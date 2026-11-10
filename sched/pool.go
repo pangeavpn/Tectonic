@@ -54,6 +54,7 @@ type DialRequest struct {
 }
 
 // DialFunc opens one lane. It may return before the lane's WELCOME arrives.
+// An error wrapping ErrCredentialRejected stops the pool.
 type DialFunc func(ctx context.Context, req DialRequest) (PoolLane, error)
 
 // PoolConfig configures a Pool.
@@ -629,6 +630,12 @@ func (p *Pool) liveCount() int {
 func (p *Pool) dialed(ref *laneRef, req DialRequest, replaces *laneState, l PoolLane, err error, taken []byte) {
 	p.dialing--
 	now := time.Now()
+	if errors.Is(err, ErrCredentialRejected) {
+		// The dialer knows the credential is no good (it expired); no
+		// amount of redialing will help.
+		p.shutdown(err)
+		return
+	}
 	if err != nil {
 		p.dialFailed(now, err, req.Reason, taken)
 		if replaces != nil {
