@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="326" viewBox="0 0 960 326" role="img" aria-labelledby="title desc">
+<title id="title">Head-of-line blocking, compared</title>
+<desc id="desc">On one TCP connection, losing packet 2 holds packets 3 to 6 until it is retransmitted. With Tectonic lanes, only the lane that lost a packet waits; packets on the other lanes reach WireGuard immediately.</desc>
+<style>
+  .panel { fill: #161412; stroke: #2a2624; }
+  .card { fill: #1f1c1a; stroke: #36312d; stroke-width: 1.2; }
+  .acard { fill: #2a1a13; stroke: #e0784a; stroke-width: 1.4; }
+  .outer { fill: #3a2016; stroke: #e0784a; stroke-width: 1.6; }
+  .slate { fill: #465062; }
+  .ghost { fill: #2a2624; stroke: #36312d; stroke-width: 1; }
+  .h { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 52px; font-weight: 700; letter-spacing: -1.5px; fill: #fbf9f2; }
+  .t { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 17px; font-weight: 600; fill: #fbf9f2; }
+  .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 13.5px; fill: #aea299; }
+  .lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 14px; fill: #aea299; }
+  .lbl-a { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #ec9068; }
+  .lead { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 17px; fill: #aea299; }
+  .cap { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; letter-spacing: 1.2px; fill: #7d766f; }
+  .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 12px; fill: #aea299; }
+  .mono-a { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11.5px; letter-spacing: 1px; fill: #ec9068; }
+  .st { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 600; fill: #ffffff; }
+  .ss { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #c4cbd6; }
+  .pk { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; font-weight: 700; fill: #ffffff; }
+  .pk-g { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; font-weight: 700; fill: #7d766f; }
+  .line { stroke: #7d766f; stroke-width: 1.5; fill: none; }
+  .dash { stroke: #7d766f; stroke-width: 1.3; stroke-dasharray: 4 4; fill: none; }
+  .region { fill: none; stroke: #45403b; stroke-width: 1.3; stroke-dasharray: 6 5; }
+  .lane { stroke: #e0784a; stroke-width: 3; fill: none; stroke-linecap: round; }
+  .lane-new { stroke: #e0784a; stroke-width: 3; fill: none; stroke-dasharray: 2 7; stroke-linecap: round; }
+  .lane-old { stroke: #7d766f; stroke-width: 3; fill: none; opacity: .55; stroke-linecap: round; }
+  .pipe { fill: none; stroke: #36312d; stroke-width: 1.2; }
+  .acc-fill { fill: #e0784a; }
+  .line-fill { fill: #7d766f; }
+  .x { stroke: #f25c5c; stroke-width: 2.6; stroke-linecap: round; }
+  .icon { stroke: #aea299; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .icon-a { stroke: #ec9068; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" class="line-fill"/>
+  </marker>
+  <marker id="arr-a" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" class="acc-fill"/>
+  </marker>
+</defs>
+<rect class="panel" x="0.5" y="0.5" width="959" height="325" rx="18"/>
+<rect class="card" x="28" y="28" width="438" height="270" rx="14"/>
+<text class="cap" x="52" y="58">ONE TCP CONNECTION</text>
+<text class="t" x="52" y="86">A lost packet stalls everything</text>
+<rect class="pipe" x="52" y="134" width="390" height="40" rx="20"/>
+<rect class="slate" x="75.0" y="145" width="26" height="18" rx="5"/><text class="pk" x="88" y="158" text-anchor="middle">1</text>
+<rect class="ghost" x="121.0" y="145" width="26" height="18" rx="5"/><text class="pk-g" x="134" y="158" text-anchor="middle">2</text>
+<path class="x" d="M126,146 L142,162 M142,146 L126,162"/>
+<rect class="ghost" x="167.0" y="145" width="26" height="18" rx="5"/><text class="pk-g" x="180" y="158" text-anchor="middle">3</text>
+<rect class="ghost" x="213.0" y="145" width="26" height="18" rx="5"/><text class="pk-g" x="226" y="158" text-anchor="middle">4</text>
+<rect class="ghost" x="259.0" y="145" width="26" height="18" rx="5"/><text class="pk-g" x="272" y="158" text-anchor="middle">5</text>
+<rect class="ghost" x="305.0" y="145" width="26" height="18" rx="5"/><text class="pk-g" x="318" y="158" text-anchor="middle">6</text>
+<path class="dash" d="M167,190 h164"/>
+<text class="lbl" x="249" y="212" text-anchor="middle">3–6 arrived but must wait</text>
+<text class="s" x="52" y="252">Every packet behind the loss waits one</text>
+<text class="s" x="52" y="272">retransmit before WireGuard sees it.</text>
+<rect class="acard" x="494" y="28" width="438" height="270" rx="14"/>
+<text class="mono-a" x="518" y="58">TECTONIC LANES</text>
+<text class="t" x="518" y="86">Only one lane waits</text>
+<rect class="pipe" x="518" y="108" width="300" height="32" rx="16"/>
+<rect class="slate" x="547.0" y="115" width="26" height="18" rx="5"/><text class="pk" x="560" y="128" text-anchor="middle">1</text>
+<rect class="slate" x="607.0" y="115" width="26" height="18" rx="5"/><text class="pk" x="620" y="128" text-anchor="middle">4</text>
+<path class="lane" d="M826,124 h52" marker-end="url(#arr-a)" style="stroke-width:2"/>
+<rect class="pipe" x="518" y="150" width="300" height="32" rx="16"/>
+<rect class="ghost" x="547.0" y="157" width="26" height="18" rx="5"/><text class="pk-g" x="560" y="170" text-anchor="middle">2</text>
+<path class="x" d="M552,158 L568,174 M568,158 L552,174"/>
+<rect class="ghost" x="607.0" y="157" width="26" height="18" rx="5"/><text class="pk-g" x="620" y="170" text-anchor="middle">5</text>
+<path class="line" d="M826,166 h52" marker-end="url(#arr)" style="stroke-width:2"/>
+<rect class="pipe" x="518" y="192" width="300" height="32" rx="16"/>
+<rect class="slate" x="547.0" y="199" width="26" height="18" rx="5"/><text class="pk" x="560" y="212" text-anchor="middle">3</text>
+<rect class="slate" x="607.0" y="199" width="26" height="18" rx="5"/><text class="pk" x="620" y="212" text-anchor="middle">6</text>
+<path class="lane" d="M826,208 h52" marker-end="url(#arr-a)" style="stroke-width:2"/>
+<text class="lbl" x="886" y="171">wait</text>
+<text class="s" x="518" y="252">WireGuard gets 1, 3, 4 and 6 now. Only</text>
+<text class="s" x="518" y="272">packet 5 waits for lane 2 to recover.</text>
+</svg>

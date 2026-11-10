@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="388" viewBox="0 0 960 388" role="img" aria-labelledby="title desc">
+<title id="title">How Tectonic works</title>
+<desc id="desc">WireGuard on the device sends to the Tectonic client on loopback. The client spreads packets, out of order, across several TLS lanes to the Tectonic server on the node, which hands them to WireGuard as they arrive. A replacement lane is opening. A firewall watching sees Chrome visiting a website, and a probe that fails login gets the cover website.</desc>
+<style>
+  .panel { fill: #161412; stroke: #2a2624; }
+  .card { fill: #1f1c1a; stroke: #36312d; stroke-width: 1.2; }
+  .acard { fill: #2a1a13; stroke: #e0784a; stroke-width: 1.4; }
+  .outer { fill: #3a2016; stroke: #e0784a; stroke-width: 1.6; }
+  .slate { fill: #465062; }
+  .ghost { fill: #2a2624; stroke: #36312d; stroke-width: 1; }
+  .h { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 52px; font-weight: 700; letter-spacing: -1.5px; fill: #fbf9f2; }
+  .t { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 17px; font-weight: 600; fill: #fbf9f2; }
+  .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 13.5px; fill: #aea299; }
+  .lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 14px; fill: #aea299; }
+  .lbl-a { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #ec9068; }
+  .lead { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 17px; fill: #aea299; }
+  .cap { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; letter-spacing: 1.2px; fill: #7d766f; }
+  .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 12px; fill: #aea299; }
+  .mono-a { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11.5px; letter-spacing: 1px; fill: #ec9068; }
+  .st { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 600; fill: #ffffff; }
+  .ss { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #c4cbd6; }
+  .pk { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; font-weight: 700; fill: #ffffff; }
+  .pk-g { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; font-weight: 700; fill: #7d766f; }
+  .line { stroke: #7d766f; stroke-width: 1.5; fill: none; }
+  .dash { stroke: #7d766f; stroke-width: 1.3; stroke-dasharray: 4 4; fill: none; }
+  .region { fill: none; stroke: #45403b; stroke-width: 1.3; stroke-dasharray: 6 5; }
+  .lane { stroke: #e0784a; stroke-width: 3; fill: none; stroke-linecap: round; }
+  .lane-new { stroke: #e0784a; stroke-width: 3; fill: none; stroke-dasharray: 2 7; stroke-linecap: round; }
+  .lane-old { stroke: #7d766f; stroke-width: 3; fill: none; opacity: .55; stroke-linecap: round; }
+  .pipe { fill: none; stroke: #36312d; stroke-width: 1.2; }
+  .acc-fill { fill: #e0784a; }
+  .line-fill { fill: #7d766f; }
+  .x { stroke: #f25c5c; stroke-width: 2.6; stroke-linecap: round; }
+  .icon { stroke: #aea299; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .icon-a { stroke: #ec9068; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" class="line-fill"/>
+  </marker>
+  <marker id="arr-a" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" class="acc-fill"/>
+  </marker>
+</defs>
+<rect class="panel" x="0.5" y="0.5" width="959" height="387" rx="18"/>
+<rect class="card" x="32" y="96" width="220" height="196" rx="14"/>
+<text class="cap" x="52" y="122">DEVICE</text>
+<rect class="slate" x="52" y="136" width="180" height="46" rx="10"/>
+<text class="st" x="142" y="157" text-anchor="middle">WireGuard</text>
+<text class="ss" x="142" y="174" text-anchor="middle">to 127.0.0.1:port</text>
+<path class="line" d="M142,182 V206" marker-end="url(#arr)"/>
+<rect class="acard" x="52" y="210" width="180" height="62" rx="10"/>
+<text class="t" x="142" y="234" text-anchor="middle">Tectonic client</text>
+<text class="s" x="142" y="254" text-anchor="middle">scheduler · shaper · pool</text>
+<rect class="card" x="708" y="96" width="220" height="196" rx="14"/>
+<text class="cap" x="728" y="122">VPN NODE</text>
+<rect class="acard" x="728" y="136" width="180" height="62" rx="10"/>
+<text class="t" x="818" y="160" text-anchor="middle">Tectonic server</text>
+<text class="s" x="818" y="180" text-anchor="middle">:443 · real TLS 1.3</text>
+<path class="line" d="M818,198 V222" marker-end="url(#arr)"/>
+<rect class="slate" x="728" y="226" width="180" height="46" rx="10"/>
+<text class="st" x="818" y="247" text-anchor="middle">WireGuard</text>
+<text class="ss" x="818" y="264" text-anchor="middle">127.0.0.1:51820</text>
+<path class="lane" d="M232,226 C 400,186 540,186 728,166"/>
+<path class="lane" d="M232,241 C 400,241 540,241 728,171"/>
+<path class="lane-new" d="M232,256 C 400,300 560,300 728,176"/>
+<rect class="slate" x="347.0" y="196" width="26" height="18" rx="5"/><text class="pk" x="360" y="209" text-anchor="middle">3</text>
+<rect class="slate" x="547.0" y="182" width="26" height="18" rx="5"/><text class="pk" x="560" y="195" text-anchor="middle">1</text>
+<rect class="slate" x="367.0" y="232" width="26" height="18" rx="5"/><text class="pk" x="380" y="245" text-anchor="middle">2</text>
+<rect class="slate" x="577.0" y="217" width="26" height="18" rx="5"/><text class="pk" x="590" y="230" text-anchor="middle">5</text>
+<rect class="slate" x="457.0" y="277" width="26" height="18" rx="5"/><text class="pk" x="470" y="290" text-anchor="middle">4</text>
+<text class="mono-a" x="470" y="318" text-anchor="middle">LANE 3 · OPENING, WILL REPLACE LANE 1</text>
+<rect class="card" x="300" y="24" width="360" height="44" rx="22"/>
+<g class="icon"><path d="M318,46 q10,-9 20,0 q-10,9 -20,0 z"/><circle cx="328" cy="46" r="3"/></g>
+<text class="lbl" x="350" y="51">Firewall / DPI watching the wire</text>
+<path class="dash" d="M480,68 V150" marker-end="url(#arr)"/>
+<text class="lbl-a" x="494" y="100">sees Chrome visiting a website</text>
+<rect class="card" x="708" y="320" width="220" height="44" rx="22"/>
+<text class="lbl" x="818" y="347" text-anchor="middle">Failed login → cover website</text>
+<path class="dash" d="M928,170 C 952,190 952,320 928,336" marker-end="url(#arr)"/>
+<path class="lane" d="M40,350 h28"/><text class="lbl" x="78" y="355">active lane</text>
+<path class="lane-new" d="M190,350 h28"/><text class="lbl" x="228" y="355">replacement lane</text>
+<rect class="slate" x="367.0" y="341" width="26" height="18" rx="5"/><text class="pk" x="380" y="354" text-anchor="middle">n</text><text class="lbl" x="400" y="355">WireGuard packet, delivered on arrival</text>
+</svg>

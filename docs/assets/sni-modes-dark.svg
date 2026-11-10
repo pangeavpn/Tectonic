@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="300" viewBox="0 0 960 300" role="img" aria-labelledby="title desc">
+<title id="title">SNI modes</title>
+<desc id="desc">Three SNI modes. Own sends our cover domain with a real certificate, for open networks. Borrowed sends any name the network allows, with a pinned certificate, for SNI allowlists. None sends no SNI, like Chrome opening an IP address, for allowlists that let empty SNI through.</desc>
+<style>
+  .panel { fill: #161412; stroke: #2a2624; }
+  .card { fill: #1f1c1a; stroke: #36312d; stroke-width: 1.2; }
+  .acard { fill: #2a1a13; stroke: #e0784a; stroke-width: 1.4; }
+  .outer { fill: #3a2016; stroke: #e0784a; stroke-width: 1.6; }
+  .slate { fill: #465062; }
+  .ghost { fill: #2a2624; stroke: #36312d; stroke-width: 1; }
+  .h { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 52px; font-weight: 700; letter-spacing: -1.5px; fill: #fbf9f2; }
+  .t { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 17px; font-weight: 600; fill: #fbf9f2; }
+  .s { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 13.5px; fill: #aea299; }
+  .lbl { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 14px; fill: #aea299; }
+  .lbl-a { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 14px; font-weight: 600; fill: #ec9068; }
+  .lead { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 17px; fill: #aea299; }
+  .cap { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; letter-spacing: 1.2px; fill: #7d766f; }
+  .mono { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 12px; fill: #aea299; }
+  .mono-a { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11.5px; letter-spacing: 1px; fill: #ec9068; }
+  .st { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 15px; font-weight: 600; fill: #ffffff; }
+  .ss { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif; font-size: 12.5px; fill: #c4cbd6; }
+  .pk { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; font-weight: 700; fill: #ffffff; }
+  .pk-g { font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace; font-size: 11px; font-weight: 700; fill: #7d766f; }
+  .line { stroke: #7d766f; stroke-width: 1.5; fill: none; }
+  .dash { stroke: #7d766f; stroke-width: 1.3; stroke-dasharray: 4 4; fill: none; }
+  .region { fill: none; stroke: #45403b; stroke-width: 1.3; stroke-dasharray: 6 5; }
+  .lane { stroke: #e0784a; stroke-width: 3; fill: none; stroke-linecap: round; }
+  .lane-new { stroke: #e0784a; stroke-width: 3; fill: none; stroke-dasharray: 2 7; stroke-linecap: round; }
+  .lane-old { stroke: #7d766f; stroke-width: 3; fill: none; opacity: .55; stroke-linecap: round; }
+  .pipe { fill: none; stroke: #36312d; stroke-width: 1.2; }
+  .acc-fill { fill: #e0784a; }
+  .line-fill { fill: #7d766f; }
+  .x { stroke: #f25c5c; stroke-width: 2.6; stroke-linecap: round; }
+  .icon { stroke: #aea299; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+  .icon-a { stroke: #ec9068; stroke-width: 1.6; fill: none; stroke-linecap: round; stroke-linejoin: round; }
+</style>
+<defs>
+  <marker id="arr" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" class="line-fill"/>
+  </marker>
+  <marker id="arr-a" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,1 L9,5 L0,9 z" class="acc-fill"/>
+  </marker>
+</defs>
+<rect class="panel" x="0.5" y="0.5" width="959" height="299" rx="18"/>
+<rect class="acard" x="36" y="28" width="280" height="214" rx="14"/>
+<text class="mono-a" x="58" y="58">OWN</text>
+<text class="t" x="58" y="88">Our cover domain</text>
+<rect class="slate" x="58" y="106" width="236" height="32" rx="8"/>
+<text class="pk" x="72" y="127" style="font-weight:500;font-size:12px">sni: n12.example-cdn.net</text>
+<text class="s" x="58" y="170">real certificate, checked by name</text>
+<path class="region" d="M58,188 h236"/>
+<text class="cap" x="58" y="214">BEST FOR</text>
+<text class="lbl" x="128" y="214">open networks · blocklists</text>
+<rect class="card" x="340" y="28" width="280" height="214" rx="14"/>
+<text class="cap" x="362" y="58">BORROWED</text>
+<text class="t" x="362" y="88">A name the network allows</text>
+<rect class="slate" x="362" y="106" width="236" height="32" rx="8"/>
+<text class="pk" x="376" y="127" style="font-weight:500;font-size:12px">sni: allowed-site.com</text>
+<text class="s" x="362" y="170">certificate pinned by the hub</text>
+<path class="region" d="M362,188 h236"/>
+<text class="cap" x="362" y="214">BEST FOR</text>
+<text class="lbl" x="432" y="214">SNI allowlists</text>
+<rect class="card" x="644" y="28" width="280" height="214" rx="14"/>
+<text class="cap" x="666" y="58">NONE</text>
+<text class="t" x="666" y="88">No SNI at all</text>
+<rect class="slate" x="666" y="106" width="236" height="32" rx="8"/>
+<text class="pk" x="680" y="127" style="font-weight:500;font-size:12px">sni: —</text>
+<text class="s" x="666" y="170">same as Chrome opening https://IP</text>
+<path class="region" d="M666,188 h236"/>
+<text class="cap" x="666" y="214">BEST FOR</text>
+<text class="lbl" x="736" y="214">allowlists that skip it</text>
+<text class="lbl" x="480" y="276" text-anchor="middle">The login is inside TLS, so the server accepts any SNI, or none. The client races all three on a new network and remembers the winner.</text>
+</svg>
