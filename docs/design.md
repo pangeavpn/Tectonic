@@ -21,7 +21,7 @@
 > [!NOTE]
 > **Status: draft.** This describes what we intend to build. Nothing here is implemented yet, and every number under [Measuring speed](#13-measuring-speed) is a target, not a result.
 
-Tectonic carries WireGuard over a small pool of short-lived TLS 1.3 connections called **lanes**. Packets travel across the lanes unordered, so a stall on one lane never holds up the others. To anyone watching the network, each lane is Chrome loading an ordinary website.
+Tectonic carries WireGuard over a small pool of short-lived TLS 1.3 connections called **lanes**. Packets travel across the lanes independently and are put back in order as they arrive, so a stall on one lane holds up the others only briefly. To anyone watching the network, each lane is Chrome loading an ordinary website.
 
 It's written in Go and shares one codebase between client and server. The client links it into the PangeaVPN daemon on desktop, Android and iOS, and the server runs on the VPN nodes.
 
@@ -73,9 +73,12 @@ Most of these ideas exist somewhere in some form. What's new is combining them, 
   <img src="assets/head-of-line-light.svg" alt="On one TCP connection, losing packet 2 holds packets 3 to 6 until it is retransmitted. With Tectonic lanes, only the lane that lost a packet waits; the others reach WireGuard immediately." width="100%" />
 </picture>
 
+> [!NOTE]
+> The figure shows the idea as first drawn, with packets handed to WireGuard the moment they arrive. Measured that way, the TCP connections inside the tunnel took every packet that arrived out of turn for a lost one. As built, the receiver puts packets back in order and waits a bounded time for a late one; see [Putting packets back in order](#putting-packets-back-in-order).
+
 | | Idea | What it does |
 |---|---|---|
-| 01 | **Unordered lanes** | WireGuard packets are spread across several TLS lanes and handed over the moment they arrive, in any order. A lost segment stalls only its own lane. |
+| 01 | **Unordered lanes** | WireGuard packets are spread across several TLS lanes, with no order shared between them. The receiver merges them back into WireGuard's own order, waiting for a late packet only briefly. A lost segment stalls its own lane, and the others for no more than that wait. |
 | 02 | **Free deduplication** | WireGuard's anti-replay window already drops duplicate packets. That lets us send a small, urgent packet on two lanes without any bookkeeping on the receiving end. |
 | 03 | **Lane churn** | Each lane lives from tens of seconds to a few minutes, and a replacement opens before the old one closes, the way a browser cycles connections. No single connection runs for hours or carries gigabytes. |
 | 04 | **Throttle detection** | If adding a lane raises total throughput while each lane stays capped, the network is throttling per connection. Tectonic responds by adding lanes, up to a limit. |
@@ -94,7 +97,7 @@ Most of these ideas exist somewhere in some form. What's new is combining them, 
   <img src="assets/lanes-light.svg" alt="WireGuard on the device sends to the Tectonic client on loopback. The client spreads packets, out of order, across several TLS lanes to the Tectonic server on the node, which hands them to WireGuard as they arrive. A firewall sees Chrome visiting a website; a probe that fails login gets the cover website." width="100%" />
 </picture>
 
-On the device, WireGuard sends to a loopback port, as it does with every other PangeaVPN transport. The Tectonic client spreads those packets across its lanes. The server passes each packet to the node's WireGuard as soon as it arrives, without putting them back in order.
+On the device, WireGuard sends to a loopback port, as it does with every other PangeaVPN transport. The Tectonic client spreads those packets across its lanes. The server merges what arrives on the lanes back into the order WireGuard sent it and passes it to the node's WireGuard. A packet waits only while an earlier one is still on its way on another lane.
 
 From the daemon's point of view, Tectonic is one more transport. It brings up a loopback UDP listener and points WireGuard's endpoint at it.
 
@@ -184,15 +187,38 @@ A receiver skips any frame type it doesn't recognise, using the length field, so
 
 ### Choosing a lane
 
-For each outgoing WireGuard packet, the scheduler picks the lane with the earliest estimated delivery time:
+For each outgoing WireGuard packet, the scheduler estimates when each lane would deliver it:
 
 ```text
 eta(lane) = queued_bytes(lane) / rate(lane) + srtt(lane) / 2
 ```
 
+It keeps the lanes in order of preference, newest first, and sends the packet on the most preferred lane whose estimate is within a small margin (a sixteenth of that lane's round trip) of the earliest.
+
+- **One lane while one lane is enough.** Traffic a single lane can carry stays on that lane, in order. Once the lane falls behind, the overflow spills to the next, and each packet still goes where it should arrive about as early as anywhere.
 - **Shallow socket buffers.** Each lane sets `TCP_NOTSENT_LOWAT`, so the operating system holds only a little unsent data. The queue stays in Tectonic's scheduler, which can still steer packets to the fastest lane. This also keeps latency low while the tunnel is busy.
 - **Rate and RTT** come from `TCP_INFO` where the platform provides it, and from `PING`/`PONG` otherwise.
-- **Unordered delivery.** The receiver hands each `DATA` frame to WireGuard as soon as it arrives. TCP connections running *inside* the tunnel never wait on a retransmission happening in an unrelated lane.
+- **Small packets first.** Within a lane, packets of 128 bytes or less go out ahead of the larger ones queued there, so a download doesn't make pings and ACKs wait behind it.
+- **A full queue drops.** A lane's queue is full once its oldest packet has waited about a round trip. When every lane is full the packet is dropped, which the TCP connections inside the tunnel read the way they would read a full link.
+
+### Without `TCP_NOTSENT_LOWAT`
+
+Where the socket option is missing (Windows, and the benchmark's simulated hosts), a lane has to keep the kernel's buffer shallow by itself. It sends `PING`s several times a round trip and treats the bytes no `PONG` has confirmed as still outstanding.
+
+- **Window.** The lane writes no more than a multiple of what it delivers in one round trip: three times while `PONG`s come back on time and its rate is still rising, as it does while the connection is in slow start; twice once the rate is steady; one and a half times once `PONG`s come back late, which means bytes are already waiting below it.
+- **Estimate.** `queued_bytes` counts the outstanding bytes too, less what the connection carries in flight without any of it waiting. A lane is offered a little more than it was last seen to deliver, and only while its `PONG`s are on time. A new lane isn't counted on until its first `PONG` is back.
+- **Pacing.** A lane that is at its capacity spaces its writes out, so a burst from the tunnel waits in the lane's queue instead of overflowing a queue on the path.
+
+The aim throughout is that anything the tunnel can't carry yet waits in Tectonic's queue, where it can be steered or dropped, and not below it. A queue on the path that overflows drops the lane's own TCP segments, and the lane then stalls on a retransmission.
+
+### Putting packets back in order
+
+Lanes are separate TCP connections, so packets spread across them arrive out of order. A TCP connection *inside* the tunnel reads a packet that turns up late as a lost one: it retransmits and slows down for a loss that never happened. The receiver therefore merges the lanes back into one ordered stream before handing packets to WireGuard.
+
+- **No sequence numbers.** WireGuard's data header is in the clear and carries a counter that rises by one per packet. The merge uses that.
+- **Late or lost.** Each lane is an ordered, reliable stream, and the sender puts packets on a lane in counter order. So a lane that has delivered counter *c* will never deliver anything below *c*. A missing packet is known to be lost the moment every lane has delivered something beyond it, and the packets behind it go on at once. Until then it is still on its way, and they wait for it.
+- **A bounded wait.** A lane that has stalled, or has carried nothing recent to judge by, can't settle the question. In that case a packet waits at most one and a half round trips (between 20 and 150 ms) for the ones before it, then goes anyway. That is long enough for a lane to retransmit a lost segment, and short enough that the TCP inside the tunnel doesn't time out.
+- **Small packets don't wait.** Packets of 128 bytes or less, and anything that isn't WireGuard data, are handed on as they arrive.
 
 ### Duplicating small urgent packets
 
@@ -201,7 +227,8 @@ While any lane is retransmitting, packets of 128 bytes or less are also copied o
 ### Lane churn
 
 - Each lane's lifetime is drawn from a browser-like distribution (median about 90 s, range 20 s to 6 min), and its byte budget is drawn the same way (median about 40 MB).
-- Shortly before a lane expires, a replacement opens with TLS resumption. Once the new lane is carrying traffic, the old one is sent `RETIRE`, finishes sending, and closes. The number of working lanes never drops during the switch.
+- Shortly before a lane expires, a replacement opens with TLS resumption. As the newest lane it takes the traffic, as fast as its connection can grow, while the old lane carries the rest. Once the traffic has moved off the old lane, it is sent `RETIRE`, finishes sending, and closes. The number of working lanes never drops during the switch.
+- A new TCP connection next to a busy one grows slowly, so on a saturated link the old lane can stay for many seconds. It is retired regardless after 30 s, or once it has carried the most any lane's byte budget can be.
 - If the network kills a lane, for example with a forged reset or a middlebox timeout, traffic moves to the remaining lanes at once and a replacement opens.
 
 ### Lane count and throttle detection
@@ -297,8 +324,8 @@ This is a broad comparison of public designs. Each of them solves a real problem
 | Protocol | What it does | How Tectonic differs |
 |---|---|---|
 | VLESS + REALITY | Borrows another site's TLS identity, and its server only accepts the names it's configured for | Uses our own identity by default. When it borrows a name, it accepts any name, or none. Traffic is spread across lanes rather than one connection. |
-| Trojan | Real TLS plus a password, with a fallback website, over one long-lived stream | The login is bound to the TLS session, so it can't be replayed. Lanes churn and deliver datagrams unordered. |
-| Cloak | Hides its login in ClientHello fields and multiplexes ordered streams over several connections | The ClientHello is untouched Chrome. Datagrams are unordered, with no head-of-line blocking between lanes. |
+| Trojan | Real TLS plus a password, with a fallback website, over one long-lived stream | The login is bound to the TLS session, so it can't be replayed. Lanes churn, and a datagram isn't tied to one connection's order. |
+| Cloak | Hides its login in ClientHello fields and multiplexes ordered streams over several connections | The ClientHello is untouched Chrome. Datagrams are merged with a bounded wait, so a stalled lane holds the others up for about a round trip at most. |
 | AnyTLS | TLS with padding aimed at defeating TLS-in-TLS detection | There's no TLS inside the TLS, because the payload is WireGuard. Shaping targets WireGuard's own patterns and costs nothing during bulk transfer. |
 | NaiveProxy | Uses Chrome's real network stack and HTTP/2 CONNECT | Pure Go with no native library, so it runs on iOS too. Multiple lanes and datagram-native framing. |
 | Speed-first VPN protocols | Built for speed, with little or no disguise | Speed comes from the scheduler, while the traffic still looks like browsing |
@@ -332,7 +359,7 @@ This repository holds the protocol, and the PangeaVPN daemon imports it.
 |---|---|
 | `wire/` | Frames, `HELLO` and `WELCOME`, key derivation. No I/O; unit- and fuzz-tested. |
 | `lane/` | A single lane: dial, TLS, login, frame I/O, retire |
-| `sched/` | The lane pool, scheduler, duplication, churn and throttle detection |
+| `sched/` | The lane pool, scheduler, resequencer, duplication, churn and throttle detection |
 | `shape/` | Shaping profiles and record-size planning |
 | `server/` | The server: TLS listener, login check, cover-site fallback, session table, UDP forwarding to WireGuard |
 | `client.go` | A small public API that dials a profile and returns a datagram connection for WireGuard |
@@ -349,7 +376,7 @@ In [pangeavpn-app](https://github.com/pangeavpn/pangeavpn-app), the integration 
 |---|---|---|
 | M0 | Design sign-off | This document is agreed and the open questions are answered |
 | M1 | Core, single lane | `wire`, `lane` and `server` exist. An in-process end-to-end test carries a real WireGuard handshake, and a probe that fails login gets the cover site. |
-| M2 | Lanes | The scheduler, unordered delivery, duplication, churn and throttle detection work, and the benchmark harness has first numbers |
+| M2 | Lanes | The scheduler, in-order merging, duplication, churn and throttle detection work, and the benchmark harness has first numbers |
 | M3 | Daemon integration | Tectonic can be chosen explicitly in the daemon. It isn't yet part of the automatic cascade. |
 | M4 | Node deployment | `tectonic-server` and a cover site run on the nodes, and the hub issues credentials |
 | M5 | SNI modes and shaping | All three SNI modes are chosen and remembered automatically per network. Shaping profiles are recorded from real Chrome sessions. A fingerprint audit is done. |
