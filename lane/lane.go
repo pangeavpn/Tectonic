@@ -171,6 +171,14 @@ const (
 	busyWindow    = 10 * time.Millisecond
 	busyBytes     = 16 << 10
 	coalesceDelay = 2 * time.Millisecond
+	// Outside a bulk transfer a record still waits up to flushDelay (and no
+	// more than a sixteenth of the round trip) for more to go with it.
+	// Packets inside the tunnel come in trains: a reply's segments, the
+	// ACKs that answer them. Written one to a record, each pays for its own
+	// TLS framing, its own padding and, being a little over one segment
+	// with them, two TCP headers. A millisecond turns a train into one
+	// record.
+	flushDelay = time.Millisecond
 )
 
 // Handler receives a lane's events. Every callback runs on the lane's reader
@@ -1044,11 +1052,15 @@ func (l *Lane) writeLoop() error {
 				continue
 			}
 		}
-		// In a bulk transfer, give a record a moment to fill.
-		if busy && !gated && len(l.ctrl) == 0 && len(l.small) == 0 && !l.retiring && !l.closing &&
-			l.queued < shape.MaxRecord-wire.MaxFrameLen/32 {
+		// Give a record a moment to fill.
+		if !gated && !idle && !l.retiring && !l.closing &&
+			l.queued+len(l.ctrl) < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
-				coalesceUntil = now.Add(coalesceDelay)
+				hold := min(flushDelay, l.RTT()/16)
+				if busy && len(l.small) == 0 {
+					hold = coalesceDelay
+				}
+				coalesceUntil = now.Add(hold)
 			}
 			if wait := coalesceUntil.Sub(now); wait > 0 {
 				l.mu.Unlock()

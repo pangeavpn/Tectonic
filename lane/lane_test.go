@@ -423,6 +423,33 @@ func TestRecordShaping(t *testing.T) {
 	}
 }
 
+func TestRecordWaitsAMomentToFill(t *testing.T) {
+	prof := shape.Default()
+	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	l, rc := pipeLane(t, prof)
+	if err := l.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	// Two packets a fraction of a millisecond apart, as the packets of one
+	// train inside the tunnel are: they leave in one record, not two.
+	l.Send(wgInitiation())
+	time.Sleep(200 * time.Microsecond)
+	l.Send(wgInitiation())
+	waitWrites(t, rc, 2)
+	time.Sleep(20 * time.Millisecond)
+	// Two 151-byte frames, with or without a PING, round up to 384.
+	if got := rc.sizes()[1:]; len(got) != 1 || got[0] != 384 {
+		t.Fatalf("records %v, want one of 384 bytes", got)
+	}
+	// A packet on its own still goes within the flush delay.
+	start := time.Now()
+	l.Send(wgInitiation())
+	waitWrites(t, rc, 3)
+	if d := time.Since(start); d > 50*time.Millisecond {
+		t.Fatalf("a lone packet waited %v", d)
+	}
+}
+
 func TestIdleKeepalivesAreDelayedAndPadded(t *testing.T) {
 	prof := shape.Default()
 	prof.IdleAfter = shape.Duration(time.Millisecond)
