@@ -11,3 +11,5 @@ import "syscall"
 func setNotSentLowat(syscall.RawConn, int) bool { return false }
 
 func readTCPInfo(syscall.RawConn) (tcpInfo, bool) { return tcpInfo{}, false }
+
+func pacedByDesign(syscall.RawConn) bool { return false }

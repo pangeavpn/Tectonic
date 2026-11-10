@@ -286,7 +286,15 @@ type Lane struct {
 
 	// lowat is whether TCP_NOTSENT_LOWAT is in effect. Without it the
 	// writer paces itself on PONGs instead.
-	lowat      bool
+	lowat bool
+	// sock is what the kernel last said about the connection, which the
+	// estimate for a lane with TCP_NOTSENT_LOWAT is made from; sockPoll is
+	// when it was last read, or is being read.
+	sock     atomic.Pointer[sockState]
+	sockPoll atomic.Int64
+	// paced counts the signs that the connection spaces its packets out
+	// (see paces).
+	paced      atomic.Int32
 	confirmedA atomic.Uint64 // mirrors confirmed, for ETA
 	// tracked counts the bytes written in records that carry DATA or a
 	// PING. It is what PINGs mark positions in and PONGs confirm; records
@@ -390,8 +398,14 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 		if rc, err := sc.SyscallConn(); err == nil {
 			l.rc = rc
 			l.lowat = setNotSentLowat(rc, notSentLowat)
-			if _, ok := readTCPInfo(rc); ok {
+			if ti, ok := readTCPInfo(rc); ok {
 				l.hasTCPInfo.Store(true)
+				if l.lowat {
+					if pacedByDesign(rc) {
+						l.paced.Store(pacedAfter)
+					}
+					l.noteTCPInfo(ti, now)
+				}
 			}
 		}
 	}
@@ -631,6 +645,10 @@ func (l *Lane) Queued() int { return int(l.queuedA.Load()) }
 //
 //	eta(lane) = queued_bytes(lane) / rate(lane) + srtt(lane) / 2
 //
+// With TCP_NOTSENT_LOWAT, queued_bytes also counts what the kernel has
+// taken and not sent, and the rate is what the connection can send now:
+// its window each round trip, or its pacing rate (see sockState).
+//
 // Without TCP_NOTSENT_LOWAT the queue is not all in the lane: bytes it has
 // written may still be waiting in the kernel. They count as queued too, so
 // queued_bytes is then everything not yet confirmed by a PONG, less what
@@ -642,6 +660,13 @@ func (l *Lane) Queued() int { return int(l.queuedA.Load()) }
 func (l *Lane) ETA(n int) time.Duration {
 	q := int(l.queuedA.Load()) + n
 	if l.lowat {
+		// The kernel holds part of the queue too, and says how much the
+		// connection can send (see sockState).
+		now := time.Now()
+		if s := l.kernel(now); s != nil {
+			idle := time.Duration(now.UnixNano() - l.lastSend.Load())
+			return s.wait(float64(q), idle) + l.RTT()/2
+		}
 		return l.backlog(q) + l.RTT()/2
 	}
 	eta := l.backlog(q) + l.base()/2
@@ -1210,6 +1235,11 @@ func (l *Lane) writeLoop() error {
 		if pkts > 0 {
 			l.lastData.Store(after.UnixNano())
 		}
+		if l.lowat {
+			// What was just written is in the kernel now; see how much
+			// of it the connection could send.
+			l.readSock(after)
+		}
 		switch {
 		case !l.full.Load():
 			// Not pacing. What was written at the rate of a lane still
@@ -1577,31 +1607,16 @@ func (l *Lane) monitor() {
 	}
 }
 
+// applyTCPInfo takes the monitor's regular reading of the connection: what
+// is true of it now, and one more sample for the rate estimate.
 func (l *Lane) applyTCPInfo(ti tcpInfo, now time.Time) {
-	if ti.rtt > 0 {
-		l.rttSampled.Store(true)
-		l.srtt.Store(int64(ti.rtt))
-		if ti.minRTT > 0 {
-			l.minRTT.Store(int64(ti.minRTT))
-		} else if m := l.minRTT.Load(); m == 0 || int64(ti.rtt) < m {
-			l.minRTT.Store(int64(ti.rtt))
-		}
-	}
+	l.noteTCPInfo(ti, now)
 	if ti.rate > 0 {
 		l.pingMu.Lock()
 		appLimited := l.appLimited
 		l.pingMu.Unlock()
 		l.updateRate(ti.rate, appLimited || ti.appLimited)
 	}
-	l.pingMu.Lock()
-	if !l.retransInit {
-		l.retransInit = true
-	} else if ti.retrans > l.lastRetransN {
-		l.lastRetrans.Store(now.UnixNano())
-	}
-	l.lastRetransN = ti.retrans
-	l.pingMu.Unlock()
-	l.stalled.Store(ti.stalled)
 }
 
 // closeWrite sends TLS close_notify (or the carrier's equivalent).
@@ -1620,4 +1635,9 @@ type tcpInfo struct {
 	appLimited bool
 	retrans    uint64 // total retransmissions so far
 	stalled    bool   // an unrecovered retransmission timeout is in progress
+	// The connection's window and what is using it, in bytes, the bytes
+	// written to it and not yet sent, its pacing rate in bytes per second
+	// and its segment size; cwnd is zero where the platform doesn't say.
+	cwnd, inflight, notsent, pacing, mss float64
+	rto                                  time.Duration
 }

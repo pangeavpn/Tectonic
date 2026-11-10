@@ -37,5 +37,15 @@ func readTCPInfo(rc syscall.RawConn) (tcpInfo, bool) {
 	if ti.Srtt > 0 && ti.Snd_cwnd > 0 {
 		info.rate = float64(ti.Snd_cwnd) / (float64(ti.Srtt) / 1000)
 	}
+	// Darwin gives the window in bytes and the bytes in the send buffer,
+	// sent or not; those the window covers are taken to be in flight.
+	info.cwnd = float64(ti.Snd_cwnd)
+	info.inflight = min(float64(ti.Snd_sbbytes), info.cwnd)
+	info.notsent = float64(ti.Snd_sbbytes) - info.inflight
+	info.mss = float64(ti.Maxseg)
+	info.rto = time.Duration(ti.Rto) * time.Millisecond
 	return info, true
 }
+
+// pacedByDesign: Darwin's TCP does not pace.
+func pacedByDesign(syscall.RawConn) bool { return false }
