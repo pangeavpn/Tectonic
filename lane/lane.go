@@ -75,13 +75,23 @@ const (
 	// to the fastest lane.
 	notSentLowat = 32 << 10
 
-	defaultRTT      = 100 * time.Millisecond
-	defaultRate     = 1 << 20 // bytes/s before any estimate
-	minRate         = 16 << 10
-	minQueueDelay   = 50 * time.Millisecond
-	minQueueBytes   = 64 << 10
-	maxQueueBytes   = 4 << 20
-	activeWindow    = 2 * time.Second
+	defaultRTT    = 100 * time.Millisecond
+	defaultRate   = 1 << 20 // bytes/s before any estimate
+	minRate       = 16 << 10
+	minQueueDelay = 50 * time.Millisecond
+	minQueueBytes = 64 << 10
+	maxQueueBytes = 4 << 20
+	activeWindow  = 2 * time.Second
+	// Packets of smallMax bytes or less (pings, TCP ACKs and most of what
+	// real-time traffic sends inside the tunnel) go out ahead of the larger
+	// ones queued on a lane, up to smallQueueMax of them at a time, so a
+	// bulk transfer does not make everything else wait behind it. The
+	// receiver hands such packets on as they come, so sending them out of
+	// turn costs nothing. WireGuard keepalives stay in the main queue:
+	// they are in no hurry, and while the tunnel is idle they are held
+	// back on purpose.
+	smallMax        = 128
+	smallQueueMax   = 512
 	monitorInterval = 100 * time.Millisecond
 	readBufferSize  = 64 << 10
 
@@ -224,6 +234,7 @@ type Lane struct {
 	ctrl       []byte   // encoded control frames, sent before any DATA
 	data       [][]byte // queued datagrams
 	dataAt     []int64  // when each was queued, unix ns
+	small      [][]byte // queued small datagrams, which go out first
 	queued     int      // bytes of DATA frames queued, headers included
 	keepalives int      // how many queued datagrams are WireGuard keepalives
 	kaSince    time.Time
@@ -450,7 +461,7 @@ func (l *Lane) Send(pkt []byte) bool {
 		l.mu.Unlock()
 		return false
 	}
-	if l.queued >= minQueueBytes {
+	if l.queued >= minQueueBytes && len(l.data) > 0 && (len(pkt) > smallMax || ka || len(l.small) >= smallQueueMax) {
 		// The queue is full once its oldest packet has waited about a
 		// round trip. Going by how long packets really wait, rather than
 		// by the bytes queued over the estimated rate, gives the tunnel's
@@ -462,8 +473,12 @@ func (l *Lane) Send(pkt []byte) bool {
 			return false
 		}
 	}
-	l.data = append(l.data, append([]byte(nil), pkt...))
-	l.dataAt = append(l.dataAt, now.UnixNano())
+	if len(pkt) <= smallMax && !ka && len(l.small) < smallQueueMax {
+		l.small = append(l.small, append([]byte(nil), pkt...))
+	} else {
+		l.data = append(l.data, append([]byte(nil), pkt...))
+		l.dataAt = append(l.dataAt, now.UnixNano())
+	}
 	l.queued += n
 	if ka {
 		if l.keepalives == 0 {
@@ -501,7 +516,7 @@ func (l *Lane) SendClose(reason wire.CloseReason) {
 	if !l.closing {
 		l.closing = true
 		l.retiring = true
-		l.data, l.dataAt = nil, nil
+		l.data, l.dataAt, l.small = nil, nil, nil
 		l.queued, l.keepalives = 0, 0
 		l.queuedA.Store(0)
 		l.ctrl = wire.AppendFrame(l.ctrl, wire.TypeClose, []byte{byte(reason)})
@@ -791,7 +806,7 @@ func (l *Lane) finish(err error) {
 		close(l.done)
 		l.conn.Close()
 		l.mu.Lock()
-		l.data, l.dataAt, l.ctrl = nil, nil, nil
+		l.data, l.dataAt, l.small, l.ctrl = nil, nil, nil, nil
 		l.queued, l.keepalives = 0, 0
 		l.queuedA.Store(0)
 		l.mu.Unlock()
@@ -961,7 +976,7 @@ func (l *Lane) writeLoop() error {
 	var pace pacer
 	for {
 		l.mu.Lock()
-		if len(l.ctrl) == 0 && len(l.data) == 0 {
+		if len(l.ctrl) == 0 && len(l.data) == 0 && len(l.small) == 0 {
 			retiring := l.retiring
 			l.mu.Unlock()
 			drainFrom = time.Time{}
@@ -979,7 +994,7 @@ func (l *Lane) writeLoop() error {
 
 		now := time.Now()
 		pl := l.planner.Load()
-		kaOnly := len(l.ctrl) == 0 && l.keepalives == len(l.data)
+		kaOnly := len(l.ctrl) == 0 && len(l.small) == 0 && l.keepalives == len(l.data)
 		idle := kaOnly && now.Sub(l.lastActive) >= pl.IdleAfter()
 		if idle && !l.retiring {
 			// Absorb keepalives into idle behaviour: hold them a random
@@ -1007,7 +1022,7 @@ func (l *Lane) writeLoop() error {
 		// Without TCP_NOTSENT_LOWAT, DATA waits while the window of
 		// unconfirmed bytes is full; control frames still go.
 		gated := !l.lowat && !l.closing && len(l.data) > 0 && !l.windowOpen()
-		if gated && len(l.ctrl) == 0 && !l.needCoverPing() {
+		if gated && len(l.ctrl) == 0 && len(l.small) == 0 && !l.needCoverPing() {
 			l.mu.Unlock()
 			select {
 			case <-l.wake: // a PONG opened the window, or new control frames
@@ -1016,7 +1031,7 @@ func (l *Lane) writeLoop() error {
 			}
 			continue
 		}
-		if l.full.Load() && !gated && !l.closing && len(l.ctrl) == 0 && len(l.data) > 0 {
+		if l.full.Load() && !gated && !l.closing && len(l.ctrl) == 0 && len(l.small) == 0 && len(l.data) > 0 {
 			if wait := pace.wait(now, paceGain*l.Rate()); wait > 0 {
 				l.mu.Unlock()
 				timer.Reset(wait)
@@ -1030,7 +1045,7 @@ func (l *Lane) writeLoop() error {
 			}
 		}
 		// In a bulk transfer, give a record a moment to fill.
-		if busy && !gated && len(l.ctrl) == 0 && !l.retiring && !l.closing &&
+		if busy && !gated && len(l.ctrl) == 0 && len(l.small) == 0 && !l.retiring && !l.closing &&
 			l.queued < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
 				coalesceUntil = now.Add(coalesceDelay)
@@ -1055,6 +1070,24 @@ func (l *Lane) writeLoop() error {
 		closing := l.closing
 		queuedBefore := l.queued
 		var dataBytes, pkts, real int
+		// Small packets first, and even while the window is closed: they
+		// add next to nothing to what is outstanding.
+		for len(l.small) > 0 {
+			p := l.small[0]
+			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
+				break
+			}
+			buf = wire.AppendFrame(buf, wire.TypeData, p)
+			l.small[0] = nil
+			l.small = l.small[1:]
+			l.queued -= wire.HeaderLen + len(p)
+			real++
+			dataBytes += len(p)
+			pkts++
+		}
+		if len(l.small) == 0 {
+			l.small = l.small[:0:0]
+		}
 		for !gated && len(l.data) > 0 {
 			p := l.data[0]
 			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
@@ -1075,7 +1108,7 @@ func (l *Lane) writeLoop() error {
 		if len(l.data) == 0 {
 			l.data, l.dataAt = l.data[:0:0], l.dataAt[:0:0]
 		}
-		backlogged := len(l.data) > 0
+		backlogged := len(l.data) > 0 || len(l.small) > 0
 		l.queuedA.Store(int64(l.queued))
 		l.mu.Unlock()
 

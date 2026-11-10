@@ -3,6 +3,7 @@ package lane
 import (
 	"math"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -368,5 +369,60 @@ func TestAnsweringPingsLeavesNothingOutstanding(t *testing.T) {
 	}
 	if st := la.Stats(); st.Unconfirmed != 0 {
 		t.Fatalf("%d bytes outstanding on a lane that only answered PINGs", st.Unconfirmed)
+	}
+}
+
+func TestSmallPacketsGoAheadOfQueuedBulk(t *testing.T) {
+	a, b := tcpPair(t)
+	var mu sync.Mutex
+	var sizes []int
+	la := New(a, nil, Options{Role: Server})
+	lb := New(b, nil, Options{Role: Server, Handler: Handler{
+		Data: func(_ *Lane, pkt []byte) { mu.Lock(); sizes = append(sizes, len(pkt)); mu.Unlock() },
+	}})
+	defer la.Close()
+	defer lb.Close()
+	// A bulk backlog, then a ping, a keepalive and another ping, all queued
+	// before the writer starts.
+	for range 30 {
+		la.Send(make([]byte, 1400))
+	}
+	la.Send(make([]byte, 96))
+	ka := make([]byte, 32)
+	ka[0] = 4 // a WireGuard keepalive: no hurry
+	la.Send(ka)
+	la.Send(make([]byte, 100))
+	if err := lb.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := la.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := len(sizes)
+		mu.Unlock()
+		if n == 33 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("received %d of 33 packets", n)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if sizes[0] != 96 || sizes[1] != 100 {
+		t.Fatalf("first packets were %d and %d bytes, want the two small ones", sizes[0], sizes[1])
+	}
+	// The rest keep their order, the keepalive in its place behind them.
+	for i, s := range sizes[2:32] {
+		if s != 1400 {
+			t.Fatalf("packet %d was %d bytes, want a bulk packet", i+2, s)
+		}
+	}
+	if sizes[32] != 32 {
+		t.Fatalf("last packet was %d bytes, want the keepalive", sizes[32])
 	}
 }
