@@ -10,6 +10,7 @@ package lane
 
 import (
 	"bufio"
+	"cmp"
 	"errors"
 	"fmt"
 	"io"
@@ -45,7 +46,7 @@ var (
 	// ErrLoginFailed means the server answered the HELLO with something
 	// other than WELCOME: it served its website instead.
 	ErrLoginFailed = errors.New("lane: login failed")
-	// ErrPingTimeout means a PING went unanswered for PingTimeout.
+	// ErrPingTimeout means a PING went unanswered for the ping timeout.
 	ErrPingTimeout = errors.New("lane: no PONG within the timeout")
 	// ErrPeerClosed means the peer ended the connection without retiring it.
 	ErrPeerClosed = errors.New("lane: closed by peer")
@@ -55,15 +56,17 @@ var (
 	ErrSessionClosed = errors.New("lane: session closed")
 )
 
-// Tunables. They are variables so tests can shorten them.
-var (
-	// PingInterval is the least time between PINGs. PINGs only ride along
-	// in records that carry DATA, so an idle lane sends none.
-	PingInterval = time.Second
-	// PingTimeout ends a lane whose PING goes unanswered this long.
-	PingTimeout = 15 * time.Second
-	// Linger is how long a retiring lane waits for the peer's close_notify.
-	Linger = 10 * time.Second
+// Defaults for the Options of the same names.
+const (
+	// DefaultPingInterval is the least time between PINGs on a lane with
+	// TCP_NOTSENT_LOWAT. PINGs only ride along in records that carry DATA,
+	// so an idle lane sends none.
+	DefaultPingInterval = time.Second
+	// DefaultPingTimeout ends a lane whose PING goes unanswered this long.
+	DefaultPingTimeout = 15 * time.Second
+	// DefaultLinger is how long a retiring lane waits for the peer's
+	// close_notify.
+	DefaultLinger = 10 * time.Second
 )
 
 const (
@@ -81,6 +84,26 @@ const (
 	activeWindow    = 2 * time.Second
 	monitorInterval = 100 * time.Millisecond
 	readBufferSize  = 64 << 10
+
+	// Without TCP_NOTSENT_LOWAT, a lane caps the bytes it has written but
+	// not yet seen confirmed by a PONG at windowGain × rate × base RTT +
+	// windowMin. That never holds back the TCP connection while the
+	// network's own queue stays under one base RTT, and bounds what waits
+	// unsent in the kernel to about one bandwidth-delay product.
+	windowGain     = 2.0
+	windowMin      = 64 << 10
+	windowMax      = 64 << 20
+	minRateSpan    = 20 * time.Millisecond
+	baseRTTEpoch   = 10 * time.Second // the base RTT is the least seen over 10-20 s
+	maxPings       = 8
+	minPingSpacing = 2 * time.Millisecond
+
+	// A lane that wrote at least busyBytes in the last busyWindow is in a
+	// bulk transfer: its records are packed up to 16 KB, waiting up to
+	// coalesceDelay for one to fill, and never padded (design §8).
+	busyWindow    = 10 * time.Millisecond
+	busyBytes     = 16 << 10
+	coalesceDelay = 2 * time.Millisecond
 )
 
 // Handler receives a lane's events. Every callback runs on the lane's reader
@@ -110,7 +133,11 @@ type Options struct {
 	Raw net.Conn
 	// InitialRTT seeds the RTT estimate until the first measurement.
 	InitialRTT time.Duration
-	Logger     *slog.Logger
+	// PingInterval, PingTimeout and Linger override the defaults.
+	PingInterval time.Duration
+	PingTimeout  time.Duration
+	Linger       time.Duration
+	Logger       *slog.Logger
 }
 
 var laneIDs atomic.Uint64
@@ -128,6 +155,10 @@ type Lane struct {
 
 	profiles *shape.Set
 	planner  atomic.Pointer[shape.Planner]
+
+	pingInterval time.Duration
+	pingTimeout  time.Duration
+	linger       time.Duration
 
 	mu         sync.Mutex
 	ctrl       []byte   // encoded control frames, sent before any DATA
@@ -156,7 +187,8 @@ type Lane struct {
 	minRTT      atomic.Int64 // ns
 	rate        atomic.Uint64
 	rttSampled  atomic.Bool
-	rateSampled atomic.Bool
+	rateSampled atomic.Bool  // a sample from a busy lane set the rate
+	rateSeen    atomic.Bool  // any delivery-rate sample has been taken
 	lastRetrans atomic.Int64 // unix ns of the last retransmission seen
 	stalled     atomic.Bool  // TCP_INFO reports an unrecovered timeout
 	hasTCPInfo  atomic.Bool
@@ -169,18 +201,34 @@ type Lane struct {
 	lastSend    atomic.Int64
 	lastRecv    atomic.Int64
 
+	// lowat is whether TCP_NOTSENT_LOWAT is in effect. Without it the
+	// writer paces itself on PONGs instead.
+	lowat      bool
+	confirmedA atomic.Uint64 // mirrors confirmed, for ETA
+	baseRTT    atomic.Int64  // ns: least PONG round trip over the last 10-20 s
+
 	pingMu        sync.Mutex
-	pingTok       uint64
-	pingAt        time.Time
-	pingBytes     uint64 // bytes written up to and including the PING's record
-	pingOut       bool
+	pings         []outPing // outstanding, oldest first
 	lastPingSent  time.Time
-	lastPong      time.Time
-	lastPongBytes uint64
+	lastPingBytes uint64    // bytes written when the last PING went
+	rateFrom      time.Time // start of the current delivery-rate sample
+	rateFromBytes uint64
+	rateLimited   bool   // the lane wasn't kept busy at some point in the sample
+	confirmed     uint64 // bytes the peer has confirmed receiving
+	baseCur       time.Duration
+	basePrev      time.Duration
+	baseEpoch     time.Time
 	appLimited    bool // the queue ran dry since the last PING
-	pingLimited   bool // appLimited as it stood when the outstanding PING went out
 	lastRetransN  uint64
 	retransInit   bool
+}
+
+// outPing is a PING waiting for its PONG.
+type outPing struct {
+	tok     uint64
+	at      time.Time
+	bytes   uint64 // bytes written up to and including the PING's record
+	limited bool   // the lane was not kept busy before this PING
 }
 
 // New wraps an established TLS connection as a lane. r is where frames are
@@ -212,6 +260,10 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 		monitorWake: make(chan struct{}, 1),
 		done:        make(chan struct{}),
 		welcomed:    make(chan struct{}),
+
+		pingInterval: cmp.Or(opts.PingInterval, DefaultPingInterval),
+		pingTimeout:  cmp.Or(opts.PingTimeout, DefaultPingTimeout),
+		linger:       cmp.Or(opts.Linger, DefaultLinger),
 	}
 	l.log = log.With("lane", l.id, "role", opts.Role.String())
 	pl := opts.Planner
@@ -228,7 +280,7 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 	if sc, ok := opts.Raw.(syscall.Conn); ok {
 		if rc, err := sc.SyscallConn(); err == nil {
 			l.rc = rc
-			setNotSentLowat(rc, notSentLowat)
+			l.lowat = setNotSentLowat(rc, notSentLowat)
 			if _, ok := readTCPInfo(rc); ok {
 				l.hasTCPInfo.Store(true)
 			}
@@ -412,6 +464,10 @@ func (l *Lane) Queued() int { return int(l.queuedA.Load()) }
 // (design §7):
 //
 //	eta(lane) = queued_bytes(lane) / rate(lane) + srtt(lane) / 2
+//
+// Without TCP_NOTSENT_LOWAT the kernel may hold more unsent data, but the
+// lane then PINGs several times a round trip, so srtt is fresh and already
+// includes that wait.
 func (l *Lane) ETA(n int) time.Duration {
 	q := float64(l.queuedA.Load() + int64(n))
 	return time.Duration(q/l.Rate()*float64(time.Second)) + l.RTT()/2
@@ -435,7 +491,7 @@ func (l *Lane) Retransmitting() bool {
 		// Without TCP_INFO, a PING that is long overdue is the best sign
 		// that the connection is stuck retransmitting.
 		l.pingMu.Lock()
-		stuck := l.pingOut && time.Since(l.pingAt) > 2*l.RTT()+100*time.Millisecond
+		stuck := len(l.pings) > 0 && time.Since(l.pings[0].at) > 2*l.RTT()+100*time.Millisecond
 		l.pingMu.Unlock()
 		return stuck
 	}
@@ -457,11 +513,22 @@ type Stats struct {
 	PacketsRecv    uint64
 	Retransmitting bool
 	TCPInfo        bool // estimates come from TCP_INFO rather than PING/PONG
+	NotSentLowat   bool // TCP_NOTSENT_LOWAT is in effect; otherwise the lane paces on PONGs
+	Unconfirmed    uint64
+	Window         uint64 // the cap on unconfirmed bytes without TCP_NOTSENT_LOWAT
+	PingsOut       int
 }
 
 // Stats returns a snapshot of the lane's counters.
 func (l *Lane) Stats() Stats {
+	l.pingMu.Lock()
+	unconfirmed, pings := l.bytesSent.Load()-l.confirmed, len(l.pings)
+	l.pingMu.Unlock()
 	return Stats{
+		NotSentLowat:   l.lowat,
+		Unconfirmed:    unconfirmed,
+		Window:         uint64(l.windowBytes()),
+		PingsOut:       pings,
 		Created:        l.created,
 		SRTT:           l.RTT(),
 		MinRTT:         time.Duration(l.minRTT.Load()),
@@ -570,7 +637,7 @@ func (l *Lane) run() {
 			return
 		}
 		if linger == nil {
-			linger = time.After(Linger)
+			linger = time.After(l.linger)
 		}
 	}
 	l.finish(nil)
@@ -662,6 +729,10 @@ func (l *Lane) writeLoop() error {
 	buf := make([]byte, 0, shape.MaxRecord+wire.MaxFrameLen)
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
+	// Bulk detection: bytes written in the current busyWindow.
+	var winStart, coalesceUntil time.Time
+	var winBytes int
+	busy := false
 	for {
 		l.mu.Lock()
 		if len(l.ctrl) == 0 && len(l.data) == 0 {
@@ -699,12 +770,45 @@ func (l *Lane) writeLoop() error {
 			}
 		}
 
+		// Without TCP_NOTSENT_LOWAT, DATA waits while the window of
+		// unconfirmed bytes is full; control frames still go.
+		gated := !l.lowat && !l.closing && len(l.data) > 0 && !l.windowOpen()
+		if gated && len(l.ctrl) == 0 && !l.needCoverPing() {
+			l.mu.Unlock()
+			select {
+			case <-l.wake: // a PONG opened the window, or new control frames
+			case <-l.done:
+				return nil
+			}
+			continue
+		}
+		// In a bulk transfer, give a record a moment to fill.
+		if busy && !gated && len(l.ctrl) == 0 && !l.retiring && !l.closing &&
+			l.queued < shape.MaxRecord-wire.MaxFrameLen/32 {
+			if coalesceUntil.IsZero() {
+				coalesceUntil = now.Add(coalesceDelay)
+			}
+			if wait := coalesceUntil.Sub(now); wait > 0 {
+				l.mu.Unlock()
+				timer.Reset(wait)
+				select {
+				case <-l.wake:
+				case <-timer.C:
+				case <-l.done:
+					return nil
+				}
+				timer.Stop()
+				continue
+			}
+		}
+		coalesceUntil = time.Time{}
+
 		buf = append(buf[:0], l.ctrl...)
 		l.ctrl = l.ctrl[:0]
 		closing := l.closing
 		queuedBefore := l.queued
 		var dataBytes, pkts, real int
-		for len(l.data) > 0 {
+		for !gated && len(l.data) > 0 {
 			p := l.data[0]
 			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
 				break
@@ -729,27 +833,45 @@ func (l *Lane) writeLoop() error {
 		l.mu.Unlock()
 
 		pinged := false
-		if real > 0 {
-			buf, pinged = l.maybePing(buf, now, backlogged)
+		if real > 0 || gated {
+			// A gated record exists to carry a PING whose PONG will
+			// reopen the window.
+			buf, pinged = l.maybePing(buf, now, backlogged, gated)
+		}
+		mode := pl.Mode(queuedBefore, idle)
+		switch {
+		case gated:
+			mode = shape.Interactive
+		case busy && !idle:
+			mode = shape.Bulk
 		}
 		if len(buf) < shape.MaxRecord {
-			buf = wire.AppendPadding(buf, pl.Padding(pl.Mode(queuedBefore, idle), len(buf)))
+			buf = wire.AppendPadding(buf, pl.Padding(mode, len(buf)))
 		}
-		if _, err := l.conn.Write(buf); err != nil {
-			return err
-		}
-		total := l.bytesSent.Add(uint64(len(buf)))
-		l.dataSent.Add(uint64(dataBytes))
-		l.pktsSent.Add(uint64(pkts))
-		l.lastSend.Store(time.Now().UnixNano())
+		// Only this goroutine writes, so the total after the write is
+		// known now; record it before a fast PONG can arrive.
+		total := l.bytesSent.Load() + uint64(len(buf))
 		l.pingMu.Lock()
 		if pinged {
-			l.pingBytes = total
+			l.pings[len(l.pings)-1].bytes = total
 		}
 		if !backlogged {
 			l.appLimited = true
 		}
 		l.pingMu.Unlock()
+		if _, err := l.conn.Write(buf); err != nil {
+			return err
+		}
+		l.bytesSent.Store(total)
+		l.dataSent.Add(uint64(dataBytes))
+		l.pktsSent.Add(uint64(pkts))
+		after := time.Now()
+		l.lastSend.Store(after.UnixNano())
+		if after.Sub(winStart) >= busyWindow {
+			busy = winBytes >= busyBytes
+			winStart, winBytes = after, 0
+		}
+		winBytes += dataBytes
 		if closing {
 			l.mu.Lock()
 			done := len(l.ctrl) == 0
@@ -762,23 +884,85 @@ func (l *Lane) writeLoop() error {
 	}
 }
 
-// maybePing adds a PING to a record that already carries DATA, at most once
-// per PingInterval and with one PING outstanding at a time.
-func (l *Lane) maybePing(buf []byte, now time.Time, backlogged bool) ([]byte, bool) {
+// maybePing adds a PING to a record. PINGs only ride in records that carry
+// DATA, so an idle lane sends none. With TCP_NOTSENT_LOWAT they go once per
+// ping interval, for liveness and, without TCP_INFO, the estimates. Without
+// it they go several times a round trip, because their PONGs are what
+// reopen the window; cover forces one when none is outstanding.
+func (l *Lane) maybePing(buf []byte, now time.Time, backlogged, cover bool) ([]byte, bool) {
 	l.pingMu.Lock()
 	defer l.pingMu.Unlock()
-	if l.pingOut || now.Sub(l.lastPingSent) < PingInterval {
+	var due bool
+	if l.lowat {
+		due = len(l.pings) == 0 && now.Sub(l.lastPingSent) >= l.pingInterval
+	} else {
+		// Spread PINGs through the window, by time and by bytes, so
+		// confirmations keep pace with what is in flight.
+		spacing := min(l.pingInterval, max(l.RTT()/4, minPingSpacing))
+		every := max(uint64(l.windowBytes()/8), shape.MaxRecord)
+		due = len(l.pings) < maxPings &&
+			(now.Sub(l.lastPingSent) >= spacing || l.bytesSent.Load()-l.lastPingBytes >= every)
+	}
+	if !due && !(cover && len(l.pings) == 0) {
 		return buf, false
 	}
-	l.pingTok = wire.NewPingToken()
-	l.pingAt = now
-	l.pingOut = true
-	l.pingBytes = 0
+	p := outPing{tok: wire.NewPingToken(), at: now, limited: l.appLimited || !backlogged}
+	l.pings = append(l.pings, p)
 	l.lastPingSent = now
-	l.pingLimited = l.appLimited || !backlogged
+	l.lastPingBytes = l.bytesSent.Load()
 	l.appLimited = false
 	buf = wire.AppendHeader(buf, wire.TypePing, wire.PingLen)
-	return wire.AppendPing(buf, l.pingTok), true
+	return wire.AppendPing(buf, p.tok), true
+}
+
+// windowOpen reports whether a lane pacing itself on PONGs may write more
+// DATA: the bytes written but not yet confirmed are under
+// windowGain × rate × min RTT + windowMin.
+func (l *Lane) windowOpen() bool {
+	w := l.windowBytes()
+	l.pingMu.Lock()
+	defer l.pingMu.Unlock()
+	return float64(l.bytesSent.Load()-l.confirmed) < w
+}
+
+// windowBytes is the cap on unconfirmed bytes for a lane without
+// TCP_NOTSENT_LOWAT.
+func (l *Lane) windowBytes() float64 {
+	if !l.rateSeen.Load() {
+		// A new connection is in slow start; until it has shown what it
+		// can deliver, offer it no more than a small first window.
+		return windowMin
+	}
+	rtt := time.Duration(l.baseRTT.Load())
+	if rtt <= 0 {
+		rtt = l.RTT()
+	}
+	return min(windowGain*l.Rate()*rtt.Seconds()+windowMin, windowMax)
+}
+
+// observeBase tracks the base RTT: the least PONG round trip seen in the
+// current and previous 10-second epochs, so it follows a path whose delay
+// really changed. Called with pingMu held.
+func (l *Lane) observeBase(sample time.Duration, now time.Time) {
+	if l.baseEpoch.IsZero() || now.Sub(l.baseEpoch) >= baseRTTEpoch {
+		l.basePrev, l.baseCur, l.baseEpoch = l.baseCur, 0, now
+	}
+	if l.baseCur == 0 || sample < l.baseCur {
+		l.baseCur = sample
+	}
+	base := l.baseCur
+	if l.basePrev != 0 && l.basePrev < base {
+		base = l.basePrev
+	}
+	l.baseRTT.Store(int64(base))
+}
+
+// needCoverPing reports whether a gated lane must send a PING so that a
+// PONG will come back and reopen its window.
+func (l *Lane) needCoverPing() bool {
+	l.pingMu.Lock()
+	defer l.pingMu.Unlock()
+	return len(l.pings) == 0
 }
 
 // onPong updates the estimates from a PONG. Every byte written before the
@@ -786,25 +970,45 @@ func (l *Lane) maybePing(buf []byte, now time.Time, backlogged bool) ([]byte, bo
 // PONGs over the time between them is a delivery-rate sample.
 func (l *Lane) onPong(tok uint64, now time.Time) {
 	l.pingMu.Lock()
-	defer l.pingMu.Unlock()
-	if !l.pingOut || tok != l.pingTok {
+	i := 0
+	for i < len(l.pings) && l.pings[i].tok != tok {
+		i++
+	}
+	if i == len(l.pings) {
+		l.pingMu.Unlock()
 		return
 	}
-	l.pingOut = false
-	if l.hasTCPInfo.Load() {
-		return // TCP_INFO already supplies RTT and rate
+	p := l.pings[i]
+	l.pings = l.pings[i+1:]
+	if len(l.pings) == 0 {
+		l.pings = nil
 	}
-	l.updateRTT(now.Sub(l.pingAt))
-	if l.pingBytes != 0 && !l.lastPong.IsZero() && l.pingBytes > l.lastPongBytes {
-		dt := now.Sub(l.lastPong).Seconds()
-		if dt > 0 {
-			l.updateRate(float64(l.pingBytes-l.lastPongBytes)/dt, l.pingLimited)
+	if p.bytes > l.confirmed {
+		l.confirmed = p.bytes
+		l.confirmedA.Store(p.bytes)
+	}
+	if !l.lowat {
+		l.observeBase(now.Sub(p.at), now)
+	}
+	if !l.hasTCPInfo.Load() { // otherwise TCP_INFO supplies RTT and rate
+		l.updateRTT(now.Sub(p.at))
+		// A delivery-rate sample spans at least one base RTT: PONGs
+		// arrive in bunches, and a sample over the gap between two of
+		// them says nothing.
+		l.rateLimited = l.rateLimited || p.limited
+		span := max(time.Duration(l.baseRTT.Load()), l.RTT()/2, minRateSpan)
+		switch {
+		case l.rateFrom.IsZero():
+			l.rateFrom, l.rateFromBytes, l.rateLimited = now, p.bytes, false
+		case now.Sub(l.rateFrom) >= span:
+			if p.bytes > l.rateFromBytes {
+				l.updateRate(float64(p.bytes-l.rateFromBytes)/now.Sub(l.rateFrom).Seconds(), l.rateLimited)
+			}
+			l.rateFrom, l.rateFromBytes, l.rateLimited = now, p.bytes, false
 		}
 	}
-	if l.pingBytes != 0 {
-		l.lastPong = now
-		l.lastPongBytes = l.pingBytes
-	}
+	l.pingMu.Unlock()
+	l.signal(l.wake) // a gated writer may go on
 }
 
 func (l *Lane) updateRTT(sample time.Duration) {
@@ -830,12 +1034,15 @@ func (l *Lane) updateRate(sample float64, appLimited bool) {
 		return
 	}
 	old := math.Float64frombits(l.rate.Load())
+	if !l.rateSeen.Swap(true) && !appLimited {
+		old = sample // the default was only a guess
+	}
 	var next float64
 	switch {
-	case !l.rateSampled.Swap(true):
-		next = sample
 	case appLimited:
 		next = max(old, sample)
+	case !l.rateSampled.Swap(true):
+		next = sample
 	default:
 		next = old*0.75 + sample*0.25
 	}
@@ -855,9 +1062,13 @@ func (l *Lane) monitor() {
 		}
 		now := time.Now()
 		l.pingMu.Lock()
-		out, at := l.pingOut, l.pingAt
+		out := len(l.pings) > 0
+		var at time.Time
+		if out {
+			at = l.pings[0].at
+		}
 		l.pingMu.Unlock()
-		if out && now.Sub(at) > PingTimeout {
+		if out && now.Sub(at) > l.pingTimeout {
 			l.finish(ErrPingTimeout)
 			return
 		}

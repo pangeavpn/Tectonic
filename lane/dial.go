@@ -220,7 +220,7 @@ func dialTCP(ctx context.Context, cfg DialConfig) (net.Conn, error) {
 				return err
 			}
 		}
-		setNotSentLowat(c, notSentLowat)
+		setNotSentLowat(c, notSentLowat) // New checks it took
 		return nil
 	}}
 	return d.DialContext(ctx, "tcp", cfg.Addr)

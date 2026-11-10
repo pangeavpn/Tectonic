@@ -9,10 +9,14 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func setNotSentLowat(rc syscall.RawConn, n int) {
-	_ = rc.Control(func(fd uintptr) {
-		_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, n)
-	})
+func setNotSentLowat(rc syscall.RawConn, n int) bool {
+	var err error
+	if cerr := rc.Control(func(fd uintptr) {
+		err = unix.SetsockoptInt(int(fd), unix.IPPROTO_TCP, unix.TCP_NOTSENT_LOWAT, n)
+	}); cerr != nil {
+		return false
+	}
+	return err == nil
 }
 
 func readTCPInfo(rc syscall.RawConn) (tcpInfo, bool) {

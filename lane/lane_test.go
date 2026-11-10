@@ -266,14 +266,11 @@ func TestCDNCarrier(t *testing.T) {
 }
 
 func TestPingEstimatesWithoutTCPInfo(t *testing.T) {
-	defer func(d time.Duration) { PingInterval = d }(PingInterval)
-	PingInterval = 20 * time.Millisecond
-
 	a, b := tcpPair(t)
 	// Delay one direction to give the RTT something to measure. Raw is
 	// left unset, so the lanes can't use TCP_INFO and fall back to PINGs.
-	ca := New(&slowConn{Conn: a, delay: 15 * time.Millisecond}, nil, Options{Role: Server})
-	cb := New(b, nil, Options{Role: Server})
+	ca := New(&slowConn{Conn: a, delay: 15 * time.Millisecond}, nil, Options{Role: Server, PingInterval: 20 * time.Millisecond})
+	cb := New(b, nil, Options{Role: Server, PingInterval: 20 * time.Millisecond})
 	defer ca.Close()
 	defer cb.Close()
 	if err := ca.Start(nil); err != nil {
@@ -286,7 +283,7 @@ func TestPingEstimatesWithoutTCPInfo(t *testing.T) {
 	for time.Now().Before(deadline) {
 		ca.Send(make([]byte, 1000))
 		time.Sleep(5 * time.Millisecond)
-		if ca.rttSampled.Load() && ca.rateSampled.Load() {
+		if ca.rttSampled.Load() && ca.rateSeen.Load() {
 			break
 		}
 	}
@@ -297,7 +294,7 @@ func TestPingEstimatesWithoutTCPInfo(t *testing.T) {
 	if !ca.rttSampled.Load() || st.SRTT < 15*time.Millisecond || st.SRTT > time.Second {
 		t.Fatalf("SRTT = %v (sampled %v)", st.SRTT, ca.rttSampled.Load())
 	}
-	if !ca.rateSampled.Load() || st.Rate <= 0 {
+	if !ca.rateSeen.Load() || st.Rate <= 0 {
 		t.Fatalf("rate never sampled: %+v", st)
 	}
 }
@@ -464,12 +461,10 @@ func TestSendRefusesWhenQueueIsFull(t *testing.T) {
 }
 
 func TestPingTimeoutEndsLane(t *testing.T) {
-	defer func(i, to time.Duration) { PingInterval, PingTimeout = i, to }(PingInterval, PingTimeout)
-	PingInterval, PingTimeout = 10*time.Millisecond, 200*time.Millisecond
 	a, b := net.Pipe()
 	defer b.Close()
 	go io.Copy(io.Discard, b) // reads but never answers PINGs
-	l := New(a, nil, Options{Role: Server})
+	l := New(a, nil, Options{Role: Server, PingInterval: 10 * time.Millisecond, PingTimeout: 200 * time.Millisecond})
 	if err := l.Start(nil); err != nil {
 		t.Fatal(err)
 	}
@@ -537,5 +532,37 @@ func TestSNIModeStrings(t *testing.T) {
 	}
 	if Direct.String() != "direct" || CDN.String() != "cdn" {
 		t.Fatal("carrier strings")
+	}
+}
+
+// Without TCP_NOTSENT_LOWAT a lane must not stuff the kernel: until PONGs
+// confirm delivery it writes at most one small first window, and it keeps a
+// PING outstanding so a PONG can reopen it.
+func TestFallbackWindowBoundsUnconfirmedBytes(t *testing.T) {
+	a, b := tcpPair(t)
+	go io.Copy(io.Discard, b) // reads everything, answers nothing
+	l := New(a, nil, Options{Role: Server})
+	defer l.Close()
+	if err := l.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	first := l.Stats().BytesSent
+	for range 2000 {
+		l.Send(make([]byte, 1400))
+	}
+	time.Sleep(200 * time.Millisecond)
+	st := l.Stats()
+	if st.NotSentLowat {
+		t.Skip("raw socket unexpectedly has TCP_NOTSENT_LOWAT")
+	}
+	written := st.BytesSent - first
+	if written < windowMin-shape.MaxRecord || written > windowMin+2*shape.MaxRecord {
+		t.Fatalf("wrote %d bytes with nothing confirmed; window is %d", written, windowMin)
+	}
+	if st.PingsOut == 0 {
+		t.Fatal("gated with no PING outstanding: nothing could ever reopen the window")
+	}
+	if st.Queued == 0 {
+		t.Fatal("the backlog should wait in the lane's queue, not the kernel")
 	}
 }
