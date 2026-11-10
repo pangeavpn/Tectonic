@@ -409,6 +409,7 @@ func TestRecordShaping(t *testing.T) {
 	l.mu.Lock() // hold the writer while the backlog builds
 	for range 40 {
 		l.data = append(l.data, make([]byte, 1420))
+		l.dataAt = append(l.dataAt, time.Now().UnixNano())
 		l.queued += 1423
 	}
 	l.mu.Unlock()
@@ -570,10 +571,13 @@ func TestFallbackWindowBoundsUnconfirmedBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	first := l.Stats().BytesSent
-	for range 2000 {
-		l.Send(make([]byte, 1400))
+	// The first burst fills the window; the second finds it closed.
+	for range 2 {
+		for range 2000 {
+			l.Send(make([]byte, 1400))
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	time.Sleep(200 * time.Millisecond)
 	st := l.Stats()
 	if st.NotSentLowat {
 		t.Skip("raw socket unexpectedly has TCP_NOTSENT_LOWAT")

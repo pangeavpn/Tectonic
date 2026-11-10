@@ -29,6 +29,8 @@ type PoolLane interface {
 	Close() error
 	Stats() lane.Stats
 	RTT() time.Duration
+	// BaseRTT is the lane's round trip without any queueing.
+	BaseRTT() time.Duration
 	SetPlanner(*shape.Planner)
 }
 
@@ -586,7 +588,7 @@ func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
 	}
 	var rtt time.Duration
 	for st := range p.lanes {
-		if r := st.l.RTT(); r > 0 && (rtt == 0 || r < rtt) {
+		if r := st.l.BaseRTT(); r > 0 && (rtt == 0 || r < rtt) {
 			rtt = r
 		}
 	}
@@ -612,7 +614,7 @@ func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
 			}
 			var rtt time.Duration
 			if l != nil {
-				rtt = l.RTT()
+				rtt = l.BaseRTT()
 			}
 			p.source(ref).Push(pkt, rtt)
 		},

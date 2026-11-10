@@ -68,12 +68,13 @@ func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) b
 	}
 	src := ss.reseq.Source()
 	l := lane.New(conn, br, lane.Options{
-		Role:    lane.Server,
-		Planner: shape.NewPlanner(s.profile),
-		Raw:     raw,
-		Logger:  s.log,
+		Role:       lane.Server,
+		Planner:    shape.NewPlanner(s.profile),
+		Raw:        raw,
+		InitialRTT: ss.baseRTT(),
+		Logger:     s.log,
 		Handler: lane.Handler{
-			Data: func(l *lane.Lane, pkt []byte) { src.Push(pkt, l.RTT()) },
+			Data: func(l *lane.Lane, pkt []byte) { src.Push(pkt, l.BaseRTT()) },
 			// Nothing more will arrive on the lane, so the packets other
 			// lanes deliver no longer wait for it.
 			End: func(*lane.Lane) { src.Close() },
@@ -178,6 +179,20 @@ func (ss *session) add(l *lane.Lane, maxLanes int) bool {
 		victim.Retire()
 	}
 	return true
+}
+
+// baseRTT is the least round trip among the session's lanes, which seeds a
+// new lane's estimate; zero if there are none.
+func (ss *session) baseRTT() time.Duration {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	var rtt time.Duration
+	for _, li := range ss.lanes {
+		if r := li.l.BaseRTT(); r > 0 && (rtt == 0 || r < rtt) {
+			rtt = r
+		}
+	}
+	return rtt
 }
 
 func (ss *session) liveLocked() int {

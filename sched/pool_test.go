@@ -85,6 +85,7 @@ func (l *fakeLane) Stats() lane.Stats {
 	return l.stats
 }
 func (l *fakeLane) RTT() time.Duration        { return 10 * time.Millisecond }
+func (l *fakeLane) BaseRTT() time.Duration    { return 10 * time.Millisecond }
 func (l *fakeLane) SetPlanner(*shape.Planner) {}
 func (l *fakeLane) isDone() bool {
 	select {
