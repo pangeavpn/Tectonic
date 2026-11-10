@@ -246,9 +246,11 @@ TLS hides what's inside the traffic, but WireGuard still has a recognisable shap
 | Traffic state | What Tectonic does | Overhead |
 |---|---|---|
 | Bulk transfer | Packs `DATA` frames into records of up to 16 KB, like a real download | ≈ 0% |
-| Interactive | Rounds record sizes up to buckets taken from a recorded browsing profile | Small |
+| Interactive | Gives a record up to a millisecond to fill, then rounds its size up to a bucket taken from a recorded browsing profile. A few packets that would need a lot of padding together are divided between two records that each fit a bucket closely. | Small |
 | Lane start | Pads the first flight in each direction to match Chrome loading a page over HTTP/2 | Once per lane |
 | Idle | Absorbs WireGuard keepalives into browser-like idle behaviour, closes the lane, and opens a fresh one when traffic resumes | Tiny |
+
+The wait matters as much as the padding. Packets inside the tunnel come in trains: the segments of a reply, the ACKs that answer them. Sent one to a record, each pays for its own TLS framing, its own padding and, being slightly larger than one TCP segment with them, two TCP headers. A millisecond is enough to turn a train into one record.
 
 Shaping profiles are data, not code. `WELCOME` tells the client which profile to use, so new profiles can be rolled out from the hub without a protocol change.
 

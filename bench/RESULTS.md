@@ -1,59 +1,65 @@
 # Benchmark results
 
-**Bottom line:** on this simulator Tectonic now meets six of the eight §13
-targets, where the first run met three. On a clean link it carries 88–100% of
-what plain WireGuard does, against 17% before. It still misses the interactive
-overhead target, and sits on the line for bulk overhead. Per design §13 it
-isn't called faster until the numbers exist on real networks, and the bench
-measures only one of the two paths a lane can take; see
-[What this doesn't measure](#what-this-doesnt-measure).
+**Bottom line:** on this simulator Tectonic now meets seven of the eight §13
+targets in the latest full run, where the first run met three. On a clean
+link it carries 81–101% of what plain WireGuard does (92% on average over
+eleven runs), against 17% before. Interactive overhead is 9%, against 29%.
+Latency under load is the target still in doubt: it lands on either side of
+the line from run to run. Per design §13 Tectonic isn't called faster until
+the numbers exist on real networks, and the bench measures only one of the two
+paths a lane can take; see [What this doesn't measure](#what-this-doesnt-measure).
 
 ## Latest full run
 
 `go run .` at the commit that added this version of the file. Go 1.27.3,
-darwin/amd64, 4 cores, inner TCP without RACK. The machine was **not idle**
-during this run: plain WireGuard reached 48 Mbit/s on the clean link, where
-it reaches 87–90 on a quiet machine. Transports within the run share the same
-conditions, so the comparisons hold, but for clean-link throughput and bulk
-overhead read the five quieter runs in the next section.
+darwin/amd64, 4 cores, inner TCP without RACK, on a machine that was nearly
+idle (load average 2.5–5.5).
 
 | Measurement | Target | Result | |
 |---|---|---|---|
-| Time to first WireGuard packet | ≤ 2 RTT | 2.06 RTT (median of 5, in measured round trips of 53.5 ms on a 50 ms link) | ✅ |
-| Clean link: wireguard | | 48.4 Mbit/s | |
-| Clean link: tectonic | | 52.4 Mbit/s | |
-| Clean link: reality | | 51.6 Mbit/s | |
-| Clean link: anytls | | 29.4 Mbit/s | |
-| Throughput on a clean link (100 Mbit/s, 50 ms) | ≥ 90% of plain WireGuard over UDP | 108% (52.4 vs 48.4 Mbit/s) | ✅ |
-| Bandwidth overhead, bulk transfer | ≤ 3% | 4.8% more link bytes than WireGuard over UDP | ❌ |
-| 1% loss: wireguard | | 2.0 Mbit/s | |
-| 1% loss: tectonic | | 1.4 Mbit/s | |
-| 1% loss: reality | | 0.9 Mbit/s | |
+| Time to first WireGuard packet | ≤ 2 RTT | 2.08 RTT (median of 5, in measured round trips of 51.3 ms on a 50 ms link) | ✅ |
+| Clean link: wireguard | | 86.5 Mbit/s | |
+| Clean link: tectonic | | 87.2 Mbit/s | |
+| Clean link: reality | | 85.1 Mbit/s | |
+| Clean link: anytls | | 84.7 Mbit/s | |
+| Throughput on a clean link (100 Mbit/s, 50 ms) | ≥ 90% of plain WireGuard over UDP | 101% (87.2 vs 86.5 Mbit/s) | ✅ |
+| Bandwidth overhead, bulk transfer | ≤ 3% | 0.6% more link bytes than WireGuard over UDP | ✅ |
+| 1% loss: wireguard | | 2.1 Mbit/s | |
+| 1% loss: tectonic | | 1.6 Mbit/s | |
+| 1% loss: reality | | 1.0 Mbit/s | |
 | 1% loss: anytls | | 1.0 Mbit/s | |
-| Throughput with 1% random loss | Clearly above REALITY and AnyTLS | 1.5× the better of the two | ✅ |
+| Throughput with 1% random loss | Clearly above REALITY and AnyTLS | 1.6× the better of the two | ✅ |
 | 4 Mbit/s per-connection cap: reality | | 3.3 Mbit/s | |
-| Throughput under a 4 Mbit/s per-connection cap | Rises with the number of lanes, up to max_lanes | 5.8 Mbit/s with 2 lanes after 45 s (most lanes seen: 3) | ✅ |
-| Latency under load: wireguard | | idle 52 ms; loaded p50 76 ms, p95 87 ms (1.7× idle) | |
-| Latency under load (20 Mbit/s, 50 ms) | Ping stays within 2× idle RTT | idle 53 ms; loaded p50 82 ms, p95 97 ms (1.8× idle) | ✅ |
-| Latency under load: reality | | idle 53 ms; loaded p50 154 ms, p95 276 ms (5.2× idle) | |
-| Recovery from a reset lane | No visible stall in a TCP transfer inside the tunnel | longest stall 37 ms after the reset (40 ms before); 39.5 Mbit/s afterwards | ✅ |
-| Reset during a transfer: reality | | transfer stopped: the tunnel did not survive the reset | |
-| Bandwidth overhead, interactive use | ≤ 15% | 27.1% more link bytes than WireGuard over UDP | ❌ |
+| Throughput under a 4 Mbit/s per-connection cap | Rises with the number of lanes, up to max_lanes | 9.7 Mbit/s with 3 lanes after 45 s (most lanes seen: 3) | ✅ |
+| Latency under load: wireguard | | idle 53 ms; loaded p50 73 ms, p95 91 ms (1.7× idle) | |
+| Latency under load (20 Mbit/s, 50 ms) | Ping stays within 2× idle RTT | idle 56 ms; loaded p50 83 ms, p95 115 ms (2.1× idle) | ❌ |
+| Latency under load: reality | | idle 54 ms; loaded p50 86 ms, p95 267 ms (5.0× idle) | |
+| Recovery from a reset lane | No visible stall in a TCP transfer inside the tunnel | longest stall 79 ms after the reset (none before); 35.6 Mbit/s afterwards | ✅ |
+| Reset during a transfer: reality | | the transfer carried nothing after the reset | |
+| Bandwidth overhead, interactive use | ≤ 15% | 8.8% more link bytes than WireGuard over UDP | ✅ |
 
-## Clean link, five runs on a quieter machine
+## Clean link, eleven runs
 
-`go run . -run clean -transports tectonic`, back to back.
+The full run above and ten of `go run . -run clean -transports tectonic`, all
+at the same commit.
 
-| Run | WireGuard | Tectonic | Ratio | Bulk overhead |
-|---|---|---|---|---|
-| 1 | 86.9 Mbit/s | 87.1 Mbit/s | 100% | 1.9% |
-| 2 | 90.0 Mbit/s | 86.7 Mbit/s | 96% | 3.0% |
-| 3 | 89.7 Mbit/s | 78.6 Mbit/s | 88% | 3.5% |
-| 4 | 89.7 Mbit/s | 81.4 Mbit/s | 91% | 2.3% |
-| 5 | 87.2 Mbit/s | 82.9 Mbit/s | 95% | 3.6% |
+| Run | WireGuard | Tectonic | Ratio |
+|---|---|---|---|
+| 1 (the full run) | 86.5 Mbit/s | 87.2 Mbit/s | 101% |
+| 2 | 79.4 Mbit/s | 76.4 Mbit/s | 96% |
+| 3 | 88.2 Mbit/s | 78.1 Mbit/s | 89% |
+| 4 | 86.6 Mbit/s | 80.3 Mbit/s | 93% |
+| 5 | 89.0 Mbit/s | 72.1 Mbit/s | 81% |
+| 6 | 88.0 Mbit/s | 79.2 Mbit/s | 90% |
+| 7 | 88.2 Mbit/s | 80.2 Mbit/s | 91% |
+| 8 | 87.1 Mbit/s | 82.1 Mbit/s | 94% |
+| 9 | 88.1 Mbit/s | 81.5 Mbit/s | 93% |
+| 10 | 86.7 Mbit/s | 87.8 Mbit/s | 101% |
+| 11 | 88.0 Mbit/s | 72.8 Mbit/s | 83% |
 
-Four of the five meet the 90% target; the mean is 83.3 against 88.7 Mbit/s,
-94%. Bulk overhead is at the 3% target, on either side of it from run to run.
+The mean is 92%. Seven of the eleven are at or above 90%, and run 6 misses
+it by a rounding. So the target is met more often than not, and not every
+time. Bulk overhead in runs 1–6 was 0.6%, 0.0%, 1.6%, 2.3%, 3.7% and 0.8%.
 
 ## Why it was slow, and what changed
 
@@ -100,26 +106,69 @@ Four things did the damage, and each has been changed:
      queue on the link overflowed, and the lane stalled on a retransmission.
 
 Small packets (pings, ACKs) also go out ahead of queued bulk data now, which
-is what brought latency under load from 2.9× to 1.8× of idle.
+is what brought latency under load from 2.9× of idle to about 2×.
+
+## Interactive overhead: from 29% to 9%
+
+Counting where the bytes went showed that padding was the largest single
+cost, but not for the reason first given. Nearly every packet was going out
+as a record of its own:
+
+| Share of payload, both directions | Before | After |
+|---|---|---|
+| What plain WireGuard puts on the link | 115% | 115% |
+| What Tectonic puts on the link | 149% | 124% |
+| of which padding | 19% | 3% |
+| of which TCP/IP headers and TCP's own ACKs | 16% | 10% |
+| of which TLS framing | 2% | 1% |
+| Link packets, for 740–820 WireGuard packets | 1882 | 1192 |
+
+Packets inside the tunnel come in trains: the segments of a reply, the ACKs
+that answer them. One to a record, each was padded up to a bucket by itself,
+paid for its own TLS framing and, being slightly larger than one TCP segment
+with them, went out as two. Two changes:
+
+- **A record waits up to a millisecond to fill** (less on a short path: a
+  sixteenth of the round trip). That alone took the overhead to about 10.5%.
+  Shorter waits save less: 13% at 250 µs and 10.5% at 500 µs with both
+  changes in, against 9% at 1 ms; 2 ms gains nothing more.
+- **A few packets that would need a lot of padding together are divided
+  between two records.** Three full-size packets pad from 4.4 KB to the 6144
+  bucket as one record; as two and one they pad by 250 bytes in all, and
+  every record still comes out at a bucket's size. Over five pairs of runs
+  this was worth 1.7 points (8.9% against 10.6%).
+
+Seventeen runs of the final code gave 8.1–9.7%. The wait also packs the ACKs
+of a bulk download, which is why bulk overhead, 2–4% before, is now under the
+3% target in five runs of six. It costs latency: an idle ping inside the
+tunnel measures 54–56 ms where it measured 52–53.
+
+About 6 of the 9 points left are TCP's own: a 52-byte header where UDP has
+28, and an ACK for every other segment. Another 2.5 are padding, which the
+profile's bucket table sets; the buckets in the default profile are
+placeholders until real Chrome sessions are recorded (milestone M5), and a
+finer table would pad less at the price of hiding sizes less well.
 
 ## What the misses and the variation come from
 
-**Clean link, run to run (88–100%).** Start-up is now clean in nearly every
+**Clean link, run to run (81–101%).** Start-up is now clean in nearly every
 run: no loss and nothing late. What varies is where the inner TCP itself
 leaves slow start. gVisor's HyStart stops at the first rise of about 6 ms in
 round-trip time. When that happens near the link's capacity the flow sits at
 87–89 Mbit/s from the first second, level with WireGuard. When jitter trips
 it at half of capacity, the flow spends the measurement climbing. The other
 cost is hand-over on a saturated link: a new TCP connection next to a busy one
-grows slowly whatever Tectonic does, and until it has grown the stream runs a
-few milliseconds later than it otherwise would.
+grows slowly whatever Tectonic does, and now and then a queue on the path
+still overflows during one, which stalls a lane.
 
-**Bulk overhead (1.9–3.6%, target 3%).** PINGs and their PONGs, several per
-round trip on this path, plus TLS and TCP headers on records that go out
-before they fill. It was 9.4%; most of that was padding on the small records
-of a slow transfer.
+**Latency under load (2.1× here; 1.7–2.1× over four runs).** On the line, not
+clear of it. Plain WireGuard measures 1.7–1.8× on the same link. What is left
+is the queue below the lane: a lane at capacity keeps up to half a round
+trip's worth of data outstanding beyond what the path carries at once, and a
+ping waits behind that. The millisecond a record waits adds a little to both
+the idle and the loaded figure.
 
-**1% loss (1.5× here, 1.0–1.5× over several runs).** Every transport manages
+**1% loss (1.6× here, 1.0–1.6× over several runs).** Every transport manages
 1–2 Mbit/s on this link, so the ratio moves with the noise and should not be
 read as settled. A lost segment stalls its lane for 100–300 ms on this TCP
 stack, which is longer than the receiver can wait without the inner TCP
@@ -127,20 +176,10 @@ timing out, so the inner TCP still sees most outer losses as reordering.
 Tectonic does not yet turn several lossy lanes into several times the
 throughput.
 
-**Latency under load (1.8× here).** Two other runs of this scenario gave
-1.6× and 2.2×, so it is on the line, not clear of it. Plain WireGuard measures
-1.7–1.8× on the same link. What is left is the queue below the lane: a lane
-at capacity keeps up to half a round trip's worth of data outstanding beyond
-what the path carries at once, and a ping waits behind that.
-
-**Per-connection cap (5.8 Mbit/s over two lanes).** Above the 4 Mbit/s one
-connection gets, and the pool probed a third lane. The pass mark is lenient;
-two capped lanes could carry 8.
-
-**Interactive overhead (27%).** Small records pay for TLS and TCP headers,
-and are padded up to the default profile's buckets. Those buckets are
-placeholders until real Chrome sessions are recorded (milestone M5). Nothing
-in this round of changes was aimed at it.
+**Per-connection cap (9.7 Mbit/s over three lanes).** Well above the
+4 Mbit/s one connection gets, and the pool grew to a third lane and kept it.
+Three capped lanes could carry 12. An earlier run of the same scenario gave
+5.8 Mbit/s over two lanes.
 
 ## What this doesn't measure
 
@@ -151,8 +190,8 @@ that path, which in production only Windows takes.
 
 Linux, Android, macOS and iOS take the other path: the kernel holds at most
 32 KB unsent, and rate and RTT come from `TCP_INFO`. The receiver's merge, the
-scheduler, the queue limit, small-packet priority and hand-over are shared
-and apply there too, but **that path has not been measured**. One thing to
+scheduler, the queue limit, small-packet priority, the way records are filled
+and hand-over are shared and apply there too, but **that path has not been measured**. One thing to
 check on it: a lane that has just opened can still hide up to 32 KB in the
 kernel, which is several round trips' worth for a cold connection, and the
 scheduler does not see it.
