@@ -2,6 +2,8 @@ package shape
 
 import (
 	"encoding/json"
+	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 
@@ -125,6 +127,90 @@ func TestInteractivePadding(t *testing.T) {
 	}
 	if pl.Padding(Bulk, 100) != 0 {
 		t.Fatal("bulk records must not be padded")
+	}
+}
+
+func TestSplitDividesFramesToFitBuckets(t *testing.T) {
+	pl := NewPlanner(nil)
+	const pkt = 1455 // a full-size WireGuard packet in its DATA frame
+	full := func(n int) []int {
+		s := make([]int, n)
+		for i := range s {
+			s[i] = pkt
+		}
+		return s
+	}
+	// records sends frames the way a lane would, and returns each record's
+	// size on the wire and the padding in all.
+	records := func(base int, sizes []int) (out []int, pad int) {
+		for len(sizes) > 0 {
+			k := pl.Split(base, sizes)
+			if k < 1 || k > len(sizes) {
+				t.Fatalf("Split(%d, %v) = %d", base, sizes, k)
+			}
+			size := base
+			for _, s := range sizes[:k] {
+				size += s
+			}
+			p := pl.Padding(Interactive, size)
+			out, pad = append(out, size+p), pad+p
+			sizes, base = sizes[k:], 0
+		}
+		return out, pad
+	}
+	for _, tc := range []struct {
+		n    int
+		want []int
+	}{
+		{1, []int{1536}},
+		{2, []int{3072}},
+		// Three in one record would pad to 6144, wasting 1779 bytes.
+		{3, []int{3072, 1536}},
+		{4, []int{6144}},
+		// Five in one would pad to 8192, wasting 917.
+		{5, []int{6144, 1536}},
+	} {
+		got, _ := records(0, full(tc.n))
+		if !slices.Equal(got, tc.want) {
+			t.Errorf("%d full packets go out as %v, want %v", tc.n, got, tc.want)
+		}
+	}
+	// However the frames fall, dividing them never costs more than sending
+	// them in one record, and every record is a bucket's size.
+	rng := rand.New(rand.NewPCG(1, 2))
+	for range 2000 {
+		n := 1 + rng.IntN(MaxSplit)
+		sizes := make([]int, n)
+		sum := 0
+		for i := range sizes {
+			sizes[i] = 35 + rng.IntN(1421)
+			if sum+sizes[i] >= pl.Profile().BulkThreshold {
+				sizes = sizes[:i]
+				break
+			}
+			sum += sizes[i]
+		}
+		if len(sizes) == 0 {
+			continue
+		}
+		base := rng.IntN(2) * 11 // sometimes a PONG goes first
+		got, pad := records(base, sizes)
+		one := pl.Padding(Interactive, base+sum)
+		if cost := pad + (len(got)-1)*splitCost; cost > one {
+			t.Fatalf("%v after %d: divided as %v costing %d, but one record costs %d", sizes, base, got, cost, one)
+		}
+		for _, r := range got {
+			if !slices.Contains(pl.Profile().Buckets, r) {
+				t.Fatalf("%v after %d: record of %d bytes is not a bucket", sizes, base, r)
+			}
+		}
+	}
+	// Too many frames to weigh, or just one: all in one record.
+	if got := pl.Split(0, make([]int, MaxSplit+1)); got != MaxSplit+1 {
+		t.Fatalf("Split of %d frames = %d", MaxSplit+1, got)
+	}
+	if got := pl.Split(0, nil); got != 0 {
+		t.Fatalf("Split of nothing = %d", got)
 	}
 }
 

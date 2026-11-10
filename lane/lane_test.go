@@ -450,6 +450,31 @@ func TestRecordWaitsAMomentToFill(t *testing.T) {
 	}
 }
 
+func TestInteractiveRecordsAreDividedToFitBuckets(t *testing.T) {
+	prof := shape.Default()
+	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	l, rc := pipeLane(t, prof)
+	if err := l.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	// Three full-size packets in one record would be padded from 4.4 KB to
+	// the 6144 bucket. Two and then one pad to 3072 and 1536, and both
+	// records go out without waiting on each other.
+	l.mu.Lock() // hold the writer while the packets queue
+	for range 3 {
+		l.data = append(l.data, make([]byte, 1452))
+		l.dataAt = append(l.dataAt, time.Now().UnixNano())
+		l.queued += 1455
+	}
+	l.mu.Unlock()
+	l.signal(l.wake)
+	waitWrites(t, rc, 3)
+	time.Sleep(20 * time.Millisecond)
+	if got := rc.sizes()[1:]; len(got) != 2 || got[0] != 3072 || got[1] != 1536 {
+		t.Fatalf("records %v, want [3072 1536]", got)
+	}
+}
+
 func TestIdleKeepalivesAreDelayedAndPadded(t *testing.T) {
 	prof := shape.Default()
 	prof.IdleAfter = shape.Duration(time.Millisecond)

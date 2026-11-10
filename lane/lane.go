@@ -982,6 +982,9 @@ func (l *Lane) writeLoop() error {
 	var drainFrom time.Time
 	var drainBytes int
 	var pace pacer
+	// more is set when the last record left packets behind on purpose, to
+	// go out at once in a record of their own (see shape.Planner.Split).
+	more := false
 	for {
 		l.mu.Lock()
 		if len(l.ctrl) == 0 && len(l.data) == 0 && len(l.small) == 0 {
@@ -1053,7 +1056,7 @@ func (l *Lane) writeLoop() error {
 			}
 		}
 		// Give a record a moment to fill.
-		if !gated && !idle && !l.retiring && !l.closing &&
+		if !more && !gated && !idle && !l.retiring && !l.closing &&
 			l.queued+len(l.ctrl) < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
 				hold := min(flushDelay, l.RTT()/16)
@@ -1082,13 +1085,29 @@ func (l *Lane) writeLoop() error {
 		closing := l.closing
 		queuedBefore := l.queued
 		var dataBytes, pkts, real int
+		// An interactive record is padded up to a bucket, so a few queued
+		// packets may cost less padding divided between two records.
+		take := len(l.small) + len(l.data)
+		if n := take; n > 1 && n <= shape.MaxSplit && !gated && !busy && !idle &&
+			pl.Mode(l.queued, false) == shape.Interactive {
+			var sizes [shape.MaxSplit]int
+			for i, p := range l.small {
+				sizes[i] = wire.HeaderLen + len(p)
+			}
+			for i, p := range l.data {
+				sizes[len(l.small)+i] = wire.HeaderLen + len(p)
+			}
+			take = pl.Split(len(buf), sizes[:n])
+		}
+		more = take < len(l.small)+len(l.data)
 		// Small packets first, and even while the window is closed: they
 		// add next to nothing to what is outstanding.
-		for len(l.small) > 0 {
+		for len(l.small) > 0 && take > 0 {
 			p := l.small[0]
 			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
 				break
 			}
+			take--
 			buf = wire.AppendFrame(buf, wire.TypeData, p)
 			l.small[0] = nil
 			l.small = l.small[1:]
@@ -1100,11 +1119,12 @@ func (l *Lane) writeLoop() error {
 		if len(l.small) == 0 {
 			l.small = l.small[:0:0]
 		}
-		for !gated && len(l.data) > 0 {
+		for !gated && len(l.data) > 0 && take > 0 {
 			p := l.data[0]
 			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
 				break
 			}
+			take--
 			buf = wire.AppendFrame(buf, wire.TypeData, p)
 			l.data[0] = nil
 			l.data, l.dataAt = l.data[1:], l.dataAt[1:]

@@ -98,6 +98,57 @@ func (pl *Planner) Padding(mode Mode, size int) int {
 	return 0
 }
 
+const (
+	// splitCost is what one more record costs on the wire beyond the frames
+	// in it: its TLS framing, and most of the time a TCP header, since a
+	// record that ends before a segment is full sends that segment short.
+	splitCost = 64
+	// MaxSplit is the most frames Split weighs. More than that make a
+	// record large enough that its padding is a small part of it.
+	MaxSplit = 16
+)
+
+// Split reports how many of the frames waiting to be sent, of the given
+// sizes and in that order, should go in the next record, which already
+// holds base bytes. It is for interactive records, each of which is padded
+// up to a bucket: how the frames are divided between records then decides
+// how much padding they take. Three full-size packets in one record pad
+// from 4.4 KB to 6.1 KB; as two and then one they pad by 250 bytes in all,
+// and every record still comes out at a bucket's size.
+//
+// Split picks the division that puts the fewest bytes on the wire,
+// counting splitCost for each record after the first, and returns how many
+// frames the first record takes. That is all of them when one record is
+// best, or when there are more than MaxSplit.
+func (pl *Planner) Split(base int, sizes []int) int {
+	n := len(sizes)
+	if n <= 1 || n > MaxSplit {
+		return n
+	}
+	// rest[i] is the least it costs to send frames i onwards in records of
+	// their own.
+	var rest [MaxSplit + 1]int
+	for i := n - 1; i >= 0; i-- {
+		best, sum := -1, 0
+		for j := i; j < n; j++ {
+			sum += sizes[j]
+			if c := splitCost + pl.Padding(Interactive, sum) + rest[j+1]; best < 0 || c < best {
+				best = c
+			}
+		}
+		rest[i] = best
+	}
+	best, take, sum := -1, n, base
+	for j := range n {
+		sum += sizes[j]
+		// On a tie the later division wins: fewer records.
+		if c := pl.Padding(Interactive, sum) + rest[j+1]; best < 0 || c <= best {
+			best, take = c, j+1
+		}
+	}
+	return take
+}
+
 // FirstFlightPadding returns the padding that brings a lane's first flight
 // of size bytes up to a size drawn from the profile's range for that
 // direction. A flight already at or above the drawn size gets none.
