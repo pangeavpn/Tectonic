@@ -9,10 +9,11 @@
 //	go run .                      # every scenario
 //	go run . -run 'clean|loss'    # some of them
 //	go run . -quick               # shorter measurements
+//	go run . -kernel              # over a kernel path (Linux; see bench/knet)
 //
-// Numbers depend on the machine: everything, TCP stacks included, runs in
-// this process. Run on an idle machine and compare transports within one
-// run rather than across runs.
+// Numbers depend on the machine: on the simulated link everything, TCP
+// stacks included, runs in this process. Run on an idle machine and compare
+// transports within one run rather than across runs.
 package main
 
 import (
@@ -24,6 +25,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/pangeavpn/tectonic/bench/knet"
 )
 
 func main() {
@@ -34,7 +37,35 @@ func main() {
 	verbose := flag.Bool("v", false, "log progress")
 	list := flag.Bool("list", false, "list scenarios and exit")
 	flag.BoolVar(&innerRACK, "inner-rack", false, "use RACK loss detection in the TCP inside the tunnel (gVisor's can stall on RTOs)")
+	useKernel := flag.Bool("kernel", false, "run over a kernel path: network namespaces, veth and netem/tbf/fq, with Linux TCP (Linux only; needs the modules listed in bench/knet)")
+	inner := flag.String("inner", "kernel", "with -kernel, the TCP inside the tunnel: kernel (TUN devices) or gvisor")
+	serverCC := flag.String("server-cc", "", "with -kernel, congestion control for the node's outer TCP connections, e.g. bbr (default: the kernel's, cubic)")
 	flag.Parse()
+
+	if *useKernel {
+		code, ran, err := knet.Reexec()
+		if ran {
+			os.Exit(code)
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "bench:", err)
+			os.Exit(1)
+		}
+		if kernel, err = knet.New(); err != nil {
+			fmt.Fprintln(os.Stderr, "bench:", err)
+			os.Exit(1)
+		}
+		defer kernel.Close()
+		kernel.ServerCC = *serverCC
+		switch *inner {
+		case "kernel":
+			kernelInner = true
+		case "gvisor":
+		default:
+			fmt.Fprintf(os.Stderr, "bench: -inner %q: want kernel or gvisor\n", *inner)
+			os.Exit(2)
+		}
+	}
 
 	if *list {
 		for _, s := range scenarios {
@@ -67,8 +98,8 @@ func main() {
 	o.selected = func(t transport) bool { return len(want) == 0 || want[t] || t == tWireGuard && want[tTectonic] }
 
 	ctx := context.Background()
-	fmt.Printf("# Tectonic benchmarks\n\n%s, %s/%s, GOMAXPROCS=%d, %s per measurement, inner TCP RACK %v\n\n",
-		runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.GOMAXPROCS(0), o.dur, innerRACK)
+	fmt.Printf("# Tectonic benchmarks\n\n%s, %s/%s, GOMAXPROCS=%d, %s per measurement\n\n%s\n\n",
+		runtime.Version(), runtime.GOOS, runtime.GOARCH, runtime.GOMAXPROCS(0), o.dur, describePath())
 	fmt.Println("| Measurement | Target | Result | |")
 	fmt.Println("|---|---|---|---|")
 	failures := 0

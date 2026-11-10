@@ -23,6 +23,7 @@ import (
 	"github.com/pangeavpn/tectonic/bench/internal/stacktune"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
+	"golang.zx2c4.com/wireguard/tun"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
@@ -41,7 +42,8 @@ const DefaultMTU = 1420
 type Peer struct {
 	Device *device.Device
 	// Net opens sockets inside the tunnel (DialContextTCPAddrPort,
-	// ListenTCPAddrPort, ListenUDPAddrPort, ...).
+	// ListenTCPAddrPort, ListenUDPAddrPort, ...). Nil when PairConfig.TUN
+	// supplied the device.
 	Net *netstack.Net
 	// Stack is the gVisor stack behind Net: CUBIC, SACK, RACK and 4 MiB
 	// socket buffers (see internal/stacktune). Change protocol options here
@@ -77,6 +79,12 @@ type PairConfig struct {
 	PersistentKeepalive int
 	// Logger receives wireguard-go's log; nil discards it.
 	Logger *device.Logger
+	// TUN, if set, supplies each peer's tunnel device in place of a gVisor
+	// netstack: a real kernel TUN, for instance, so that the TCP inside the
+	// tunnel is the kernel's. server reports which peer is asking. Peers
+	// made this way have no Net or Stack; open sockets through whatever
+	// owns the device.
+	TUN func(server bool, addr netip.Addr, mtu int) (tun.Device, error)
 }
 
 // NewPair creates, configures and starts a server peer and then a client
@@ -105,7 +113,7 @@ func NewPair(cfg PairConfig) (client, server *Peer, err error) {
 		return nil, nil, err
 	}
 
-	server, err = newPeer(ServerAddr, cfg.MTU, cfg.ServerBind, cfg.Logger, serverKey)
+	server, err = newPeer(ServerAddr, cfg.MTU, cfg.ServerBind, cfg.Logger, serverKey, cfg.TUN, true)
 	if err != nil {
 		return nil, nil, fmt.Errorf("wgnet: server: %w", err)
 	}
@@ -129,7 +137,7 @@ func NewPair(cfg PairConfig) (client, server *Peer, err error) {
 		endpoint = netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), port).String()
 	}
 
-	client, err = newPeer(ClientAddr, cfg.MTU, cfg.ClientBind, cfg.Logger, clientKey)
+	client, err = newPeer(ClientAddr, cfg.MTU, cfg.ClientBind, cfg.Logger, clientKey, cfg.TUN, false)
 	if err != nil {
 		server.Close()
 		return nil, nil, fmt.Errorf("wgnet: client: %w", err)
@@ -148,7 +156,17 @@ func NewPair(cfg PairConfig) (client, server *Peer, err error) {
 	return client, server, nil
 }
 
-func newPeer(addr netip.Addr, mtu int, bind conn.Bind, log *device.Logger, key *ecdh.PrivateKey) (*Peer, error) {
+func newPeer(addr netip.Addr, mtu int, bind conn.Bind, log *device.Logger, key *ecdh.PrivateKey,
+	mkTUN func(bool, netip.Addr, int) (tun.Device, error), server bool) (*Peer, error) {
+	if mkTUN != nil {
+		dev, err := mkTUN(server, addr, mtu)
+		if err != nil {
+			return nil, err
+		}
+		p := &Peer{Device: device.NewDevice(dev, bind, log), Addr: addr}
+		copy(p.PublicKey[:], key.PublicKey().Bytes())
+		return p, nil
+	}
 	tunDev, tnet, err := netstack.CreateNetTUN([]netip.Addr{addr}, nil, mtu)
 	if err != nil {
 		return nil, err

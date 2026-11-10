@@ -56,16 +56,20 @@ const (
 	coverDomain  = "node.bench.test"
 )
 
-// env is one transport running over one simulated link, with WireGuard
-// peers on either side whose netstacks carry the test traffic.
+// env is one transport running over one path, with WireGuard peers on
+// either side whose networks carry the test traffic.
 type env struct {
 	tr     transport
-	L      *link.Link
+	P      path
 	client *wgnet.Peer
 	server *wgnet.Peer
-	conn   *tectonic.Conn // tTectonic only
-	node   *server.Server // tTectonic only
-	close  []func()
+	// cli and srv open sockets inside the tunnel, on the client and server
+	// peers; srvAddr is the server peer's tunnel address.
+	cli, srv tunnelNet
+	srvAddr  netip.Addr
+	conn     *tectonic.Conn // tTectonic only
+	node     *server.Server // tTectonic only
+	close    []func()
 }
 
 func (e *env) Close() {
@@ -125,14 +129,14 @@ func freeUDPPort() (uint16, error) {
 	return uint16(c.LocalAddr().(*net.UDPAddr).Port), nil
 }
 
-// newEnv builds a link and brings WireGuard up across it over tr.
+// newEnv builds a path and brings WireGuard up across it over tr.
 func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
-	L, err := link.New(lc)
+	L, err := newPath(lc)
 	if err != nil {
 		return nil, err
 	}
-	e := &env{tr: tr, L: L}
-	e.close = append(e.close, func() { L.Close() })
+	e := &env{tr: tr, P: L}
+	e.close = append(e.close, L.close)
 	ok := false
 	defer func() {
 		if !ok {
@@ -143,17 +147,21 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 	pair := wgnet.PairConfig{}
 	switch tr {
 	case tWireGuard:
-		cpc, err := L.Client.ListenUDP(wgLinkPort)
+		cpc, err := L.client().ListenUDP(wgLinkPort)
 		if err != nil {
 			return nil, err
 		}
-		spc, err := L.Server.ListenUDP(wgLinkPort)
+		spc, err := L.server().ListenUDP(wgLinkPort)
 		if err != nil {
+			cpc.Close()
 			return nil, err
 		}
+		// The binds don't close their PacketConns; the devices close
+		// first (they were appended later), then these.
+		e.close = append(e.close, func() { cpc.Close(); spc.Close() })
 		pair.ClientBind = wgnet.NewPacketConnBind(cpc)
 		pair.ServerBind = wgnet.NewPacketConnBind(spc)
-		pair.ServerEndpoint = netip.AddrPortFrom(link.ServerAddr, wgLinkPort).String()
+		pair.ServerEndpoint = netip.AddrPortFrom(L.serverAddr(), wgLinkPort).String()
 
 	case tTectonic:
 		port, err := freeUDPPort()
@@ -169,7 +177,7 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 		pair.ClientBind = wgnet.NewPacketConnBind(c)
 		pair.ServerBind = conn.NewStdNetBind()
 		pair.ServerListenPort = port
-		pair.ServerEndpoint = netip.AddrPortFrom(link.ServerAddr, tectonicPort).String()
+		pair.ServerEndpoint = netip.AddrPortFrom(L.serverAddr(), tectonicPort).String()
 
 	case tReality, tAnyTLS:
 		kind := baseline.Reality
@@ -180,7 +188,7 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 		if err != nil {
 			return nil, err
 		}
-		ln, err := L.Server.ListenTCP(baselinePort)
+		ln, err := L.server().ListenTCP(baselinePort)
 		if err != nil {
 			return nil, err
 		}
@@ -188,7 +196,7 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 		e.close = append(e.close, cancel)
 		go baseline.Serve(sctx, kind, ln, benchPKI().own, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(port)})
 		pc, err := baseline.Dial(ctx, kind, func(ctx context.Context) (net.Conn, error) {
-			return L.Client.DialTCP(ctx, netip.AddrPortFrom(link.ServerAddr, baselinePort))
+			return L.client().DialTCP(ctx, netip.AddrPortFrom(L.serverAddr(), baselinePort))
 		}, coverDomain)
 		if err != nil {
 			return nil, err
@@ -197,22 +205,31 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 		pair.ClientBind = wgnet.NewPacketConnBind(pc)
 		pair.ServerBind = conn.NewStdNetBind()
 		pair.ServerListenPort = port
-		pair.ServerEndpoint = netip.AddrPortFrom(link.ServerAddr, baselinePort).String()
+		pair.ServerEndpoint = netip.AddrPortFrom(L.serverAddr(), baselinePort).String()
 
 	default:
 		return nil, fmt.Errorf("unknown transport %q", tr)
 	}
 
+	if kernel != nil && kernelInner {
+		pair.TUN = kernel.TUN
+	}
 	client, srv, err := wgnet.NewPair(pair)
 	if err != nil {
 		return nil, err
 	}
-	e.client, e.server = client, srv
+	e.client, e.server, e.srvAddr = client, srv, srv.Addr
 	e.close = append(e.close, client.Close, srv.Close)
-	// The TCP inside the tunnel: RACK on or off (see -inner-rack).
-	for _, p := range []*wgnet.Peer{client, srv} {
-		if err := stacktune.Tune(p.Stack, innerRACK); err != nil {
-			return nil, err
+	if pair.TUN != nil {
+		e.cli = kernelTunnel{kernel.ClientTunnel(client.Addr)}
+		e.srv = kernelTunnel{kernel.ServerTunnel(srv.Addr)}
+	} else {
+		e.cli, e.srv = gvisorTunnel{client.Net}, gvisorTunnel{srv.Net}
+		// The TCP inside the tunnel: RACK on or off (see -inner-rack).
+		for _, p := range []*wgnet.Peer{client, srv} {
+			if err := stacktune.Tune(p.Stack, innerRACK); err != nil {
+				return nil, err
+			}
 		}
 	}
 
@@ -236,10 +253,10 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 	return e, nil
 }
 
-// startTectonic runs a Tectonic node on the link's server host, port
+// startTectonic runs a Tectonic node on the path's server host, port
 // listen, in front of WireGuard at wgAddr, and dials it from the client
 // host.
-func startTectonic(ctx context.Context, L *link.Link, listen uint16, wgAddr string) (*tectonic.Conn, *server.Server, error) {
+func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*tectonic.Conn, *server.Server, error) {
 	p := benchPKI()
 	secret := bytes.Repeat([]byte{0x5a}, 32)
 	srv, err := server.New(server.Config{
@@ -255,7 +272,7 @@ func startTectonic(ctx context.Context, L *link.Link, listen uint16, wgAddr stri
 	if err != nil {
 		return nil, nil, err
 	}
-	ln, err := L.Server.ListenTCP(listen)
+	ln, err := L.server().ListenTCP(listen)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -265,7 +282,7 @@ func startTectonic(ctx context.Context, L *link.Link, listen uint16, wgAddr stri
 	dk := wire.DeviceKey(secret, id)
 	c, err := tectonic.Dial(ctx, tectonic.Config{
 		Profile: tectonic.Profile{
-			Node:        netip.AddrPortFrom(link.ServerAddr, listen).String(),
+			Node:        netip.AddrPortFrom(L.serverAddr(), listen).String(),
 			CoverDomain: coverDomain,
 			KeyID:       id[:],
 			DeviceKey:   dk[:],
@@ -277,7 +294,7 @@ func startTectonic(ctx context.Context, L *link.Link, listen uint16, wgAddr stri
 			if err != nil {
 				return nil, err
 			}
-			return L.Client.DialTCP(ctx, ap)
+			return L.client().DialTCP(ctx, ap)
 		},
 		Logger: benchLogger(),
 	})
@@ -331,7 +348,7 @@ type gap struct {
 }
 
 func startDownload(ctx context.Context, e *env) (*transfer, error) {
-	ln, err := e.server.Net.ListenTCPAddrPort(netip.AddrPortFrom(e.server.Addr, bulkPort))
+	ln, err := e.srv.listenTCP(netip.AddrPortFrom(e.srvAddr, bulkPort))
 	if err != nil {
 		return nil, err
 	}
@@ -352,9 +369,10 @@ func startDownload(ctx context.Context, e *env) (*transfer, error) {
 			}
 		}
 	}()
-	c, err := e.client.Net.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(e.server.Addr, bulkPort))
+	c, err := e.cli.dialTCP(ctx, netip.AddrPortFrom(e.srvAddr, bulkPort))
 	if err != nil {
 		cancel()
+		ln.Close()
 		return nil, err
 	}
 	go func() {
@@ -426,7 +444,7 @@ type pinger struct {
 }
 
 func newPinger(e *env) (*pinger, error) {
-	s, err := e.server.Net.ListenUDPAddrPort(netip.AddrPortFrom(e.server.Addr, echoPort))
+	s, err := e.srv.listenUDP(netip.AddrPortFrom(e.srvAddr, echoPort))
 	if err != nil {
 		return nil, err
 	}
@@ -440,7 +458,7 @@ func newPinger(e *env) (*pinger, error) {
 			s.WriteTo(buf[:n], a)
 		}
 	}()
-	c, err := e.client.Net.DialUDPAddrPort(netip.AddrPort{}, netip.AddrPortFrom(e.server.Addr, echoPort))
+	c, err := e.cli.dialUDP(netip.AddrPortFrom(e.srvAddr, echoPort))
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -484,8 +502,8 @@ func percentile(ds []time.Duration, p float64) time.Duration {
 	return s[min(len(s)-1, int(p*float64(len(s))))]
 }
 
-// linkBytes is everything the link carried in both directions.
-func linkBytes(L *link.Link) uint64 {
-	up, down := L.Stats()
+// linkBytes is everything the path carried in both directions.
+func linkBytes(L path) uint64 {
+	up, down := L.stats()
 	return up.Bytes + down.Bytes
 }

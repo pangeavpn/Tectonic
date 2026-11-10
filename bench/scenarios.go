@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/pangeavpn/tectonic/bench/link"
-	"github.com/pangeavpn/tectonic/bench/wgnet"
 )
 
 // row is one line of the results table.
@@ -49,21 +48,22 @@ var scenarios = []scenario{
 	{"latency", "ping inside the tunnel during a saturating download", scLatency},
 	{"reset", "recovery from a reset lane", scReset},
 	{"interactive", "bandwidth overhead during interactive use", scInteractive},
+	{"paths", "throughput on realistic paths: nearby fibre, long-haul, mobile, lossy international", scPaths},
 }
 
 // --- Time to first WireGuard packet: ≤ 2 RTT ---
 
 func scTTFP(ctx context.Context, o opts) []row {
 	const rtt = 50 * time.Millisecond
-	L, err := link.New(link.Config{Bandwidth: 100e6, RTT: rtt})
+	L, err := newPath(link.Config{Bandwidth: 100e6, RTT: rtt})
 	if err != nil {
 		return failed("Time to first WireGuard packet", err)
 	}
-	defer L.Close()
+	defer L.close()
 
 	// Calibrate: what one round trip costs on this link in this process,
 	// timer jitter included, measured as a plain TCP connect.
-	ln, err := L.Server.ListenTCP(1999)
+	ln, err := L.server().ListenTCP(1999)
 	if err != nil {
 		return failed("Time to first WireGuard packet", err)
 	}
@@ -79,7 +79,7 @@ func scTTFP(ctx context.Context, o opts) []row {
 	var rtts []time.Duration
 	for range 5 {
 		t0 := time.Now()
-		c, err := L.Client.DialTCP(ctx, netip.AddrPortFrom(link.ServerAddr, 1999))
+		c, err := L.client().DialTCP(ctx, netip.AddrPortFrom(L.serverAddr(), 1999))
 		if err != nil {
 			return failed("Time to first WireGuard packet", err)
 		}
@@ -153,11 +153,11 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 	}
 	defer t.Stop()
 	time.Sleep(o.warm)
-	b0, l0 := t.bytes.Load(), linkBytes(e.L)
-	u0, d0 := e.L.Stats()
+	b0, l0 := t.bytes.Load(), linkBytes(e.P)
+	u0, d0 := e.P.stats()
 	bps := t.rate(ctx, o.dur)
-	db, dl := t.bytes.Load()-b0, linkBytes(e.L)-l0
-	u1, d1 := e.L.Stats()
+	db, dl := t.bytes.Load()-b0, linkBytes(e.P)-l0
+	u1, d1 := e.P.stats()
 	if db > 0 {
 		o.logf("%s: per payload byte: down %.4f (%d pkts), up %.4f (%d pkts)", tr,
 			float64(d1.Bytes-d0.Bytes)/float64(db), d1.Packets-d0.Packets,
@@ -173,11 +173,12 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 	o.logf("%s: %s, %.4f link bytes per payload byte", tr, mbps(bps), r.perInner)
 	if e.conn != nil {
 		st := e.conn.Stats()
-		up, down := e.L.Stats()
+		up, down := e.P.stats()
 		o.logf("%s: lanes %d, sent %d, dropped %d, dupes %d; received: held %d, skipped %d, late %d; link up %d pkts, down %d pkts, queue drops %d/%d",
 			tr, st.Lanes, st.Sent, st.Dropped, st.Dupes, st.Held, st.Skipped, st.Late,
 			up.Packets, down.Packets, up.DroppedQueue, down.DroppedQueue)
 	}
+	logSockets(o, e)
 	return r
 }
 
@@ -417,19 +418,14 @@ func measureReset(ctx context.Context, o opts, tr transport, lc link.Config) (be
 	if tr != tTectonic {
 		port = baselinePort
 	}
-	var victim *link.Flow
-	for _, f := range e.L.Flows() {
-		if f.Proto == link.ProtoTCP && (f.Dst.Port() == port || f.Src.Port() == port) {
-			victim = &f
-			break
-		}
-	}
-	if victim == nil {
+	flows := e.P.tcpFlows(port)
+	if len(flows) == 0 {
 		return 0, 0, 0, fmt.Errorf("no lane to reset")
 	}
+	victim := &flows[0]
 	resetAt := time.Now()
 	window := 3 * time.Second
-	if err := e.L.ResetFlow(*victim); err != nil {
+	if err := e.P.resetFlow(*victim); err != nil {
 		return 0, 0, 0, err
 	}
 	o.logf("%s: reset %v", tr, victim)
@@ -473,7 +469,7 @@ func measureInteractive(ctx context.Context, o opts, tr transport, lc link.Confi
 		return 0, err
 	}
 	defer e.Close()
-	ln, err := e.server.Net.ListenTCPAddrPort(netip.AddrPortFrom(wgnet.ServerAddr, 8080))
+	ln, err := e.srv.listenTCP(netip.AddrPortFrom(e.srvAddr, 8080))
 	if err != nil {
 		return 0, err
 	}
@@ -495,13 +491,13 @@ func measureInteractive(ctx context.Context, o opts, tr transport, lc link.Confi
 			}
 		}
 	}()
-	c, err := e.client.Net.DialContextTCPAddrPort(ctx, netip.AddrPortFrom(wgnet.ServerAddr, 8080))
+	c, err := e.cli.dialTCP(ctx, netip.AddrPortFrom(e.srvAddr, 8080))
 	if err != nil {
 		return 0, err
 	}
 	defer c.Close()
 	rng := rand.New(rand.NewPCG(1, 2))
-	l0 := linkBytes(e.L)
+	l0 := linkBytes(e.P)
 	var payload int64
 	end := time.Now().Add(o.dur)
 	buf := make([]byte, 64<<10)
@@ -521,7 +517,7 @@ func measureInteractive(ctx context.Context, o opts, tr transport, lc link.Confi
 		payload += int64(n + len(req))
 		time.Sleep(time.Duration(100+rng.IntN(400)) * time.Millisecond) // reading the page
 	}
-	ratio := float64(linkBytes(e.L)-l0) / float64(payload)
+	ratio := float64(linkBytes(e.P)-l0) / float64(payload)
 	o.logf("%s interactive: %.3f link bytes per payload byte", tr, ratio)
 	return ratio, nil
 }
@@ -536,6 +532,51 @@ func readFull(c net.Conn, b []byte) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// --- Realistic paths (not a §13 target) ---
+
+// realPaths are paths users actually have, beyond the clean 100 Mbit/s,
+// 50 ms reference. Figures are typical rather than measured: a nearby node
+// on fibre; a node on another continent; LTE, whose loss comes in bursts
+// (handovers, fades); and an international path into a censored network at
+// a busy hour, where 1–3% loss over 200 ms is common.
+var realPaths = []struct {
+	name string
+	lc   link.Config
+}{
+	{"Nearby node on fibre (200 Mbit/s, 15 ms)", link.Config{Bandwidth: 200e6, RTT: 15 * time.Millisecond}},
+	{"Another continent (50 Mbit/s, 150 ms, 0.1% loss)", link.Config{Bandwidth: 50e6, RTT: 150 * time.Millisecond, Loss: 0.001, Seed: 11}},
+	{"LTE (30 Mbit/s, 70 ms, bursty loss averaging 0.4%)", link.Config{Bandwidth: 30e6, RTT: 70 * time.Millisecond, Seed: 13,
+		Burst: &link.GilbertElliott{PGoodToBad: 0.003, PBadToGood: 0.2, LossBad: 0.3}}},
+	{"Lossy international (20 Mbit/s, 200 ms, 2% loss)", link.Config{Bandwidth: 20e6, RTT: 200 * time.Millisecond, Loss: 0.02, Seed: 17}},
+}
+
+func scPaths(ctx context.Context, o opts) []row {
+	var rows []row
+	for _, p := range realPaths {
+		po := o
+		po.warm = max(o.warm, 20*p.lc.RTT) // let slow start finish on long paths
+		o.logf("paths: %s", p.name)
+		res := runBulk(ctx, po, p.lc)
+		rows = append(rows, bulkRows(p.name, res)...)
+		tt, wg := res[tTectonic], res[tWireGuard]
+		best := 0.0
+		for _, tr := range []transport{tReality, tAnyTLS} {
+			if r, ok := res[tr]; ok && r.err == nil {
+				best = max(best, r.bps)
+			}
+		}
+		if tt.err != nil || wg.err != nil || wg.bps == 0 {
+			continue
+		}
+		sum := fmt.Sprintf("%.0f%% of WireGuard", tt.bps/wg.bps*100)
+		if best > 0 {
+			sum += fmt.Sprintf("; %.2f× the better single-connection model", tt.bps/best)
+		}
+		rows = append(rows, row{measurement: p.name + ": tectonic", result: sum})
+	}
+	return rows
 }
 
 func failed(name string, err error) []row {
