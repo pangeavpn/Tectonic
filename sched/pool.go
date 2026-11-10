@@ -151,7 +151,8 @@ type laneState struct {
 	lifetime    time.Duration
 	budget      uint64
 	retiring    bool
-	replacing   *laneState // the lane this one replaces, until it is welcomed
+	replacing   *laneState // the lane this one replaces, until it takes over
+	handoverAt  time.Time  // when this replacement takes over
 	replacement bool       // a replacement for this lane is being dialed or is up
 	upAt        time.Time
 	lastUp      uint64
@@ -481,6 +482,16 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		}
 	}
 
+	// Hand over from old lanes to replacements that have ramped up.
+	for st := range p.lanes {
+		if old := st.replacing; old != nil && st.welcomed && !now.Before(st.handoverAt) {
+			st.replacing = nil
+			if _, ok := p.lanes[old]; ok {
+				p.retire(old, "churn")
+			}
+		}
+	}
+
 	// Lane churn: replace lanes nearing their lifetime or byte budget, but
 	// not while idle; an idle lane closes soon anyway.
 	if active && p.dialing == 0 && !now.Before(p.nextDial) {
@@ -737,12 +748,10 @@ func (p *Pool) welcomed(st *laneState) {
 		p.maxLanes = max(1, int(w.MaxLanes))
 		p.sessionOnce.Do(func() { close(p.sessionUp) })
 	}
-	if old := st.replacing; old != nil {
-		// The replacement is carrying traffic; now the old lane can go.
-		st.replacing = nil
-		if _, ok := p.lanes[old]; ok {
-			p.retire(old, "churn")
-		}
+	if st.replacing != nil {
+		// The replacement carries traffic from now on; the old lane goes
+		// once the new one has had a moment to ramp up.
+		st.handoverAt = time.Now().Add(p.churn.Overlap)
 	}
 	p.refreshScheduler()
 }

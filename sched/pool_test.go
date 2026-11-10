@@ -276,7 +276,7 @@ func TestPoolChurnReplacesBeforeRetiring(t *testing.T) {
 	d.welcome = 1
 	p := newTestPool(t, d, PoolConfig{Churn: Churn{
 		LifetimeMedian: 300 * time.Millisecond, LifetimeMin: 300 * time.Millisecond, LifetimeMax: 300 * time.Millisecond,
-		Lead: 100 * time.Millisecond,
+		Lead: 100 * time.Millisecond, Overlap: 50 * time.Millisecond,
 	}})
 	keepBusy := make(chan struct{})
 	defer close(keepBusy)
@@ -317,7 +317,7 @@ func TestPoolChurnWaitsForReplacementWelcome(t *testing.T) {
 	d.welcome = 1
 	p := newTestPool(t, d, PoolConfig{Churn: Churn{
 		LifetimeMedian: 200 * time.Millisecond, LifetimeMin: 200 * time.Millisecond, LifetimeMax: 200 * time.Millisecond,
-		Lead: 50 * time.Millisecond,
+		Lead: 50 * time.Millisecond, Overlap: 50 * time.Millisecond,
 	}})
 	go func() {
 		for range 100 {

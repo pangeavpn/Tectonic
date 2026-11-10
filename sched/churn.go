@@ -22,6 +22,10 @@ type Churn struct {
 	// Lead is how long before a lane expires its replacement starts
 	// opening, so the new lane is carrying traffic before the old one goes.
 	Lead time.Duration
+	// Overlap is how long the replacement carries traffic alongside the
+	// old lane before the old one is retired, so the new connection is past
+	// TCP slow start by the time it takes over.
+	Overlap time.Duration
 }
 
 // DefaultChurn returns the design's lane lifetimes and byte budgets. The
@@ -37,6 +41,7 @@ func DefaultChurn() Churn {
 		BytesMax:       160 << 20,
 		Sigma:          0.7,
 		Lead:           5 * time.Second,
+		Overlap:        time.Second,
 	}
 }
 
@@ -53,6 +58,9 @@ func (c Churn) withDefaults() Churn {
 	}
 	if c.Lead <= 0 {
 		c.Lead = d.Lead
+	}
+	if c.Overlap <= 0 {
+		c.Overlap = d.Overlap
 	}
 	return c
 }
