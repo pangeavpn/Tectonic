@@ -23,24 +23,50 @@ import (
 // missing packet is therefore known to be lost, not late, the moment every
 // lane has delivered something beyond it, and the packets behind it go on
 // at once. Until then it is still on its way on some lane, and the packets
-// behind it wait. A timer bounds that wait, for the two cases the lanes
-// cannot settle: a lane that has stalled (it is retransmitting, or dead but
-// not yet closed), and a lane that has carried nothing recent to judge by.
+// behind it wait: a lane that has lost a segment delivers nothing more
+// until TCP has sent the segment again, and then delivers all of it.
+//
+// A timer bounds that wait, and there are two cases. A lane that was
+// delivering when the gap appeared and has gone silent has most likely lost
+// a segment, and is given time to recover (HoldFor). A lane that was
+// already quiet probably holds nothing: it is idle, or new, and the missing
+// packet was on a lane that has since died. It is given only long enough
+// for a packet that was put on it at that moment to arrive (IdleHoldFor).
 
 const (
-	// HoldMin and HoldMax bound how long a packet waits for the ones before
-	// it when the lanes cannot say whether those are lost. Within the
-	// bounds the wait is one and a half times the receiving lane's round
-	// trip: long enough for a lane that lost a segment to retransmit it,
-	// so the TCP inside the tunnel sees a delay rather than a loss. HoldMax
-	// keeps that delay under the 200 ms that TCP adds to its round trip
-	// before it takes a packet for lost.
-	HoldMin = 20 * time.Millisecond
-	HoldMax = 150 * time.Millisecond
+	// HoldBase and HoldMax set how long a packet waits for the ones before
+	// it: four of the receiving lane's round trips and HoldBase more, and
+	// no longer than HoldMax.
+	//
+	// A lane is a TCP connection, so the packet that is waited for is not
+	// lost. It is behind a segment the connection has to send again, and
+	// the wait should outlast that. A fast retransmission takes one to two
+	// round trips, and the round trip itself can double while a queue on
+	// the path is full. A retransmission after a timeout takes the round
+	// trip and at least 200 ms more. Giving up sooner hands the packets
+	// behind the gap on while the gap is still on its way, and a TCP
+	// connection inside the tunnel reads that as loss: it sends the whole
+	// stretch again and slows down, for packets that then arrive anyway.
+	// Measured on a kernel path, a wait of one and a half round trips gave
+	// up on thousands of packets a run, nearly all of which arrived
+	// afterwards, and carried less than half as much as this one.
+	//
+	// HoldMax is what a lane that has died without closing costs: one
+	// stall of that length, once.
+	HoldBase = 200 * time.Millisecond
+	HoldMax  = time.Second
+
+	// IdleHoldMin and IdleHoldMax bound the wait for lanes that were
+	// already quiet when a gap appeared: one and a half round trips within
+	// them. A lane counts as quiet if it had delivered nothing in order
+	// for two of its round trips (and at least activeMin) before the gap.
+	IdleHoldMin = 20 * time.Millisecond
+	IdleHoldMax = 150 * time.Millisecond
+	activeMin   = 50 * time.Millisecond
 
 	// maxHeld is the most packets waiting at once. Past it the oldest gap
 	// is given up on early.
-	maxHeld = 4096
+	maxHeld = 8192
 	// maxFlows is how many WireGuard keys are tracked at once: during a
 	// rekey the old and new keys overlap.
 	maxFlows = 8
@@ -58,7 +84,14 @@ const (
 // HoldFor returns how long a packet arriving on a lane with this round
 // trip may wait for the packets before it.
 func HoldFor(rtt time.Duration) time.Duration {
-	return min(max(rtt+rtt/2, HoldMin), HoldMax)
+	return min(4*max(rtt, 0)+HoldBase, HoldMax)
+}
+
+// IdleHoldFor returns how long a packet arriving on a lane with this round
+// trip waits for the packets before it when every lane that could still
+// deliver them was already quiet.
+func IdleHoldFor(rtt time.Duration) time.Duration {
+	return min(max(rtt+rtt/2, IdleHoldMin), IdleHoldMax)
 }
 
 // Resequencer merges the WireGuard data packets arriving on several lanes
@@ -92,6 +125,10 @@ type Source struct {
 	// past[i] is how far this lane has got in flow i: it will deliver no
 	// held-back packet with a counter below past[i].next.
 	past [maxFlows]horizon
+	// last is when the lane last delivered a packet that keeps its order,
+	// and rtt its round trip then.
+	last time.Time
+	rtt  time.Duration
 }
 
 type horizon struct {
@@ -107,11 +144,22 @@ type reflow struct {
 	// q[head:] is ascending by counter, all above next.
 	q    []heldPkt
 	head int
+	// While packets wait: the counter they began to wait for, when the
+	// first of them arrived and when its short wait ends, and whether the
+	// lanes have been looked at since (see quiet).
+	gapNext uint64
+	gapAt   time.Time
+	gapSoon time.Time
+	waiting bool
+	checked bool
 }
 
 type heldPkt struct {
 	ctr uint64
-	due time.Time
+	// at is when the packet arrived. It waits until due for the packets
+	// before it, or only until soon if the lanes they could be on were
+	// already quiet.
+	at, soon, due time.Time
 	// buf is nil for a small packet that was handed on at once and is kept
 	// only to mark its counter as seen.
 	buf []byte
@@ -161,6 +209,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 	}
 	fi := r.flow(idx, ctr)
 	f := &r.flows[fi]
+	now := time.Now()
 	// Small packets go out of turn (the scheduler may also duplicate them
 	// onto a second lane), so they say nothing about how far a lane has got.
 	ordered := len(pkt) > DupMaxSize
@@ -168,6 +217,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 		if h := &s.past[fi]; !h.ok || ctr >= h.next {
 			h.next, h.ok = ctr+1, true
 		}
+		s.last, s.rtt = now, rtt
 	}
 	switch {
 	case ctr < f.next:
@@ -187,7 +237,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 			r.stats.Late++
 			break
 		}
-		h := heldPkt{ctr: ctr, due: time.Now().Add(HoldFor(rtt))}
+		h := heldPkt{ctr: ctr, at: now, soon: now.Add(IdleHoldFor(rtt)), due: now.Add(HoldFor(rtt))}
 		if ordered {
 			h.buf = append(r.bufs.Get().([]byte)[:0], pkt...)
 			r.stats.Held++
@@ -207,6 +257,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 	if ordered {
 		r.settle(fi)
 	}
+	r.regap(f, true)
 }
 
 // Close tells the Resequencer the lane will deliver nothing more, so no
@@ -230,6 +281,7 @@ func (s *Source) Close() {
 	}
 	for fi := range r.flows {
 		r.settle(fi)
+		r.regap(&r.flows[fi], true)
 	}
 }
 
@@ -418,8 +470,45 @@ func (r *Resequencer) schedule(due time.Time) {
 	}
 }
 
+// regap notes, after anything that may have moved a flow on, what its
+// packets are now waiting for. With timer set it makes sure the timer fires
+// when the short wait for that ends.
+func (r *Resequencer) regap(f *reflow, timer bool) {
+	if !f.used || f.len() == 0 {
+		f.waiting = false
+		return
+	}
+	if f.waiting && f.gapNext == f.next {
+		return
+	}
+	h := f.q[f.head]
+	f.waiting, f.checked = true, false
+	f.gapNext, f.gapAt, f.gapSoon = f.next, h.at, h.soon
+	if timer {
+		r.schedule(f.gapSoon)
+	}
+}
+
+// quiet reports whether every lane that could still deliver what flow fi
+// is waiting for was already quiet when the wait began: it had delivered
+// nothing in order for a while. Such a lane is idle, not recovering, and
+// what is missing was most likely on a lane that has gone.
+func (r *Resequencer) quiet(fi int) bool {
+	f := &r.flows[fi]
+	for _, s := range r.sources {
+		if h := s.past[fi]; h.ok && h.next > f.next {
+			continue // it has passed the gap
+		}
+		if !s.last.Before(f.gapAt.Add(-max(2*s.rtt, activeMin))) {
+			return false
+		}
+	}
+	return true
+}
+
 // expire hands on every packet whose hold has run out, with the packets
-// before it, and gives up on the gaps between them.
+// before it, and gives up on the gaps between them. A packet at the front
+// that has waited out the short hold goes too if the lanes are quiet.
 func (r *Resequencer) expire() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -429,25 +518,45 @@ func (r *Resequencer) expire() {
 	}
 	now := time.Now()
 	var next time.Time
+	sooner := func(t time.Time) {
+		if next.IsZero() || t.Before(next) {
+			next = t
+		}
+	}
 	for i := range r.flows {
 		f := &r.flows[i]
-		if !f.used || f.len() == 0 {
+		if !f.used {
 			continue
 		}
-		last := -1
-		for k, h := range f.q[f.head:] {
-			if !h.due.After(now) {
-				last = k
+		for f.len() > 0 {
+			last := -1
+			for k, h := range f.q[f.head:] {
+				if !h.due.After(now) {
+					last = k
+				}
 			}
-		}
-		if last >= 0 {
-			r.skipTo(f, last)
-			r.drain(f)
+			if last >= 0 {
+				r.skipTo(f, last)
+				r.drain(f)
+				r.regap(f, false)
+				continue
+			}
+			if f.waiting && !f.checked && !f.gapSoon.After(now) {
+				f.checked = true
+				if r.quiet(i) {
+					r.skipTo(f, 0)
+					r.drain(f)
+					r.regap(f, false)
+					continue
+				}
+			}
+			break
 		}
 		for _, h := range f.q[f.head:] {
-			if next.IsZero() || h.due.Before(next) {
-				next = h.due
-			}
+			sooner(h.due)
+		}
+		if f.len() > 0 && f.waiting && !f.checked {
+			sooner(f.gapSoon)
 		}
 	}
 	if !next.IsZero() {

@@ -128,8 +128,8 @@ func TestResequencerGivesUpOnASilentLaneAfterTheHold(t *testing.T) {
 		t.Fatalf("delivered %v before the hold ran out", got)
 	}
 	s.waitFor(t, []uint64{0, 2, 3})
-	if held := time.Since(start); held < HoldMin {
-		t.Fatalf("released after %v, before HoldMin", held)
+	if held := time.Since(start); held < HoldBase {
+		t.Fatalf("released after %v, before the hold ran out", held)
 	}
 	// The missing packet turns up after all: it goes straight through, and
 	// WireGuard's replay window decides what to do with it.
@@ -179,19 +179,19 @@ func TestResequencerStopsWaitingForAClosedLane(t *testing.T) {
 }
 
 func TestResequencerHoldScalesWithRTT(t *testing.T) {
-	if HoldFor(0) != HoldMin || HoldFor(time.Second) != HoldMax {
-		t.Fatal("hold not clamped")
+	if HoldFor(0) != HoldBase || HoldFor(time.Second) != HoldMax {
+		t.Fatal("hold not bounded")
 	}
-	if got := HoldFor(80 * time.Millisecond); got != 120*time.Millisecond {
-		t.Fatalf("HoldFor(80ms) = %v, want one and a half round trips", got)
+	if got := HoldFor(80 * time.Millisecond); got != 520*time.Millisecond {
+		t.Fatalf("HoldFor(80ms) = %v, want four round trips and HoldBase", got)
 	}
 	var s sink
 	r := NewResequencer(s.deliver)
 	defer r.Close()
 	a, b := r.Source(), r.Source()
 	a.Push(wgData(7, 0, big), 0)
-	b.Push(wgData(7, 2, big), 40*time.Millisecond) // waits 60 ms
-	time.Sleep(HoldMin + 10*time.Millisecond)
+	b.Push(wgData(7, 2, big), 40*time.Millisecond) // waits 360 ms
+	time.Sleep(HoldBase + 50*time.Millisecond)
 	if got := s.list(); !slices.Equal(got, []uint64{0}) {
 		t.Fatalf("delivered %v long before the hold for this RTT", got)
 	}
@@ -333,7 +333,7 @@ func TestResequencerCloseStopsDelivery(t *testing.T) {
 	a.Push(wgData(7, 0, big), 0)
 	b.Push(wgData(7, 2, big), 0)
 	r.Close()
-	time.Sleep(2 * HoldMin)
+	time.Sleep(HoldBase + 50*time.Millisecond)
 	a.Push(wgData(7, 1, big), 0)
 	r.Source().Push(wgData(7, 3, big), 0)
 	b.Close()
@@ -388,5 +388,89 @@ func TestResequencerSurvivesALaneThatBreaksItsOrder(t *testing.T) {
 	}
 	if got := s.list(); !slices.Equal(got, []uint64{0, 2, 1, 3}) {
 		t.Fatalf("delivered %v", got)
+	}
+}
+
+func TestResequencerWaitsOnlyBrieflyForALaneThatWasAlreadyQuiet(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	a.Push(wgData(7, 0, big), rtt)
+	// Lane a carries nothing more for a while: it is idle, not recovering.
+	// Then 1 goes missing: it was on a lane that has died, say.
+	time.Sleep(2*rtt + activeMin)
+	start := time.Now()
+	b.Push(wgData(7, 2, big), rtt)
+	b.Push(wgData(7, 3, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0}) {
+		t.Fatalf("delivered %v without any wait", got)
+	}
+	s.waitFor(t, []uint64{0, 2, 3})
+	if waited := time.Since(start); waited < IdleHoldFor(rtt) || waited >= HoldBase {
+		t.Fatalf("waited %v for a quiet lane, want about %v", waited, IdleHoldFor(rtt))
+	}
+}
+
+func TestResequencerWaitsOnlyBrieflyForALaneThatHasShownNothing(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, _ := r.Source(), r.Source() // the second has just joined
+	start := time.Now()
+	a.Push(wgData(7, 0, big), rtt)
+	a.Push(wgData(7, 2, big), rtt)
+	s.waitFor(t, []uint64{0, 2})
+	if waited := time.Since(start); waited < IdleHoldFor(rtt) || waited >= HoldBase {
+		t.Fatalf("waited %v for a lane that has carried nothing, want about %v", waited, IdleHoldFor(rtt))
+	}
+}
+
+func TestResequencerQuietLaneCostsOneShortWaitNotOnePerGap(t *testing.T) {
+	// A lane dies with every other packet of a stretch on it; the lane
+	// left over was idle. Each packet waits the short hold from when it
+	// arrived, so the stretch is delayed by that much, once.
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	a.Push(wgData(7, 0, big), rtt)
+	time.Sleep(2*rtt + activeMin)
+	start := time.Now()
+	want := []uint64{0}
+	for c := uint64(2); c <= 40; c += 2 {
+		b.Push(wgData(7, c, big), rtt)
+		want = append(want, c)
+	}
+	s.waitFor(t, want)
+	if waited := time.Since(start); waited >= HoldBase {
+		t.Fatalf("20 gaps on a quiet lane took %v", waited)
+	}
+	if st := r.Stats(); st.Skipped != 20 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestResequencerGivesALaneThatWasDeliveringTimeToRecover(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	// Lane a is in the middle of a stream when it stops: a lost segment.
+	// What it holds arrives once TCP has sent the segment again, well
+	// after the short hold.
+	a.Push(wgData(7, 0, big), rtt)
+	b.Push(wgData(7, 2, big), rtt)
+	b.Push(wgData(7, 3, big), rtt)
+	time.Sleep(IdleHoldFor(rtt) + 60*time.Millisecond)
+	if got := s.list(); !slices.Equal(got, []uint64{0}) {
+		t.Fatalf("delivered %v: gave up on a lane that was recovering", got)
+	}
+	a.Push(wgData(7, 1, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 1, 2, 3}) {
+		t.Fatalf("delivered %v", got)
+	}
+	if st := r.Stats(); st.Skipped != 0 || st.Late != 0 {
+		t.Fatalf("stats %+v", st)
 	}
 }
