@@ -91,8 +91,12 @@ const (
 	pendingMax      = 64 // datagrams held while no lane is up
 	pendingBytesMax = 256 << 10
 	sampleEvery     = time.Second
-	backoffMin      = 500 * time.Millisecond
-	backoffMax      = 30 * time.Second
+	// overlapRTTs is how many round trips a replacement lane gets, at
+	// least, before the lane it replaces retires: slow start takes about
+	// ten to reach a few thousand packets a round trip.
+	overlapRTTs = 16
+	backoffMin  = 500 * time.Millisecond
+	backoffMax  = 30 * time.Second
 )
 
 // activeTick is how often the pool re-plans while it has lanes. A variable
@@ -160,7 +164,9 @@ type laneState struct {
 	budget      uint64
 	retiring    bool
 	replacing   *laneState // the lane this one replaces, until it takes over
-	handoverAt  time.Time  // when this replacement takes over
+	handoverAt  time.Time  // the earliest the lane it replaces may retire
+	carried     uint64     // payload bytes either way when last looked at, once a replacement is up
+	quietSince  time.Time  // since when that has not changed
 	replacement bool       // a replacement for this lane is being dialed or is up
 	upAt        time.Time
 	lastUp      uint64
@@ -502,14 +508,32 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		}
 	}
 
-	// Hand over from old lanes to replacements that have ramped up.
+	// Hand over from old lanes to replacements that have ramped up. An old
+	// lane retires once the traffic has moved off it: it has carried
+	// nothing for the length of the overlap. One still carrying traffic
+	// stays, because the lanes left would have to grow to take its share,
+	// and TCP outside slow start grows too slowly for the tunnel not to
+	// stall meanwhile. It stays no longer than MaxOverlap, and carries no
+	// more than the most any lane's byte budget can be.
 	for st := range p.lanes {
-		if old := st.replacing; old != nil && st.welcomed && !now.Before(st.handoverAt) {
-			st.replacing = nil
-			if _, ok := p.lanes[old]; ok {
-				p.retire(old, "churn")
-			}
+		old := st.replacing
+		if old == nil || !st.welcomed || now.Before(st.handoverAt) {
+			continue
 		}
+		if _, ok := p.lanes[old]; ok {
+			s := old.l.Stats()
+			if c := s.DataSent + s.DataRecv; c != old.carried || old.quietSince.IsZero() {
+				old.carried, old.quietSince = c, now
+			}
+			quiet := now.Sub(old.quietSince) >= p.churn.Overlap
+			spent := now.Sub(st.handoverAt) >= p.churn.MaxOverlap ||
+				p.churn.BytesMax > 0 && s.BytesSent+s.BytesRecv >= p.churn.BytesMax
+			if !quiet && !spent {
+				continue
+			}
+			p.retire(old, "churn")
+		}
+		st.replacing = nil
 	}
 
 	// Lane churn: replace lanes nearing their lifetime or byte budget, but
@@ -791,9 +815,10 @@ func (p *Pool) welcomed(st *laneState) {
 		p.sessionOnce.Do(func() { close(p.sessionUp) })
 	}
 	if st.replacing != nil {
-		// The replacement carries traffic from now on; the old lane goes
-		// once the new one has had a moment to ramp up.
-		st.handoverAt = time.Now().Add(p.churn.Overlap)
+		// The replacement takes the traffic from now on, as fast as its
+		// connection's slow start allows, while the old lane carries the
+		// rest; the old lane goes once the new one has had time to ramp up.
+		st.handoverAt = time.Now().Add(max(p.churn.Overlap, overlapRTTs*st.l.BaseRTT()))
 	}
 	p.refreshScheduler()
 }
@@ -854,15 +879,28 @@ func (p *Pool) retire(st *laneState, why string) {
 // refreshScheduler gives the scheduler every lane that takes DATA, newest
 // first: a lane takes over the traffic as soon as it is up, while the lanes
 // before it carry what it cannot yet. The server orders its end of the
-// lanes the same way.
+// lanes the same way. A lane whose replacement is up comes last, so that
+// little is left on it when it retires.
 func (p *Pool) refreshScheduler() {
 	var live []*laneState
+	leaving := map[*laneState]bool{}
 	for st := range p.lanes {
 		if !st.retiring {
 			live = append(live, st)
 		}
+		if st.replacing != nil && st.welcomed {
+			leaving[st.replacing] = true
+		}
 	}
-	slices.SortFunc(live, func(a, b *laneState) int { return cmp.Compare(b.seq, a.seq) })
+	slices.SortFunc(live, func(a, b *laneState) int {
+		if leaving[a] != leaving[b] {
+			if leaving[a] {
+				return 1
+			}
+			return -1
+		}
+		return cmp.Compare(b.seq, a.seq)
+	})
 	ls := make([]Lane, len(live))
 	for i, st := range live {
 		ls[i] = st.l

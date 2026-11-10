@@ -114,6 +114,13 @@ func (l *fakeLane) sentCount() int {
 	return len(l.sent)
 }
 
+// carry records n bytes of payload arriving from the server on the lane.
+func (l *fakeLane) carry(n uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.stats.DataRecv += n
+}
+
 // fakeDialer hands out fakeLanes and lets the test see each request.
 type fakeDialer struct {
 	lanes   chan *fakeLane
@@ -334,6 +341,86 @@ func TestPoolPrefersTheNewestLane(t *testing.T) {
 	}
 	if got1, got2 := l1.sentCount()-before1, l2.sentCount()-before2; got1 != 0 || got2 != 10 {
 		t.Fatalf("older lane took %d packets and the newest %d, want 0 and 10", got1, got2)
+	}
+}
+
+// busyChurn replaces lanes after 200 ms and keeps the tunnel active, with
+// the server sending on the first two lanes until the returned stop is
+// called.
+func busyChurn(t *testing.T, maxOverlap time.Duration) (l1, l2 *fakeLane, stop func()) {
+	d := newFakeDialer()
+	d.welcome = 1
+	p := newTestPool(t, d, PoolConfig{Churn: Churn{
+		LifetimeMedian: 200 * time.Millisecond, LifetimeMin: 200 * time.Millisecond, LifetimeMax: 200 * time.Millisecond,
+		Lead: 50 * time.Millisecond, Overlap: 40 * time.Millisecond, MaxOverlap: maxOverlap,
+	}})
+	l1, l2 = d.next(t), d.next(t)
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	})
+	busy := make(chan struct{})
+	go func() {
+		carrying := true
+		for {
+			select {
+			case <-done:
+				return
+			case <-busy:
+				carrying, busy = false, nil
+			case <-time.After(5 * time.Millisecond):
+				p.Send(make([]byte, 100)) // goes to the newest lane
+				if carrying {
+					l1.carry(1000)
+					l2.carry(1000)
+				}
+			}
+		}
+	}()
+	go func() { // take the replacements as they are dialed
+		for {
+			select {
+			case <-done:
+				return
+			case <-d.lanes:
+			}
+		}
+	}()
+	return l1, l2, func() { close(busy) }
+}
+
+func TestPoolKeepsAnOldLaneWhileItStillCarriesTraffic(t *testing.T) {
+	l1, l2, stop := busyChurn(t, time.Minute)
+	// Well past the lifetime and several overlaps: the replacements are
+	// up, but the old lanes are still carrying the server's traffic, so
+	// retiring them would leave the tunnel short.
+	time.Sleep(500 * time.Millisecond)
+	if l1.wasRetired() || l2.wasRetired() {
+		t.Fatal("a lane retired while it was still carrying traffic")
+	}
+	// The traffic moves off them: they go.
+	stop()
+	deadline := time.Now().Add(2 * time.Second)
+	for !l1.wasRetired() || !l2.wasRetired() {
+		if time.Now().After(deadline) {
+			t.Fatalf("old lanes not retired once quiet: %v %v", l1.wasRetired(), l2.wasRetired())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestPoolRetiresABusyOldLaneAfterMaxOverlap(t *testing.T) {
+	l1, l2, _ := busyChurn(t, 150*time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
+	for !l1.wasRetired() || !l2.wasRetired() {
+		if time.Now().After(deadline) {
+			t.Fatalf("busy old lanes never retired: %v %v", l1.wasRetired(), l2.wasRetired())
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

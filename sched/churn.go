@@ -22,10 +22,14 @@ type Churn struct {
 	// Lead is how long before a lane expires its replacement starts
 	// opening, so the new lane is carrying traffic before the old one goes.
 	Lead time.Duration
-	// Overlap is how long the replacement carries traffic alongside the
-	// old lane before the old one is retired, so the new connection is past
-	// TCP slow start by the time it takes over.
-	Overlap time.Duration
+	// Overlap is the least time the replacement carries traffic alongside
+	// the old lane before the old one is retired, and how long the old
+	// lane must then have carried nothing. A new connection takes the
+	// traffic only as fast as TCP lets it grow, which next to a busy
+	// connection can take many seconds, so an old lane that is still
+	// carrying something stays, up to MaxOverlap or BytesMax in all.
+	Overlap    time.Duration
+	MaxOverlap time.Duration
 }
 
 // DefaultChurn returns the design's lane lifetimes and byte budgets. The
@@ -42,6 +46,7 @@ func DefaultChurn() Churn {
 		Sigma:          0.7,
 		Lead:           5 * time.Second,
 		Overlap:        time.Second,
+		MaxOverlap:     30 * time.Second,
 	}
 }
 
@@ -61,6 +66,9 @@ func (c Churn) withDefaults() Churn {
 	}
 	if c.Overlap <= 0 {
 		c.Overlap = d.Overlap
+	}
+	if c.MaxOverlap <= 0 {
+		c.MaxOverlap = max(d.MaxOverlap, c.Overlap)
 	}
 	return c
 }
