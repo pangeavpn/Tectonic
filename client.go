@@ -170,6 +170,14 @@ var (
 	ErrClosed = net.ErrClosed
 )
 
+// recvBuffer is how many datagrams from the node can wait for ReadFrom.
+// They come in bursts: when a late packet arrives, the pool hands on at
+// once everything it held back for it, which can be the most it holds
+// (8192) with more arriving behind. A buffer that overflows drops packets
+// that had already made it across, and the TCP connections inside the
+// tunnel take each for congestion.
+const recvBuffer = 16384
+
 // Conn is a datagram connection to the node's WireGuard, carried over
 // Tectonic lanes. It implements net.PacketConn; the address passed to
 // WriteTo is ignored, and ReadFrom always reports RemoteAddr.
@@ -212,7 +220,7 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		log:    log,
 		local:  addr("tectonic"),
 		remote: addr(d.node),
-		recv:   make(chan []byte, 1024),
+		recv:   make(chan []byte, recvBuffer),
 		closed: make(chan struct{}),
 		rdWake: make(chan struct{}),
 		bufs:   sync.Pool{New: func() any { return make([]byte, 0, 2048) }},
