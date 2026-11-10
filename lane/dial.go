@@ -113,6 +113,10 @@ type DialConfig struct {
 	// FirstPacket, if set, rides in the same record as HELLO, so the first
 	// WireGuard packet reaches the node within two round trips.
 	FirstPacket []byte
+	// TakeFirstPacket, if FirstPacket is nil, is called the moment TLS
+	// completes, so a packet that arrived during the handshake still makes
+	// the first flight.
+	TakeFirstPacket func() []byte
 
 	// Lane configures the lane itself. Role and Raw are filled in by Dial.
 	Lane Options
@@ -183,6 +187,9 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 		h.Flags |= wire.FlagCellular
 	}
 	h.Sign(wire.LaneKey(cfg.DeviceKey, binding))
+	if cfg.FirstPacket == nil && cfg.TakeFirstPacket != nil {
+		cfg.FirstPacket = cfg.TakeFirstPacket()
+	}
 	first := wire.AppendFrame(nil, wire.TypeHello, h.AppendBody(nil))
 	if len(cfg.FirstPacket) > 0 && len(cfg.FirstPacket) <= wire.MaxBodyLen {
 		first = wire.AppendFrame(first, wire.TypeData, cfg.FirstPacket)
