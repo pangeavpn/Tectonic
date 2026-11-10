@@ -48,21 +48,27 @@ The output is a Markdown table of measurement, target and result.
   percent between runs.
 - **The simulated hosts are gVisor netstacks, and gVisor has neither
   `TCP_NOTSENT_LOWAT` nor `TCP_INFO`.** Every lane in the bench therefore runs
-  Tectonic's fallback path: estimates from PING/PONG, and a PONG-paced window
-  that keeps the backlog out of the TCP stack. In production only Windows takes
-  that path; Linux, Android, macOS and iOS set the low-water mark and read
-  `TCP_INFO`, which keeps unsent data in the kernel to 32 KB rather than up to
-  a bandwidth-delay product. The bench is a pessimistic proxy for those
-  platforms.
-- **The inner TCP is gVisor's too,** and it tolerates reordering poorly.
-  With RACK (`-inner-rack`), its reordering window is about a quarter of the
-  minimum RTT, and after a burst of spurious recoveries a flow can stall on
-  retransmission timeouts for seconds; this hits the single-connection models
-  too. Without RACK (the default here), three duplicate ACKs trigger a
-  retransmit. Either way, reordering between lanes, which Tectonic allows by
-  design, costs far more here than with a kernel TCP inside the tunnel, which
-  adapts its reordering window. Expect large run-to-run swings in Tectonic's
-  throughput for this reason.
+  the path a lane takes without them: it estimates its rate from PING/PONG,
+  caps what it has written but not seen confirmed, and paces itself (see
+  [design §7](../docs/design.md#without-tcp_notsent_lowat)). In production
+  only Windows takes that path. Linux, Android, macOS and iOS set the
+  low-water mark and read `TCP_INFO`, and the bench says nothing about how
+  those lanes behave.
+- **The inner TCP is gVisor's too.** Two of its habits decide most of the
+  clean-link number:
+  1. It leaves slow start (HyStart) as soon as its round-trip time rises by a
+     few milliseconds. Over plain WireGuard the link adds no delay until its
+     queue fills, so the flow overshoots, loses a few hundred packets and
+     settles at the link's capacity within two seconds. Through a tunnel that
+     adds a little delay earlier, it can stop growing at a third or half of
+     capacity and then needs ten seconds or more to climb the rest. Which
+     happens varies from run to run.
+  2. Its retransmission timeout has a floor of 200 ms on the whole round
+     trip, where Linux adds 200 ms to it. A delay spike of 150 ms that a
+     kernel TCP would ride out can send it back to one packet.
+  With RACK (`-inner-rack`) it can also stall on timeouts for seconds after a
+  burst of spurious recoveries, which hits the single-connection models too;
+  without RACK (the default here), three duplicate ACKs trigger a retransmit.
 - The link hosts use CUBIC without RACK; gVisor's Reno, and CUBIC with RACK,
   proved fragile under burst drops (see `internal/stacktune`).
 

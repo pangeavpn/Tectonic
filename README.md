@@ -12,21 +12,20 @@
 ---
 
 Tectonic is PangeaVPN's own TCP transport for WireGuard. It spreads WireGuard
-datagrams, unordered, across a small pool of short-lived TLS 1.3 connections
-("lanes"), so a stall on one connection never holds up the others. To a
-network observer each lane is Chrome loading an ordinary website.
+datagrams across a small pool of short-lived TLS 1.3 connections ("lanes")
+and puts them back in order on arrival, so a stall on one connection holds up
+the others only briefly. To a network observer each lane is Chrome loading an
+ordinary website.
 
-**Status:** implemented, not yet field-tested or shown to be fast. The
-protocol in the [design](docs/design.md) is built and covered by tests,
-including an in-process end-to-end run with real WireGuard. `bench/` measures
-the speed targets in [§13](docs/design.md#13-measuring-speed). So far it meets
-three of the eight (time to first packet, 1% loss, reset recovery) and misses
-the rest, notably clean-link throughput. Its simulator only exercises the
-fallback path that Windows clients would use, so the numbers are a
-pessimistic proxy for other platforms; see
-[`bench/RESULTS.md`](bench/RESULTS.md). The default shaping profile uses
-placeholder numbers until profiles are recorded from real Chrome sessions
-(milestone M5).
+**Status:** implemented, not yet field-tested. The protocol in the
+[design](docs/design.md) is built and covered by tests, including an
+in-process end-to-end run with real WireGuard. `bench/` measures the speed
+targets in [§13](docs/design.md#13-measuring-speed); see
+[`bench/RESULTS.md`](bench/RESULTS.md) for which it meets. Its simulator only
+exercises the path that lanes take without `TCP_NOTSENT_LOWAT`, which in
+production means Windows clients; the path other platforms take has not been
+measured yet. The default shaping profile uses placeholder numbers until
+profiles are recorded from real Chrome sessions (milestone M5).
 
 - [**Design methodology**](docs/design.md): how Tectonic works and why.
 - Client: linked into the PangeaVPN daemon
@@ -41,7 +40,7 @@ See [Design methodology § Code layout](docs/design.md#14-code-layout) for detai
 |---|---|
 | `wire/` | Frames, HELLO/WELCOME, key derivation. No I/O. |
 | `lane/` | One TLS lane: dial, login, frame I/O, retire. Direct and CDN carriers. |
-| `sched/` | Lane pool, scheduler, duplication, churn, throttle detection. |
+| `sched/` | Lane pool, scheduler, resequencer, duplication, churn, throttle detection. |
 | `shape/` | Shaping profiles and record-size planning. |
 | `server/` | Server library: TLS listener, login check, cover-site fallback, sessions. |
 | `client.go` | Public client API: dial a profile, get a `net.PacketConn` for WireGuard. |
