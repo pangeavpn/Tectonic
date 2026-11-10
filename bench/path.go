@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"os"
+	"strings"
 	"time"
 
 	"golang.zx2c4.com/wireguard/tun/netstack"
@@ -175,4 +177,63 @@ func logSockets(o opts, e *env) {
 	}
 	o.logf("%s: client sockets:\n%s", e.tr, kernel.SS(false, port))
 	o.logf("%s: node sockets:\n%s", e.tr, kernel.SS(true, port))
+}
+
+// traceTransfer logs how a download is going at every BENCH_TRACE interval
+// (a duration such as 250ms), and returns the function that stops it. Each
+// line has the rate over the interval; on the kernel path, what the kernel
+// says about the sending end of the TCP connection inside the tunnel (its
+// window, where it left slow start, its round trip and retransmissions);
+// and for Tectonic, the client's lane count and what its merge has held
+// back, given up on, seen arrive late and been told was dropped. It shows
+// what a throughput figure alone hides: a connection that left slow start
+// early and spent the measurement climbing, or one that is being made to
+// retransmit.
+func traceTransfer(ctx context.Context, o opts, e *env, t *transfer) (stop func()) {
+	every, err := time.ParseDuration(os.Getenv("BENCH_TRACE"))
+	if err != nil || every <= 0 {
+		return func() {}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	go func() {
+		tick := time.NewTicker(every)
+		defer tick.Stop()
+		last := t.bytes.Load()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-tick.C:
+			}
+			b := t.bytes.Load()
+			line := fmt.Sprintf("trace %s: %.1f Mbit/s", e.tr, float64(b-last)*8/every.Seconds()/1e6)
+			last = b
+			if kernel != nil && kernelInner {
+				line += innerSocket(kernel.SS(true, bulkPort))
+			}
+			if e.conn != nil {
+				st := e.conn.Stats()
+				line += fmt.Sprintf("; lanes %d, held %d, skipped %d, late %d, lost %d", st.Lanes, st.Held, st.Skipped, st.Late, st.Lost)
+			}
+			o.logf("%s", line)
+		}
+	}()
+	return cancel
+}
+
+// innerSocket picks the fields that say how a TCP sender is doing out of
+// `ss -ti` output for one connection.
+func innerSocket(ss string) string {
+	var out string
+	for _, f := range strings.Fields(ss) {
+		for _, k := range []string{"cwnd:", "ssthresh:", "rtt:", "retrans:", "reordering:"} {
+			if strings.HasPrefix(f, k) {
+				out += " " + f
+			}
+		}
+	}
+	if out == "" {
+		return ""
+	}
+	return ";" + out
 }

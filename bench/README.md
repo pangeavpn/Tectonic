@@ -116,7 +116,22 @@ forging one to each end.
 
 `BENCH_DEBUG=1` prints Tectonic's own debug log (lane dials, retirements,
 sessions). `BENCH_MAXLANES=n` caps the lanes the bench node allows, which
-isolates cross-lane effects.
+isolates cross-lane effects. `BENCH_PATHS=regexp` limits the `paths`
+scenario to the paths whose names match.
+
+`BENCH_TRACE=250ms` (any duration), with `-v`, logs every bulk download at
+that interval: its rate; on the kernel path, what the kernel says about the
+sending end of the TCP connection inside the tunnel (window, `ssthresh`,
+round trip, retransmissions); and for Tectonic, the client's lane count and
+what its merge has held back, given up on, seen arrive late and been told
+was dropped. A throughput figure alone hides the two things that most often
+decide it: where that connection left slow start (`ssthresh`), and whether
+it is being made to retransmit. For example:
+
+```sh
+BENCH_TRACE=250ms BENCH_PATHS=continent go run . -kernel -server-cc bbr \
+  -run '^paths$' -transports tectonic -v
+```
 
 ## Results
 

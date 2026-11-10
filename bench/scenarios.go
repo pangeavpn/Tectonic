@@ -6,6 +6,8 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -152,6 +154,7 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 		return bulkResult{tr: tr, err: err}
 	}
 	defer t.Stop()
+	defer traceTransfer(ctx, o, e, t)()
 	time.Sleep(o.warm)
 	b0, l0 := t.bytes.Load(), linkBytes(e.P)
 	u0, d0 := e.P.stats()
@@ -174,8 +177,8 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 	if e.conn != nil {
 		st := e.conn.Stats()
 		up, down := e.P.stats()
-		o.logf("%s: lanes %d, sent %d, dropped %d, dupes %d; received: held %d, skipped %d, late %d; link up %d pkts, down %d pkts, queue drops %d/%d",
-			tr, st.Lanes, st.Sent, st.Dropped, st.Dupes, st.Held, st.Skipped, st.Late,
+		o.logf("%s: lanes %d, sent %d, dropped %d, dupes %d; received: held %d, skipped %d, late %d, lost %d; link up %d pkts, down %d pkts, queue drops %d/%d",
+			tr, st.Lanes, st.Sent, st.Dropped, st.Dupes, st.Held, st.Skipped, st.Late, st.Lost,
 			up.Packets, down.Packets, up.DroppedQueue, down.DroppedQueue)
 	}
 	logSockets(o, e)
@@ -552,9 +555,16 @@ var realPaths = []struct {
 	{"Lossy international (20 Mbit/s, 200 ms, 2% loss)", link.Config{Bandwidth: 20e6, RTT: 200 * time.Millisecond, Loss: 0.02, Seed: 17}},
 }
 
+// pathsRe limits the paths scenario to the paths whose names match
+// BENCH_PATHS, a regular expression; all of them by default.
+var pathsRe = regexp.MustCompile(os.Getenv("BENCH_PATHS"))
+
 func scPaths(ctx context.Context, o opts) []row {
 	var rows []row
 	for _, p := range realPaths {
+		if !pathsRe.MatchString(p.name) {
+			continue
+		}
 		po := o
 		po.warm = max(o.warm, 20*p.lc.RTT) // let slow start finish on long paths
 		o.logf("paths: %s", p.name)
