@@ -5,6 +5,7 @@ go 1.26.0
 replace github.com/pangeavpn/tectonic => ../
 
 require (
+	github.com/pangeavpn/tectonic v0.0.0-00010101000000-000000000000
 	github.com/refraction-networking/utls v1.8.2
 	golang.zx2c4.com/wireguard v0.0.0-20260522210424-ecfc5a8d5446
 	gvisor.dev/gvisor v0.0.0-20250503011706-39ed1f5ac29c
