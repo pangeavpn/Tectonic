@@ -174,8 +174,9 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 	if e.conn != nil {
 		st := e.conn.Stats()
 		up, down := e.L.Stats()
-		o.logf("%s: lanes %d, sent %d, dropped %d, dupes %d; link up %d pkts, down %d pkts, queue drops %d/%d",
-			tr, st.Lanes, st.Sent, st.Dropped, st.Dupes, up.Packets, down.Packets, up.DroppedQueue, down.DroppedQueue)
+		o.logf("%s: lanes %d, sent %d, dropped %d, dupes %d; received: held %d, skipped %d, late %d; link up %d pkts, down %d pkts, queue drops %d/%d",
+			tr, st.Lanes, st.Sent, st.Dropped, st.Dupes, st.Held, st.Skipped, st.Late,
+			up.Packets, down.Packets, up.DroppedQueue, down.DroppedQueue)
 	}
 	return r
 }

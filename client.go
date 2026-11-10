@@ -356,6 +356,10 @@ type Stats struct {
 	Sent      uint64 // datagrams sent
 	Dropped   uint64 // datagrams no lane would take
 	Dupes     uint64 // duplicated small packets
+	// Packets from the node that arrived ahead of earlier ones and waited
+	// for them; earlier packets given up on when the wait ran out; and
+	// packets that arrived after being given up on.
+	Held, Skipped, Late uint64
 }
 
 // Stats returns a snapshot of the client.
@@ -365,6 +369,7 @@ func (c *Conn) Stats() Stats {
 	return Stats{
 		Lanes: ps.Lanes, Session: ps.Session, Carrier: carrier, Mode: mode, Throttled: ps.Throttled,
 		Sent: ps.Scheduler.Sent, Dropped: ps.Scheduler.Dropped, Dupes: ps.Scheduler.Duplicated,
+		Held: ps.Resequencer.Held, Skipped: ps.Resequencer.Skipped, Late: ps.Resequencer.Late,
 	}
 }
 

@@ -32,6 +32,7 @@ type session struct {
 	cellular bool
 	udp      *net.UDPConn
 	sched    sched.Scheduler
+	reseq    *sched.Resequencer
 	done     chan struct{}
 
 	mu        sync.Mutex
@@ -65,13 +66,17 @@ func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) b
 		ResumeWindow: s.cfg.ResumeWindow,
 		Profile:      s.profile.ID,
 	}
+	src := ss.reseq.Source()
 	l := lane.New(conn, br, lane.Options{
 		Role:    lane.Server,
 		Planner: shape.NewPlanner(s.profile),
 		Raw:     raw,
 		Logger:  s.log,
 		Handler: lane.Handler{
-			Data: func(_ *lane.Lane, pkt []byte) { ss.udp.Write(pkt) },
+			Data: func(l *lane.Lane, pkt []byte) { src.Push(pkt, l.RTT()) },
+			// Nothing more will arrive on the lane, so the packets other
+			// lanes deliver no longer wait for it.
+			End: func(*lane.Lane) { src.Close() },
 			Retire: func(*lane.Lane) {
 				ss.refresh()
 			},
@@ -83,12 +88,14 @@ func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) b
 		},
 	})
 	if !ss.add(l, maxLanes) {
+		src.Close()
 		l.Close()
 		return false
 	}
 	s.lanes.Add(1)
 	go func() {
 		<-l.Done()
+		src.Close()
 		s.lanes.Add(-1)
 		ss.remove(l)
 	}()
@@ -119,6 +126,7 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 		return nil, err
 	}
 	ss := &session{s: s, keyID: h.KeyID, cellular: h.Cellular(), udp: udp, done: make(chan struct{})}
+	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {
@@ -316,6 +324,7 @@ func (ss *session) abort() {
 		li.l.Close()
 	}
 	ss.sched.SetLanes(nil)
+	ss.reseq.Close()
 	ss.udp.Close()
 	ss.s.mu.Lock()
 	if ss.s.sessions[ss.id] == ss {

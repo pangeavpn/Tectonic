@@ -101,6 +101,7 @@ type Pool struct {
 	churn Churn
 	log   *slog.Logger
 	sched Scheduler
+	reseq *Resequencer
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -146,6 +147,7 @@ type Pool struct {
 // laneState is the pool's view of one lane.
 type laneState struct {
 	l           PoolLane
+	src         *Source // the lane's way into the resequencer
 	welcomed    bool
 	session     wire.SessionID
 	lifetime    time.Duration
@@ -163,6 +165,8 @@ type laneState struct {
 // once the dial returns.
 type laneRef struct {
 	st          *laneState
+	srcOnce     sync.Once
+	src         *Source
 	retired     bool
 	closeReason *wire.CloseReason
 }
@@ -196,6 +200,11 @@ func NewPool(cfg PoolConfig) *Pool {
 		thr:       newThrottle(),
 		rng:       rand.New(rand.NewChaCha8(seed)),
 	}
+	p.reseq = NewResequencer(func(pkt []byte) {
+		if cfg.Receive != nil {
+			cfg.Receive(pkt)
+		}
+	})
 	p.lastActive.Store(time.Now().UnixNano())
 	go p.loop()
 	return p
@@ -296,6 +305,9 @@ type PoolStats struct {
 	Throttled bool
 	Extra     int // lanes added because per-connection throttling was detected
 	Scheduler SchedulerStats
+	// Resequencer counts how packets from the server were put back in
+	// order.
+	Resequencer ResequencerStats
 }
 
 // Stats returns a snapshot of the pool.
@@ -304,16 +316,17 @@ func (p *Pool) Stats() PoolStats {
 	if !p.post(func() {
 		ch <- PoolStats{
 			Lanes: len(p.lanes), Dialing: p.dialing, Session: p.session,
-			Throttled: p.thr.throttled, Extra: p.thr.extra, Scheduler: p.sched.Stats(),
+			Throttled: p.thr.throttled, Extra: p.thr.extra,
+			Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats(),
 		}
 	}) {
-		return PoolStats{Scheduler: p.sched.Stats()}
+		return PoolStats{Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats()}
 	}
 	select {
 	case s := <-ch:
 		return s
 	case <-p.done:
-		return PoolStats{Scheduler: p.sched.Stats()}
+		return PoolStats{Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats()}
 	}
 }
 
@@ -368,6 +381,7 @@ func (p *Pool) shutdown(err error) {
 	p.pending, p.heldKA = nil, nil
 	p.mu.Unlock()
 	p.sched.SetLanes(nil)
+	p.reseq.Close()
 	sentClose := false
 	for st := range p.lanes {
 		if !sentClose && st.welcomed && err == nil {
@@ -588,14 +602,19 @@ func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
 	}
 	ref := &laneRef{}
 	req.Handler = lane.Handler{
-		Data: func(_ *lane.Lane, pkt []byte) {
+		Data: func(l *lane.Lane, pkt []byte) {
 			if !shape.IsKeepalive(pkt) {
 				p.lastActive.Store(time.Now().UnixNano())
 			}
-			if p.cfg.Receive != nil {
-				p.cfg.Receive(pkt)
+			var rtt time.Duration
+			if l != nil {
+				rtt = l.RTT()
 			}
+			p.source(ref).Push(pkt, rtt)
 		},
+		// Nothing more will arrive on the lane, so the packets other lanes
+		// deliver no longer wait for it.
+		End: func(*lane.Lane) { p.source(ref).Close() },
 		Retire: func(*lane.Lane) {
 			p.post(func() {
 				if ref.st == nil {
@@ -621,10 +640,20 @@ func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
 		ctx, cancel := context.WithTimeout(p.ctx, p.cfg.DialTimeout)
 		l, err := p.cfg.Dial(ctx, req)
 		cancel()
-		if !p.post(func() { p.dialed(ref, req, replaces, l, err, taken) }) && l != nil {
-			l.Close()
+		if !p.post(func() { p.dialed(ref, req, replaces, l, err, taken) }) {
+			p.source(ref).Close()
+			if l != nil {
+				l.Close()
+			}
 		}
 	}()
+}
+
+// source returns the lane's way into the resequencer, adding it on first
+// use: when the dial returns, or when the lane's first packet beats that.
+func (p *Pool) source(ref *laneRef) *Source {
+	ref.srcOnce.Do(func() { ref.src = p.reseq.Source() })
+	return ref.src
 }
 
 func (p *Pool) liveCount() int {
@@ -648,6 +677,7 @@ func (p *Pool) dialed(ref *laneRef, req DialRequest, replaces *laneState, l Pool
 		return
 	}
 	if err != nil {
+		p.source(ref).Close()
 		p.dialFailed(now, err, req.Reason, taken)
 		if replaces != nil {
 			replaces.replacement = false
@@ -658,11 +688,15 @@ func (p *Pool) dialed(ref *laneRef, req DialRequest, replaces *laneState, l Pool
 	closing := p.closing
 	p.mu.Unlock()
 	if closing {
+		p.source(ref).Close()
 		l.Close()
 		return
 	}
 	st := &laneState{
-		l:        l,
+		l: l,
+		// The server may send on the lane from the moment it reads HELLO,
+		// so from here on packets from other lanes wait for this one.
+		src:      p.source(ref),
 		lifetime: p.churn.Lifetime(p.rng),
 		budget:   p.churn.Budget(p.rng),
 		upAt:     now,
@@ -782,6 +816,7 @@ func (p *Pool) laneDone(st *laneState) {
 		return
 	}
 	delete(p.lanes, st)
+	st.src.Close()
 	err := st.l.Err()
 	if !st.welcomed {
 		p.dialFailed(time.Now(), err, "login", nil)

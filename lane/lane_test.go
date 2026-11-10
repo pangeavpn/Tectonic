@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
@@ -262,6 +263,28 @@ func TestCDNCarrier(t *testing.T) {
 	cl.Retire()
 	if err := waitDone(t, cl); err != nil {
 		t.Fatalf("retire over websocket: %v", err)
+	}
+}
+
+func TestEndIsCalledWhenTheReaderStops(t *testing.T) {
+	a, b := tcpPair(t)
+	var mu sync.Mutex
+	ended := 0
+	la := New(a, nil, Options{Role: Server, Handler: Handler{
+		End: func(*Lane) { mu.Lock(); ended++; mu.Unlock() },
+	}})
+	defer la.Close()
+	if err := la.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	b.Close()
+	if err := waitDone(t, la); err == nil {
+		t.Fatal("lane ended cleanly after its peer vanished")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if ended != 1 {
+		t.Fatalf("End called %d times, want once", ended)
 	}
 }
 

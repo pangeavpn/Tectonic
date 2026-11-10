@@ -118,6 +118,9 @@ type Handler struct {
 	Retire func(l *Lane)
 	// Close is called when the peer sends CLOSE, which ends the session.
 	Close func(l *Lane, reason wire.CloseReason)
+	// End is called once, when the lane's reader has stopped: no more
+	// frames will arrive on this lane.
+	End func(l *Lane)
 }
 
 // Options configure a lane.
@@ -592,7 +595,13 @@ func (l *Lane) finish(err error) {
 func (l *Lane) run() {
 	rerr := make(chan error, 1)
 	werr := make(chan error, 1)
-	go func() { rerr <- l.readLoop() }()
+	go func() {
+		err := l.readLoop()
+		if l.h.End != nil {
+			l.h.End(l)
+		}
+		rerr <- err
+	}()
 	go func() { werr <- l.writeLoop() }()
 	go l.monitor()
 
