@@ -219,11 +219,12 @@ func (ss *session) expireNow() {
 	}
 }
 
-// refresh gives the scheduler every lane that takes DATA.
+// refresh gives the scheduler every lane that takes DATA, newest first, as
+// the client orders its end of them.
 func (ss *session) refresh() {
 	ss.mu.Lock()
 	ls := make([]sched.Lane, 0, len(ss.lanes))
-	for _, li := range ss.lanes {
+	for _, li := range slices.Backward(ss.lanes) {
 		if !li.l.Retiring() {
 			ls = append(ls, li.l)
 		}

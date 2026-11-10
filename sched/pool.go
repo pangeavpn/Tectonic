@@ -1,11 +1,13 @@
 package sched
 
 import (
+	"cmp"
 	"context"
 	crand "crypto/rand"
 	"errors"
 	"log/slog"
 	"math/rand/v2"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -142,11 +144,13 @@ type Pool struct {
 	thr         *throttle
 	lastSample  time.Time
 	rng         *rand.Rand
+	laneSeq     uint64
 }
 
 // laneState is the pool's view of one lane.
 type laneState struct {
 	l           PoolLane
+	seq         uint64  // rises with every lane dialed: the newest lane has the highest
 	src         *Source // the lane's way into the resequencer
 	welcomed    bool
 	session     wire.SessionID
@@ -692,8 +696,10 @@ func (p *Pool) dialed(ref *laneRef, req DialRequest, replaces *laneState, l Pool
 		l.Close()
 		return
 	}
+	p.laneSeq++
 	st := &laneState{
-		l: l,
+		l:   l,
+		seq: p.laneSeq,
 		// The server may send on the lane from the moment it reads HELLO,
 		// so from here on packets from other lanes wait for this one.
 		src:      p.source(ref),
@@ -843,13 +849,21 @@ func (p *Pool) retire(st *laneState, why string) {
 	p.log.Debug("retiring lane", "why", why)
 }
 
-// refreshScheduler gives the scheduler every lane that takes DATA.
+// refreshScheduler gives the scheduler every lane that takes DATA, newest
+// first: a lane takes over the traffic as soon as it is up, while the lanes
+// before it carry what it cannot yet. The server orders its end of the
+// lanes the same way.
 func (p *Pool) refreshScheduler() {
-	var ls []Lane
+	var live []*laneState
 	for st := range p.lanes {
 		if !st.retiring {
-			ls = append(ls, st.l)
+			live = append(live, st)
 		}
+	}
+	slices.SortFunc(live, func(a, b *laneState) int { return cmp.Compare(b.seq, a.seq) })
+	ls := make([]Lane, len(live))
+	for i, st := range live {
+		ls[i] = st.l
 	}
 	p.sched.SetLanes(ls)
 	if len(ls) > 0 {

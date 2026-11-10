@@ -12,6 +12,7 @@ import (
 type stubLane struct {
 	mu      sync.Mutex
 	eta     time.Duration
+	rtt     time.Duration
 	full    bool
 	retrans bool
 	got     [][]byte
@@ -28,6 +29,7 @@ func (l *stubLane) Send(pkt []byte) bool {
 }
 func (l *stubLane) ETA(int) time.Duration { return l.eta }
 func (l *stubLane) Retransmitting() bool  { return l.retrans }
+func (l *stubLane) RTT() time.Duration    { return l.rtt }
 func (l *stubLane) count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -65,6 +67,62 @@ func TestSchedulerPicksEarliestETA(t *testing.T) {
 	}
 	if st := s.Stats(); st.Dropped != 1 || st.Sent != 11 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestSchedulerPrefersEarlierLanesUntilTheyFallBehind(t *testing.T) {
+	if SpillAfter(0) != SpillMin || SpillAfter(time.Second) != SpillMax || SpillAfter(80*time.Millisecond) != 5*time.Millisecond {
+		t.Fatal("SpillAfter is not a sixteenth of srtt within its bounds")
+	}
+	// srtt 80 ms: a preferred lane keeps the traffic until its estimate is
+	// more than 5 ms behind the best.
+	a := &stubLane{eta: 20 * time.Millisecond, rtt: 80 * time.Millisecond}
+	b := &stubLane{eta: 20 * time.Millisecond, rtt: 80 * time.Millisecond}
+	var s Scheduler
+	s.SetLanes([]Lane{a, b}) // a is preferred
+	send := func() { t.Helper(); s.Send(make([]byte, 500)) }
+	send()
+	if a.count() != 1 {
+		t.Fatal("the preferred lane did not take the first packet")
+	}
+	b.eta = 15 * time.Millisecond // a is 5 ms behind: not enough to spill
+	send()
+	if a.count() != 2 || b.count() != 0 {
+		t.Fatalf("spilled for a 5 ms gain: a=%d b=%d", a.count(), b.count())
+	}
+	a.eta = 26 * time.Millisecond // now 11 ms behind
+	send()
+	if b.count() != 1 {
+		t.Fatal("did not spill past a lane that fell behind")
+	}
+	// The traffic returns to the preferred lane as soon as it is back
+	// within the margin, not only once it is the earliest.
+	a.eta = 19 * time.Millisecond
+	send()
+	if a.count() != 3 || b.count() != 1 {
+		t.Fatalf("did not return to the preferred lane: a=%d b=%d", a.count(), b.count())
+	}
+	// A full preferred lane hands over to the earliest other lane.
+	a.full = true
+	send()
+	if b.count() != 2 {
+		t.Fatalf("b=%d, want the packet a had no room for", b.count())
+	}
+	a.full = false
+	// With three lanes, the most preferred of those within the margin wins:
+	// a is 20 ms behind c, b only 4 ms.
+	c := &stubLane{eta: 10 * time.Millisecond, rtt: 80 * time.Millisecond}
+	a.eta, b.eta = 30*time.Millisecond, 14*time.Millisecond
+	s.SetLanes([]Lane{a, b, c})
+	send()
+	if a.count() != 3 || b.count() != 3 || c.count() != 0 {
+		t.Fatalf("a=%d b=%d c=%d, want the packet on b", a.count(), b.count(), c.count())
+	}
+	// A lane that leaves the scheduler is forgotten.
+	s.SetLanes([]Lane{a, c})
+	send()
+	if c.count() != 1 {
+		t.Fatal("the best remaining lane did not take over")
 	}
 }
 

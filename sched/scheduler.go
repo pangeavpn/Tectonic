@@ -1,12 +1,13 @@
 // Package sched spreads WireGuard datagrams across lanes (design §7).
 //
 // The Scheduler, used by both client and server, sends each packet on the
-// lane with the earliest estimated delivery time and duplicates small urgent
-// packets while a lane is retransmitting. The Pool, used by the client, owns
-// the lanes: it opens and replaces them on a browser-like schedule, grows
-// the pool while per-connection throttling makes extra lanes pay off,
-// shrinks it when the tunnel goes idle, and rejoins the session after a
-// network change.
+// most preferred lane that would deliver it about as early as any other,
+// and duplicates small urgent packets while a lane is retransmitting. The
+// Resequencer, also used by both, merges the packets arriving on the lanes
+// back into order. The Pool, used by the client, owns the lanes: it opens
+// and replaces them on a browser-like schedule, grows the pool while
+// per-connection throttling makes extra lanes pay off, shrinks it when the
+// tunnel goes idle, and rejoins the session after a network change.
 package sched
 
 import (
@@ -26,6 +27,8 @@ type Lane interface {
 	ETA(n int) time.Duration
 	// Retransmitting reports whether the lane is recovering from loss.
 	Retransmitting() bool
+	// RTT is the smoothed round-trip estimate.
+	RTT() time.Duration
 }
 
 const (
@@ -37,7 +40,20 @@ const (
 	// dupBurst is the most duplication budget that can be saved up.
 	dupBurst = 16 << 10
 	maxLanes = 16
+
+	// SpillMin and SpillMax bound how much later than the best lane's a
+	// preferred lane's estimate may be before traffic spills past it.
+	// Within them the margin is a sixteenth of the preferred lane's srtt.
+	// The receiver delivers in order, so whatever the margin is, the whole
+	// stream arrives that much later while traffic is spilling.
+	SpillMin = time.Millisecond
+	SpillMax = 12 * time.Millisecond
 )
+
+// SpillAfter returns the margin for a lane with this srtt.
+func SpillAfter(srtt time.Duration) time.Duration {
+	return min(max(srtt/16, SpillMin), SpillMax)
+}
 
 // Scheduler picks a lane for every outgoing datagram. It is safe for
 // concurrent use; Send is lock-free apart from the duplication budget.
@@ -52,7 +68,10 @@ type Scheduler struct {
 	duplicated atomic.Uint64
 }
 
-// SetLanes replaces the set of lanes packets may be sent on.
+// SetLanes replaces the set of lanes packets may be sent on, most preferred
+// first. Client and server both put the newest lane first, so a lane takes
+// over the traffic as soon as it joins and its predecessor only carries
+// what the newcomer cannot yet.
 func (s *Scheduler) SetLanes(lanes []Lane) {
 	cp := append([]Lane(nil), lanes...)
 	s.lanes.Store(&cp)
@@ -66,15 +85,21 @@ func (s *Scheduler) Len() int {
 	return 0
 }
 
-// Send sends pkt on the lane with the earliest delivery estimate:
+// Send sends pkt on a lane chosen by delivery estimate:
 //
 //	eta(lane) = queued_bytes(lane) / rate(lane) + srtt(lane) / 2
 //
-// If that lane's queue is full it tries the next, and so on. While any lane
-// is retransmitting, a packet of DupMaxSize bytes or less is also copied
-// onto the next-best lane, within the DupShare budget; WireGuard's
-// anti-replay window drops whichever copy arrives second. Send reports
-// whether any lane took the packet.
+// It takes the most preferred lane whose estimate is within SpillAfter of
+// the earliest. Traffic that one lane can carry therefore stays on one
+// lane, in order. Once that lane falls behind, the overflow spills to the
+// next, and each packet still goes where it will arrive about as early as
+// anywhere, so the lanes deliver nearly in step and the receiver's
+// Resequencer has little to wait for. If the chosen lane's queue is full
+// it tries the others, earliest first. While any lane is retransmitting, a
+// packet of DupMaxSize bytes or less is also copied onto the next-best
+// lane, within the DupShare budget; WireGuard's anti-replay window drops
+// whichever copy arrives second. Send reports whether any lane took the
+// packet.
 func (s *Scheduler) Send(pkt []byte) bool {
 	p := s.lanes.Load()
 	if p == nil || len(*p) == 0 {
@@ -83,28 +108,38 @@ func (s *Scheduler) Send(pkt []byte) bool {
 	lanes := *p
 	n := wire.HeaderLen + len(pkt)
 
+	// order lists the lanes by estimate, earliest first; lanes with equal
+	// estimates keep their order of preference.
 	var order [maxLanes]int
-	var etas [maxLanes]time.Duration
-	k := 0
-	for i, l := range lanes {
-		if k == maxLanes {
-			break
-		}
-		e := l.ETA(n)
-		j := k
-		for j > 0 && etas[j-1] > e {
-			etas[j], order[j] = etas[j-1], order[j-1]
+	var eta, sorted [maxLanes]time.Duration
+	k := min(len(lanes), maxLanes)
+	for i := range k {
+		e := lanes[i].ETA(n)
+		eta[i] = e
+		j := i
+		for j > 0 && sorted[j-1] > e {
+			sorted[j], order[j] = sorted[j-1], order[j-1]
 			j--
 		}
-		etas[j], order[j] = e, i
-		k++
+		sorted[j], order[j] = e, i
 	}
 
-	used := -1
-	for _, i := range order[:k] {
-		if lanes[i].Send(pkt) {
-			used = i
+	used, tried := -1, -1
+	for i := range k {
+		if eta[i]-sorted[0] <= SpillAfter(lanes[i].RTT()) {
+			tried = i
+			if lanes[i].Send(pkt) {
+				used = i
+			}
 			break
+		}
+	}
+	if used < 0 {
+		for _, i := range order[:k] {
+			if i != tried && lanes[i].Send(pkt) {
+				used = i
+				break
+			}
 		}
 	}
 	if used < 0 {

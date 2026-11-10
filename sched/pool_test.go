@@ -312,6 +312,30 @@ func TestPoolChurnReplacesBeforeRetiring(t *testing.T) {
 	}
 }
 
+func TestPoolPrefersTheNewestLane(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 1
+	p := newTestPool(t, d, PoolConfig{})
+	p.Send(wgInit())
+	l1, l2 := d.next(t), d.next(t)
+	deadline := time.Now().Add(2 * time.Second)
+	for p.sched.Len() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the second lane never joined the scheduler")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// Both lanes report the same delivery estimate, so the scheduler's
+	// order of preference decides: the newest lane takes the traffic.
+	before1, before2 := l1.sentCount(), l2.sentCount()
+	for range 10 {
+		p.Send(make([]byte, 500))
+	}
+	if got1, got2 := l1.sentCount()-before1, l2.sentCount()-before2; got1 != 0 || got2 != 10 {
+		t.Fatalf("older lane took %d packets and the newest %d, want 0 and 10", got1, got2)
+	}
+}
+
 func TestPoolChurnWaitsForReplacementWelcome(t *testing.T) {
 	d := newFakeDialer()
 	d.welcome = 1
