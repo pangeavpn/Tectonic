@@ -9,6 +9,13 @@ the line from run to run. Per design §13 Tectonic isn't called faster until
 the numbers exist on real networks, and the bench measures only one of the two
 paths a lane can take; see [What this doesn't measure](#what-this-doesnt-measure).
 
+> [!NOTE]
+> This file describes the simulator on macOS at an earlier commit. The other
+> path, on Linux TCP, has been measured since, and what it showed changed the
+> merge's wait, the scheduler's estimate and the size of records: see
+> [recent.md](recent.md), which also has the simulator's figures after those
+> changes.
+
 ## Latest full run
 
 `go run .` at the commit that added this version of the file. Go 1.27.3,

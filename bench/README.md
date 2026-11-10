@@ -135,4 +135,6 @@ BENCH_TRACE=250ms BENCH_PATHS=continent go run . -kernel -server-cc bbr \
 
 ## Results
 
-See `RESULTS.md` for the latest full run and what it shows.
+See `RESULTS.md` for the simulator's full run and what it shows, and
+`recent.md` for the kernel path: what was slow on it, why, and the figures
+after the changes that followed.
