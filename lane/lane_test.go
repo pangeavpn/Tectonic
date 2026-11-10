@@ -433,7 +433,10 @@ func TestRecordWaitsAMomentToFill(t *testing.T) {
 	// Two packets a fraction of a millisecond apart, as the packets of one
 	// train inside the tunnel are: they leave in one record, not two.
 	l.Send(wgInitiation())
-	time.Sleep(200 * time.Microsecond)
+	// Spin, don't sleep: a sleep this short can come back a millisecond
+	// late (it does on Linux), which is past the moment a record waits.
+	for start := time.Now(); time.Since(start) < 200*time.Microsecond; {
+	}
 	l.Send(wgInitiation())
 	waitWrites(t, rc, 2)
 	time.Sleep(20 * time.Millisecond)
