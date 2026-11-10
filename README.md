@@ -16,26 +16,88 @@ datagrams, unordered, across a small pool of short-lived TLS 1.3 connections
 ("lanes"), so a stall on one connection never holds up the others. To a
 network observer each lane is Chrome loading an ordinary website.
 
-**Status:** design stage. Nothing here is ready to use.
+**Status:** implemented, not yet field-tested or shown to be fast. The
+protocol in the [design](docs/design.md) is built and covered by tests,
+including an in-process end-to-end run with real WireGuard. `bench/` measures
+the speed targets in [§13](docs/design.md#13-measuring-speed). So far it meets
+three of the eight (time to first packet, 1% loss, reset recovery) and misses
+the rest, notably clean-link throughput. Its simulator only exercises the
+fallback path that Windows clients would use, so the numbers are a
+pessimistic proxy for other platforms; see
+[`bench/RESULTS.md`](bench/RESULTS.md). The default shaping profile uses
+placeholder numbers until profiles are recorded from real Chrome sessions
+(milestone M5).
 
 - [**Design methodology**](docs/design.md): how Tectonic works and why.
 - Client: linked into the PangeaVPN daemon
   ([pangeavpn-app](https://github.com/pangeavpn/pangeavpn-app)).
-- Server: `cmd/tectonic-server` (planned), run on VPN nodes.
+- Server: `cmd/tectonic-server`, run on VPN nodes.
 
-## Layout (planned)
+## Layout
 
 See [Design methodology § Code layout](docs/design.md#14-code-layout) for details.
 
 | Path | Contents |
 |---|---|
 | `wire/` | Frames, HELLO/WELCOME, key derivation. No I/O. |
-| `lane/` | One TLS lane: dial, login, frame I/O, retire. |
+| `lane/` | One TLS lane: dial, login, frame I/O, retire. Direct and CDN carriers. |
 | `sched/` | Lane pool, scheduler, duplication, churn, throttle detection. |
 | `shape/` | Shaping profiles and record-size planning. |
-| `server/` | Server library: TLS listener, login check, cover-site fallback. |
+| `server/` | Server library: TLS listener, login check, cover-site fallback, sessions. |
+| `client.go` | Public client API: dial a profile, get a `net.PacketConn` for WireGuard. |
 | `cmd/tectonic-server/` | Node binary. |
-| `bench/` | Simulated-link benchmarks against other transports. |
+| `bench/` | Simulated-link benchmarks against other transports (its own module). |
+
+## Using the client
+
+The hub's `tectonic` profile block goes in, and a `net.PacketConn` comes out.
+Relay WireGuard's loopback UDP socket to it the way the daemon relays every
+transport:
+
+```go
+conn, err := tectonic.Dial(ctx, tectonic.Config{
+	Profile: profile,   // node, cover_domain, key_id, device_key, pins, cdn...
+	Network: networkID, // the SNI mode that works is remembered per network
+	Control: protect,   // optional: keep lane sockets out of the tunnel on mobile
+})
+if err != nil {
+	return err
+}
+defer conn.Close()
+err = conn.WaitForSession(ctx, 15*time.Second)
+```
+
+`Dial` returns at once. The first packet WireGuard writes goes out with the
+first lane's login, so it reaches the node within two round trips.
+`ErrCredentialRejected` means the key_id expired or was revoked, and the hub
+must issue a new one.
+
+## Running a node
+
+```sh
+go build ./cmd/tectonic-server
+head -c 32 /dev/urandom | xxd -p -c 32 > node_secret
+
+./tectonic-server serve \
+  -secret-file node_secret \
+  -cover-domain n12.example-cdn.net -cert cover.crt -key cover.key \
+  -cover-dir /var/www/cover \
+  -wireguard 127.0.0.1:51820
+```
+
+On first run the node creates its default certificate (`default.crt`) and
+logs its pin. Give that pin to the hub; clients in Borrowed and None mode
+check it. `tectonic-server pin -cert default.crt` prints the pin again, and
+`tectonic-server issue -secret-file node_secret -node HOST:443 -pin PIN`
+mints a test profile the way the hub does. Send SIGHUP to reload the
+certificates and the `-revoked` list.
+
+## Testing and benchmarks
+
+```sh
+go test ./...          # unit, fuzz-seed and end-to-end tests
+cd bench && go run .   # simulated-link benchmarks (see bench/README.md)
+```
 
 ## Developing alongside the daemon
 
