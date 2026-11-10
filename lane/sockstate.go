@@ -1,6 +1,10 @@
 package lane
 
-import "time"
+import (
+	"time"
+
+	"github.com/pangeavpn/tectonic/shape"
+)
 
 // With TCP_NOTSENT_LOWAT a lane's queue is meant to stay in the lane, but
 // not all of it does. The kernel takes up to notSentLowat bytes it cannot
@@ -26,6 +30,16 @@ const (
 	// A connection that has sat idle is taken to have at least this many
 	// bytes of window left, as a new one has.
 	idleWindow = initialWindow
+	// A record holds no more than its connection sends in a thirty-second
+	// of the round trip, within recordSpanMin and recordSpanMax. Nothing in
+	// a TLS record can be used until all of it has arrived, so the first
+	// packet in a record is late by as long as the record takes to send.
+	// At 100 Mbit/s 16 KB take about a millisecond. A connection that has
+	// just opened sends a few hundred kilobytes a second: 16 KB take it
+	// tens of milliseconds, which is more than a TCP connection inside the
+	// tunnel allows a round trip to grow by before it stops its slow start.
+	recordSpanMin = time.Millisecond
+	recordSpanMax = 4 * time.Millisecond
 	// pacedAfter is how many times a connection must be seen holding back
 	// bytes its window had room for before it is taken to pace its packets.
 	pacedAfter = 3
@@ -73,6 +87,36 @@ func (s *sockState) wait(q float64, idle time.Duration) time.Duration {
 		secs = max(secs, ahead/s.pacing)
 	}
 	return time.Duration(secs * float64(time.Second))
+}
+
+// sendRate is the rate the connection is sending at, in bytes per second:
+// its pacing rate, or without one a window each round trip.
+func (s *sockState) sendRate() float64 {
+	if s.pacing > 0 {
+		return s.pacing
+	}
+	if s.rtt <= 0 {
+		return 0
+	}
+	return s.cwnd / s.rtt.Seconds()
+}
+
+// recordLimit is the most bytes of frames a record on this connection
+// should hold: what it sends in a thirty-second of the round trip (see
+// recordSpanMin), and no more than a full record. Without pacing, whatever
+// the window has room for leaves at once and can share a record. A record
+// always takes one packet, however slow the connection.
+func (s *sockState) recordLimit() int {
+	rate := s.sendRate()
+	if rate <= 0 {
+		return shape.MaxRecord
+	}
+	span := min(max(s.rtt/32, recordSpanMin), recordSpanMax)
+	limit := rate * span.Seconds()
+	if s.pacing <= 0 {
+		limit = max(limit, s.cwnd-s.inflight-s.notsent)
+	}
+	return int(min(limit, shape.MaxRecord))
 }
 
 // kernel returns what the kernel says about the lane's connection, reading

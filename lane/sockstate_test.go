@@ -4,6 +4,9 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/pangeavpn/tectonic/shape"
+	"github.com/pangeavpn/tectonic/wire"
 )
 
 // A connection that has just opened on a 150 ms path: ten segments of
@@ -85,6 +88,103 @@ func TestIdleConnectionIsTakenToHaveLostItsWindow(t *testing.T) {
 	s.inflight = 1448
 	if w := s.wait(200_000, time.Hour); w != 0 {
 		t.Fatalf("wait on a busy connection = %v", w)
+	}
+}
+
+func TestRecordLimitFollowsTheSendingRate(t *testing.T) {
+	// A new connection on a 150 ms path, paced at 275 KB/s, sends 1100
+	// bytes in the 4 ms a record may take: one packet to a record.
+	s := coldSock()
+	s.pacing = 275e3
+	if got := s.recordLimit(); got != 1100 {
+		t.Fatalf("record limit at 275 KB/s = %d, want 1100", got)
+	}
+	// At 100 Mbit/s on a 50 ms path a full record takes about a millisecond.
+	s = &sockState{cwnd: 600 * 1448, rtt: 50 * time.Millisecond, pacing: 12.5e6}
+	if got := s.recordLimit(); got != shape.MaxRecord {
+		t.Fatalf("record limit at 12.5 MB/s = %d, want a full record", got)
+	}
+	// A connection that does not pace sends what its window has room for
+	// at once, so that much can share a record: here the whole window.
+	s = coldSock()
+	if got := s.recordLimit(); got != 10*1448 {
+		t.Fatalf("record limit for a cold connection that does not pace = %d, want its window", got)
+	}
+	// With the window full, bytes leave a window each round trip: 14.5 KB
+	// in 150 ms, 386 bytes in 4 ms.
+	s.inflight = s.cwnd
+	if got := s.recordLimit(); got < 300 || got > 500 {
+		t.Fatalf("record limit behind a full window = %d", got)
+	}
+	if got := (&sockState{}).recordLimit(); got != shape.MaxRecord {
+		t.Fatalf("record limit with nothing reported = %d", got)
+	}
+}
+
+// laneWithSock returns a started lane that takes s for its connection's
+// state, as a lane with TCP_NOTSENT_LOWAT does, and the records it writes.
+func laneWithSock(t *testing.T, s *sockState) (*Lane, *recordConn) {
+	t.Helper()
+	prof := shape.Default()
+	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	l, rc := pipeLane(t, prof)
+	l.lowat = true
+	l.sock.Store(s)
+	if err := l.Start(nil); err != nil {
+		t.Fatal(err)
+	}
+	waitWrites(t, rc, 1)
+	return l, rc
+}
+
+// queue puts n full-size packets on the lane at once.
+func queue(l *Lane, n int) {
+	l.mu.Lock()
+	for range n {
+		l.data = append(l.data, make([]byte, 1420))
+		l.dataAt = append(l.dataAt, time.Now().UnixNano())
+		l.queued += wire.HeaderLen + 1420
+	}
+	l.mu.Unlock()
+	l.signal(l.wake)
+}
+
+func TestSlowConnectionSendsSmallRecords(t *testing.T) {
+	// Nothing in a record can be used until all of it has arrived. At
+	// 275 KB/s a 16 KB record takes 58 ms; one packet takes five.
+	slow := coldSock()
+	slow.pacing = 275e3
+	l, rc := laneWithSock(t, slow)
+	queue(l, 8)
+	waitBytes(t, rc, 2000+8*1423)
+	sizes := rc.sizes()[1:]
+	if len(sizes) != 8 {
+		t.Fatalf("8 packets left in %d records %v, want one each", len(sizes), sizes)
+	}
+	for _, s := range sizes {
+		if s < 1423 || s > 1536 {
+			t.Fatalf("records %v: each should hold one packet", sizes)
+		}
+	}
+	// They follow one another at once: a record cut short does not wait
+	// to fill.
+	rc.mu.Lock()
+	span := rc.times[len(rc.times)-1].Sub(rc.times[1])
+	rc.mu.Unlock()
+	if span > 20*time.Millisecond {
+		t.Fatalf("8 records took %v", span)
+	}
+}
+
+func TestFastConnectionSendsFullRecords(t *testing.T) {
+	l, rc := laneWithSock(t, &sockState{cwnd: 600 * 1448, rtt: 50 * time.Millisecond, pacing: 12.5e6})
+	queue(l, 40)
+	waitBytes(t, rc, 2000+40*1423)
+	sizes := rc.sizes()[1:]
+	for i, s := range sizes[:len(sizes)-1] {
+		if s > shape.MaxRecord || s < shape.MaxRecord-1423 {
+			t.Fatalf("record %d of %v is not full", i, sizes)
+		}
 	}
 }
 

@@ -1133,6 +1133,14 @@ func (l *Lane) writeLoop() error {
 		closing := l.closing
 		queuedBefore := l.queued
 		var dataBytes, pkts, real int
+		// A record is no larger than the connection sends in a moment
+		// (see sockState.recordLimit); what is left over follows in the next.
+		limit := shape.MaxRecord
+		if l.lowat {
+			if s := l.sock.Load(); s != nil {
+				limit = s.recordLimit()
+			}
+		}
 		// An interactive record is padded up to a bucket, so a few queued
 		// packets may cost less padding divided between two records.
 		take := len(l.small) + len(l.data)
@@ -1152,7 +1160,8 @@ func (l *Lane) writeLoop() error {
 		// add next to nothing to what is outstanding.
 		for len(l.small) > 0 && take > 0 {
 			p := l.small[0]
-			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
+			if n := len(buf) + wire.HeaderLen + len(p); len(buf) > 0 && n > shape.MaxRecord || pkts > 0 && n > limit {
+				more = more || limit < shape.MaxRecord
 				break
 			}
 			take--
@@ -1169,7 +1178,8 @@ func (l *Lane) writeLoop() error {
 		}
 		for !gated && len(l.data) > 0 && take > 0 {
 			p := l.data[0]
-			if len(buf) > 0 && len(buf)+wire.HeaderLen+len(p) > shape.MaxRecord {
+			if n := len(buf) + wire.HeaderLen + len(p); len(buf) > 0 && n > shape.MaxRecord || pkts > 0 && n > limit {
+				more = more || limit < shape.MaxRecord
 				break
 			}
 			take--
