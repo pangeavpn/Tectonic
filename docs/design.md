@@ -21,7 +21,7 @@
 > [!NOTE]
 > **Status: draft.** This describes what we intend to build. Nothing here is implemented yet, and every number under [Measuring speed](#13-measuring-speed) is a target, not a result.
 
-Tectonic carries WireGuard over a small pool of short-lived TLS 1.3 connections called **lanes**. Packets travel across the lanes independently and are put back in order as they arrive, so a stall on one lane holds up the others only briefly. To anyone watching the network, each lane is Chrome loading an ordinary website.
+Tectonic carries WireGuard over a small pool of short-lived TLS 1.3 connections called **lanes**. Packets travel across the lanes independently and are put back in order as they arrive. Each lane has its own congestion window, so a loss slows one lane and the others keep their pace. To anyone watching the network, each lane is Chrome loading an ordinary website.
 
 It's written in Go and shares one codebase between client and server. The client links it into the PangeaVPN daemon on desktop, Android and iOS, and the server runs on the VPN nodes.
 
@@ -74,11 +74,11 @@ Most of these ideas exist somewhere in some form. What's new is combining them, 
 </picture>
 
 > [!NOTE]
-> The figure shows the idea as first drawn, with packets handed to WireGuard the moment they arrive. Measured that way, the TCP connections inside the tunnel took every packet that arrived out of turn for a lost one. As built, the receiver puts packets back in order and waits a bounded time for a late one; see [Putting packets back in order](#putting-packets-back-in-order).
+> The figure shows the idea as first drawn, with packets handed to WireGuard the moment they arrive. Measured that way, the TCP connections inside the tunnel took every packet that arrived out of turn for a lost one. As built, the receiver puts packets back in order and waits for a late one, so a lost segment delays the tunnel much as it would delay one connection; see [Putting packets back in order](#putting-packets-back-in-order). What lanes add under loss is capacity, not less delay.
 
 | | Idea | What it does |
 |---|---|---|
-| 01 | **Unordered lanes** | WireGuard packets are spread across several TLS lanes, with no order shared between them. The receiver merges them back into WireGuard's own order, waiting for a late packet only briefly. A lost segment stalls its own lane, and the others for no more than that wait. |
+| 01 | **Unordered lanes** | WireGuard packets are spread across several TLS lanes, with no order shared between them. The receiver merges them back into WireGuard's own order, waiting for a late packet while its lane's TCP recovers. Each lane has its own congestion window, so on a lossy path the lanes together carry more than one connection would. |
 | 02 | **Free deduplication** | WireGuard's anti-replay window already drops duplicate packets. That lets us send a small, urgent packet on two lanes without any bookkeeping on the receiving end. |
 | 03 | **Lane churn** | Each lane lives from tens of seconds to a few minutes, and a replacement opens before the old one closes, the way a browser cycles connections. No single connection runs for hours or carries gigabytes. |
 | 04 | **Throttle detection** | If adding a lane raises total throughput while each lane stays capped, the network is throttling per connection. Tectonic responds by adding lanes, up to a limit. |
@@ -178,6 +178,7 @@ frame = type (1 byte) ‖ length (2 bytes, big-endian) ‖ body (length bytes)
 | `0x05` | `PING` / `PONG` | both | An 8-byte token, used to measure each lane's round-trip time |
 | `0x06` | `RETIRE` | both | "No new `DATA` on this lane." The lane finishes what it's sending, then closes with TLS `close_notify`. |
 | `0x07` | `CLOSE` | both | Ends the whole session. 1-byte reason code. |
+| `0x08` | `LOST` | both | A WireGuard key index, a counter and a count: datagrams the sender dropped, or never received from WireGuard, and will not send. The receiver stops waiting for them. |
 
 A receiver skips any frame type it doesn't recognise, using the length field, so new frame types can be added without breaking older clients.
 
@@ -197,9 +198,14 @@ It keeps the lanes in order of preference, newest first, and sends the packet on
 
 - **One lane while one lane is enough.** Traffic a single lane can carry stays on that lane, in order. Once the lane falls behind, the overflow spills to the next, and each packet still goes where it should arrive about as early as anywhere.
 - **Shallow socket buffers.** Each lane sets `TCP_NOTSENT_LOWAT`, so the operating system holds only a little unsent data. The queue stays in Tectonic's scheduler, which can still steer packets to the fastest lane. This also keeps latency low while the tunnel is busy.
-- **Rate and RTT** come from `TCP_INFO` where the platform provides it, and from `PING`/`PONG` otherwise.
+- **What the kernel holds counts.** Where the platform has `TCP_INFO`, `queued_bytes` includes the bytes the kernel has taken and not sent, and `rate` is what the connection can send now: its congestion window each round trip, or its pacing rate if it paces. The lane reads them again whenever it writes, and at most every millisecond while anything is in flight. A connection that has just opened may send ten segments and then nothing for a round trip. Counted by its own queue alone it looks empty, and takes packets that then wait in the kernel while another lane had room.
+- **Without `TCP_INFO`,** rate and RTT come from `PING`/`PONG`.
+- **A record is no larger than the lane sends in a moment.** Nothing in a TLS record can be used until all of it has arrived, so a record holds no more than its connection sends in a thirty-second of the round trip (between 1 and 4 ms), and always at least one packet. At 100 Mbit/s that is a full 16 KB record. On a paced connection that has just opened it is one packet.
+- **Paced or not.** A connection that paces (BBR, or any connection on a host whose queueing discipline is `fq`) sends at its pacing rate however much window it has. One that doesn't sends whatever its window has room for at once, so that much can share a record. The kernel reports a pacing rate either way. A lane takes its connection to pace if it runs BBR, or once it has been seen holding back segments its window had room for.
 - **Small packets first.** Within a lane, packets of 128 bytes or less go out ahead of the larger ones queued there, so a download doesn't make pings and ACKs wait behind it.
-- **A full queue drops.** A lane's queue is full once its oldest packet has waited about a round trip. When every lane is full the packet is dropped, which the TCP connections inside the tunnel read the way they would read a full link.
+- **A full queue drops.** A lane's queue is full once its oldest packet has waited about a round trip. When every lane is full the packet is dropped, which the TCP connections inside the tunnel read the way they would read a full link. The sender tells the receiver which packets it dropped (`LOST`), so the receiver does not wait for them.
+
+Both the estimate and the record limit matter most while a TCP connection inside the tunnel is in slow start. It stops growing as soon as its round trip rises by an eighth (HyStart), and a few packets held up for a round trip behind a new lane's window, or for tens of milliseconds inside a large record on a slow lane, are enough. Measured on a 150 ms path, the connection left slow start at 29 packets without them and at about 1300 with them.
 
 ### Without `TCP_NOTSENT_LOWAT`
 
@@ -217,7 +223,10 @@ Lanes are separate TCP connections, so packets spread across them arrive out of 
 
 - **No sequence numbers.** WireGuard's data header is in the clear and carries a counter that rises by one per packet. The merge uses that.
 - **Late or lost.** Each lane is an ordered, reliable stream, and the sender puts packets on a lane in counter order. So a lane that has delivered counter *c* will never deliver anything below *c*. A missing packet is known to be lost the moment every lane has delivered something beyond it, and the packets behind it go on at once. Until then it is still on its way, and they wait for it.
-- **A bounded wait.** A lane that has stalled, or has carried nothing recent to judge by, can't settle the question. In that case a packet waits at most one and a half round trips (between 20 and 150 ms) for the ones before it, then goes anyway. That is long enough for a lane to retransmit a lost segment, and short enough that the TCP inside the tunnel doesn't time out.
+- **The sender says what it dropped.** A packet that no lane would take, or that never reached Tectonic from WireGuard (a socket buffer overflowed), is not late. It is gone, and only the sender knows. The sender follows WireGuard's counters too, and reports the gaps in a `LOST` frame on the lane that takes the next packet. The receiver gives those packets their places in the order without waiting.
+- **Everything else is waited for.** A packet that was put on a lane arrives, unless the lane dies: if a segment is lost, TCP sends it again, and the lane delivers nothing until it has. So the packets behind a gap wait for it: four of the lane's round trips plus 200 ms, and at most a second. That covers a fast retransmission (one to two round trips, which themselves double while a queue on the path is full) and a first retransmission timeout (the round trip plus at least 200 ms). The limit is for a lane that has died without closing, which costs one stall of that length.
+- **But not on a lane that was already quiet.** That long wait is for a lane that was delivering when the gap appeared and then went silent: it has most likely lost a segment. A lane that had delivered nothing for two round trips before the gap is idle, or has only just joined, and the missing packet was more likely on a lane that has since died (a reset closes a lane with whatever was on it). If every lane that could still deliver the packet is like that, the wait is one and a half round trips (between 20 and 150 ms): long enough for a packet put on an idle lane at that moment to arrive.
+- **Why not sooner.** Handing on the packets behind a gap while the gap is still on its way looks like loss to a TCP connection inside the tunnel: it sends the whole stretch again and slows down. The first version waited one and a half round trips, just under what a fast retransmission takes. Measured on Linux TCP it gave up on thousands of packets a run, nearly all of which then arrived, and carried less than half as much.
 - **Small packets don't wait.** Packets of 128 bytes or less, and anything that isn't WireGuard data, are handed on as they arrive.
 
 ### Duplicating small urgent packets
@@ -245,7 +254,7 @@ TLS hides what's inside the traffic, but WireGuard still has a recognisable shap
 
 | Traffic state | What Tectonic does | Overhead |
 |---|---|---|
-| Bulk transfer | Packs `DATA` frames into records of up to 16 KB, like a real download | ≈ 0% |
+| Bulk transfer | Packs `DATA` frames into records of up to 16 KB, like a real download. A slow lane that paces sends smaller ones (see [Choosing a lane](#choosing-a-lane)). | ≈ 0% |
 | Interactive | Gives a record up to a millisecond to fill, then rounds its size up to a bucket taken from a recorded browsing profile. A few packets that would need a lot of padding together are divided between two records that each fit a bucket closely. | Small |
 | Lane start | Pads the first flight in each direction to match Chrome loading a page over HTTP/2 | Once per lane |
 | Idle | Absorbs WireGuard keepalives into browser-like idle behaviour, closes the lane, and opens a fresh one when traffic resumes | Tiny |
@@ -327,7 +336,7 @@ This is a broad comparison of public designs. Each of them solves a real problem
 |---|---|---|
 | VLESS + REALITY | Borrows another site's TLS identity, and its server only accepts the names it's configured for | Uses our own identity by default. When it borrows a name, it accepts any name, or none. Traffic is spread across lanes rather than one connection. |
 | Trojan | Real TLS plus a password, with a fallback website, over one long-lived stream | The login is bound to the TLS session, so it can't be replayed. Lanes churn, and a datagram isn't tied to one connection's order. |
-| Cloak | Hides its login in ClientHello fields and multiplexes ordered streams over several connections | The ClientHello is untouched Chrome. Datagrams are merged with a bounded wait, so a stalled lane holds the others up for about a round trip at most. |
+| Cloak | Hides its login in ClientHello fields and multiplexes ordered streams over several connections | The ClientHello is untouched Chrome. Datagrams, not streams, are merged, with a bounded wait: a lane that dies without closing holds the others up for a second at most, and one that is reset for a round trip or two. |
 | AnyTLS | TLS with padding aimed at defeating TLS-in-TLS detection | There's no TLS inside the TLS, because the payload is WireGuard. Shaping targets WireGuard's own patterns and costs nothing during bulk transfer. |
 | NaiveProxy | Uses Chrome's real network stack and HTTP/2 CONNECT | Pure Go with no native library, so it runs on iOS too. Multiple lanes and datagram-native framing. |
 | Speed-first VPN protocols | Built for speed, with little or no disguise | Speed comes from the scheduler, while the traffic still looks like browsing |

@@ -13,9 +13,9 @@
 
 Tectonic is PangeaVPN's own TCP transport for WireGuard. It spreads WireGuard
 datagrams across a small pool of short-lived TLS 1.3 connections ("lanes")
-and puts them back in order on arrival, so a stall on one connection holds up
-the others only briefly. To a network observer each lane is Chrome loading an
-ordinary website.
+and puts them back in order on arrival. Each lane has its own congestion
+window, so a loss slows one lane and the others keep their pace. To a network
+observer each lane is Chrome loading an ordinary website.
 
 **Status:** implemented, not yet field-tested. The protocol in the
 [design](docs/design.md) is built and covered by tests, including an
@@ -23,9 +23,10 @@ in-process end-to-end run with real WireGuard. `bench/` measures the speed
 targets in [§13](docs/design.md#13-measuring-speed); see
 [`bench/RESULTS.md`](bench/RESULTS.md) for which it meets. Its simulator only
 exercises the path that lanes take without `TCP_NOTSENT_LOWAT`, which in
-production means Windows clients; the path other platforms take has not been
-measured yet. The default shaping profile uses placeholder numbers until
-profiles are recorded from real Chrome sessions (milestone M5).
+production means Windows clients; the path other platforms take is measured
+on Linux with `bench -kernel` (see [`bench/recent.md`](bench/recent.md)). The
+default shaping profile uses placeholder numbers until profiles are recorded
+from real Chrome sessions (milestone M5).
 
 - [**Design methodology**](docs/design.md): how Tectonic works and why.
 - Client: linked into the PangeaVPN daemon
@@ -82,6 +83,17 @@ head -c 32 /dev/urandom | xxd -p -c 32 > node_secret
   -cover-domain n12.example-cdn.net -cert cover.crt -key cover.key \
   -cover-dir /var/www/cover \
   -wireguard 127.0.0.1:51820
+```
+
+Each session reads WireGuard's packets from a UDP socket, and WireGuard sends
+them in bursts. The node asks for a 7 MB receive buffer on it, which Linux
+grants only up to `net.core.rmem_max` (about 200 KB by default) unless the
+process has `CAP_NET_ADMIN`. With the default, bursts overflow the buffer and
+the tunnel loses packets it had room for; the node logs a warning when that
+is the case. Raise the limit on the node:
+
+```sh
+sysctl -w net.core.rmem_max=7500000
 ```
 
 On first run the node creates its default certificate (`default.crt`) and
