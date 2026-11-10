@@ -126,6 +126,12 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 	if err != nil {
 		return nil, err
 	}
+	if got := setSocketBuffers(udp); got > 0 && got < wgSocketBufferLow {
+		s.bufWarn.Do(func() {
+			s.log.Warn("the UDP socket to WireGuard has a small receive buffer, and will drop bursts; raise net.core.rmem_max or run with CAP_NET_ADMIN",
+				"bytes", got, "wanted", wgSocketBuffer)
+		})
+	}
 	ss := &session{s: s, keyID: h.KeyID, cellular: h.Cellular(), udp: udp, done: make(chan struct{})}
 	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
 	s.mu.Lock()

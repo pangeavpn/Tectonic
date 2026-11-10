@@ -122,6 +122,8 @@ type Server struct {
 
 	cover *cover
 	lanes atomic.Int64
+	// bufWarn limits the warning about a small socket buffer to one.
+	bufWarn sync.Once
 }
 
 // New checks cfg and returns a Server.
