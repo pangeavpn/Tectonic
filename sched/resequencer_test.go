@@ -391,6 +391,99 @@ func TestResequencerSurvivesALaneThatBreaksItsOrder(t *testing.T) {
 	}
 }
 
+func TestResequencerDoesNotWaitForWhatTheSenderDropped(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	a.Push(wgData(7, 0, big), rtt)
+	// The sender dropped 1 and 2 and says so on the lane that carries 3.
+	// Lane a is silent and has passed neither, but nothing waits for it.
+	b.Lost(7, 1, 2, rtt)
+	b.Push(wgData(7, 3, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 3}) {
+		t.Fatalf("delivered %v; packets the sender dropped were waited for", got)
+	}
+	if st := r.Stats(); st.Lost != 2 || st.Skipped != 0 || st.Held != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestResequencerStillWaitsForWhatIsOnItsWay(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	a.Push(wgData(7, 0, big), rtt)
+	// 2 was dropped; 1 is on lane a, late. The notice arrives early, as
+	// notices do: they go ahead of the data queued on a lane.
+	b.Lost(7, 2, 1, rtt)
+	b.Push(wgData(7, 3, big), rtt)
+	b.Push(wgData(7, 4, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0}) {
+		t.Fatalf("delivered %v without waiting for 1", got)
+	}
+	a.Push(wgData(7, 1, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 1, 3, 4}) {
+		t.Fatalf("delivered %v", got)
+	}
+	if st := r.Stats(); st.Lost != 1 || st.Skipped != 0 {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+func TestResequencerDeliversAPacketReportedDroppedThatArrives(t *testing.T) {
+	// If packets reach the sender out of order it can report one missing
+	// and then send it. It is delivered, in its place if it is in time.
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	a.Push(wgData(7, 0, big), rtt)
+	b.Lost(7, 2, 1, rtt)
+	b.Push(wgData(7, 3, big), rtt)
+	b.Push(wgData(7, 2, big), rtt) // it came after all
+	if got := s.list(); !slices.Equal(got, []uint64{0}) {
+		t.Fatalf("delivered %v", got)
+	}
+	a.Push(wgData(7, 1, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 1, 2, 3}) {
+		t.Fatalf("delivered %v", got)
+	}
+	// One that arrives once the order has moved past it goes straight
+	// through, like any late packet.
+	b.Lost(7, 4, 1, rtt)
+	b.Push(wgData(7, 5, big), rtt)
+	b.Push(wgData(7, 4, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 1, 2, 3, 5, 4}) {
+		t.Fatalf("delivered %v", got)
+	}
+}
+
+func TestResequencerTakesANoticeForAKeyItHasNotSeen(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	// The notice outruns every packet of a new key.
+	b.Lost(8, 1, 1, rtt)
+	b.Push(wgData(8, 2, big), rtt)
+	if got := s.list(); len(got) != 0 {
+		t.Fatalf("delivered %v before counter 0", got)
+	}
+	a.Push(wgData(8, 0, big), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 2}) {
+		t.Fatalf("delivered %v", got)
+	}
+	// A run longer than the merge holds, or far ahead, does no harm.
+	b.Lost(8, 3, 1<<20, rtt)
+	b.Lost(8, 1<<40, 5, rtt)
+	b.Push(wgData(8, 3+maxHeld, big), rtt)
+	if got := s.list(); got[len(got)-1] != 3+maxHeld {
+		t.Fatalf("delivered %v", got[max(0, len(got)-3):])
+	}
+}
+
 func TestResequencerWaitsOnlyBrieflyForALaneThatWasAlreadyQuiet(t *testing.T) {
 	var s sink
 	r := NewResequencer(s.deliver)

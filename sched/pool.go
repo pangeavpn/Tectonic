@@ -642,6 +642,13 @@ func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
 			}
 			p.source(ref).Push(pkt, rtt)
 		},
+		Lost: func(l *lane.Lane, lost wire.Lost) {
+			var rtt time.Duration
+			if l != nil {
+				rtt = l.BaseRTT()
+			}
+			p.source(ref).Lost(lost.Index, lost.Counter, lost.Count, rtt)
+		},
 		// Nothing more will arrive on the lane, so the packets other lanes
 		// deliver no longer wait for it.
 		End: func(*lane.Lane) { p.source(ref).Close() },

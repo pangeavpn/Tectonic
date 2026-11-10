@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/pangeavpn/tectonic/wire"
 )
 
 // stubLane is a scheduler lane with a fixed ETA.
@@ -16,6 +18,7 @@ type stubLane struct {
 	full    bool
 	retrans bool
 	got     [][]byte
+	lost    []wire.Lost // notices the lane was given
 }
 
 func (l *stubLane) Send(pkt []byte) bool {
@@ -30,6 +33,16 @@ func (l *stubLane) Send(pkt []byte) bool {
 func (l *stubLane) ETA(int) time.Duration { return l.eta }
 func (l *stubLane) Retransmitting() bool  { return l.retrans }
 func (l *stubLane) RTT() time.Duration    { return l.rtt }
+
+func (l *stubLane) Lost(lost wire.Lost) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.full {
+		return false
+	}
+	l.lost = append(l.lost, lost)
+	return true
+}
 func (l *stubLane) count() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -284,5 +297,110 @@ func TestThrottleIgnoresUnevenLanes(t *testing.T) {
 	}
 	if th.extra != 0 || th.probing {
 		t.Fatal("probed although lanes ran at different rates")
+	}
+}
+
+// wgPacket is a WireGuard data packet of size bytes with the given key
+// index and counter.
+func wgPacket(idx uint32, ctr uint64, size int) []byte {
+	return wgData(idx, ctr, size)
+}
+
+func TestSchedulerReportsWhatItDrops(t *testing.T) {
+	// Every lane is full for counters 3 to 5, so they are dropped. The
+	// receiver would wait for them; the lane that takes counter 6 tells it
+	// not to.
+	a := &stubLane{eta: 10 * time.Millisecond}
+	b := &stubLane{eta: 10 * time.Millisecond}
+	var s Scheduler
+	s.SetLanes([]Lane{a, b})
+	for c := uint64(0); c < 3; c++ {
+		if !s.Send(wgPacket(9, c, 1200)) {
+			t.Fatalf("counter %d not sent", c)
+		}
+	}
+	a.full, b.full = true, true
+	for c := uint64(3); c < 6; c++ {
+		if s.Send(wgPacket(9, c, 1200)) {
+			t.Fatalf("counter %d sent on a full lane", c)
+		}
+	}
+	if len(a.lost)+len(b.lost) != 0 {
+		t.Fatal("a notice went out on a lane that takes nothing")
+	}
+	a.full = false
+	if !s.Send(wgPacket(9, 6, 1200)) {
+		t.Fatal("counter 6 not sent")
+	}
+	want := []wire.Lost{{Index: 9, Counter: 3, Count: 3}}
+	if !slices.Equal(a.lost, want) || len(b.lost) != 0 {
+		t.Fatalf("notices %+v on a, %+v on b; want %+v on a", a.lost, b.lost, want)
+	}
+	if st := s.Stats(); st.Dropped != 3 || st.Reported != 3 {
+		t.Fatalf("stats %+v", st)
+	}
+	// Nothing is reported twice.
+	s.Send(wgPacket(9, 7, 1200))
+	if len(a.lost) != 1 {
+		t.Fatalf("notices %+v after the next packet", a.lost)
+	}
+}
+
+func TestSchedulerReportsCountersItNeverSaw(t *testing.T) {
+	// WireGuard's counters rise by one. If 2 and 3 never reach the
+	// scheduler (a socket buffer overflowed, say), no lane will carry them.
+	a := &stubLane{eta: 10 * time.Millisecond}
+	var s Scheduler
+	s.SetLanes([]Lane{a})
+	for _, c := range []uint64{0, 1, 4, 5} {
+		s.Send(wgPacket(9, c, 1200))
+	}
+	if want := []wire.Lost{{Index: 9, Counter: 2, Count: 2}}; !slices.Equal(a.lost, want) {
+		t.Fatalf("notices %+v, want %+v", a.lost, want)
+	}
+	// Small packets count too: they take a counter like any other.
+	s.Send(wgPacket(9, 7, 32))
+	if want := (wire.Lost{Index: 9, Counter: 6, Count: 1}); len(a.lost) != 2 || a.lost[1] != want {
+		t.Fatalf("notices %+v, want %+v last", a.lost, want)
+	}
+	// Each key has its own counters, and one seen for the first time
+	// starts wherever it is.
+	s.Send(wgPacket(10, 500, 1200))
+	s.Send(wgPacket(10, 501, 1200))
+	// A packet out of turn, or far ahead, reports nothing.
+	s.Send(wgPacket(9, 3, 1200))
+	s.Send(wgPacket(9, 1<<30, 1200))
+	if len(a.lost) != 2 {
+		t.Fatalf("notices %+v", a.lost)
+	}
+	// Packets that are not WireGuard data are not followed.
+	s.Send(make([]byte, 148))
+	if len(a.lost) != 2 {
+		t.Fatalf("notices %+v", a.lost)
+	}
+}
+
+func TestSchedulerKeepsANoticeTheLaneWouldNotTake(t *testing.T) {
+	a := &stubLane{eta: 10 * time.Millisecond}
+	var s Scheduler
+	s.SetLanes([]Lane{a})
+	s.Send(wgPacket(9, 0, 1200))
+	s.Send(wgPacket(9, 2, 1200)) // 1 is missing
+	if len(a.lost) != 1 {
+		t.Fatalf("notices %+v", a.lost)
+	}
+	// More runs than are kept: the oldest go unreported, the newest stay.
+	a.full = true
+	for i := range uint64(maxLostPending + 4) {
+		s.Send(wgPacket(9, 10+2*i, 1200)) // each dropped, and each skips one
+	}
+	a.full = false
+	s.Send(wgPacket(9, 1000, 1200))
+	if n := len(a.lost) - 1; n < 1 || n > maxLostPending {
+		t.Fatalf("%d notices after a long run of drops, want at most %d", n, maxLostPending)
+	}
+	last := a.lost[len(a.lost)-1]
+	if last.Index != 9 || last.Counter+uint64(last.Count) != 1000 {
+		t.Fatalf("last notice %+v does not reach the packet sent", last)
 	}
 }

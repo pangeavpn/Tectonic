@@ -75,6 +75,7 @@ func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) b
 		Logger:     s.log,
 		Handler: lane.Handler{
 			Data: func(l *lane.Lane, pkt []byte) { src.Push(pkt, l.BaseRTT()) },
+			Lost: func(l *lane.Lane, lost wire.Lost) { src.Lost(lost.Index, lost.Counter, lost.Count, l.BaseRTT()) },
 			// Nothing more will arrive on the lane, so the packets other
 			// lanes deliver no longer wait for it.
 			End: func(*lane.Lane) { src.Close() },

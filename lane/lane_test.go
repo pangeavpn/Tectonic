@@ -648,3 +648,30 @@ func TestFallbackWindowBoundsUnconfirmedBytes(t *testing.T) {
 		t.Fatal("the backlog should wait in the lane's queue, not the kernel")
 	}
 }
+
+func TestLostNoticeCrossesALane(t *testing.T) {
+	got := make(chan wire.Lost, 1)
+	n := newTestNode(t, func(n *testNode) {
+		n.handler = Handler{Lost: func(_ *Lane, lost wire.Lost) { got <- lost }}
+	})
+	cl := dial(t, n.dialConfig(t, SNIOwn))
+	n.acceptLane(t)
+	waitWelcome(t, cl)
+	want := wire.Lost{Index: 77, Counter: 1 << 33, Count: 12}
+	if !cl.Lost(want) {
+		t.Fatal("the lane would not take a notice")
+	}
+	select {
+	case lost := <-got:
+		if lost != want {
+			t.Fatalf("notice arrived as %+v, want %+v", lost, want)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the notice never arrived")
+	}
+	// A lane that is retiring takes no more.
+	cl.Retire()
+	if cl.Lost(want) {
+		t.Fatal("a retiring lane took a notice")
+	}
+}

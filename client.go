@@ -360,6 +360,10 @@ type Stats struct {
 	// for them; earlier packets given up on when the wait ran out; and
 	// packets that arrived after being given up on.
 	Held, Skipped, Late uint64
+	// Lost is how many packets the node said it had dropped, which nothing
+	// waited for. Reported is the same count in the other direction: what
+	// this end told the node not to wait for.
+	Lost, Reported uint64
 }
 
 // Stats returns a snapshot of the client.
@@ -370,6 +374,7 @@ func (c *Conn) Stats() Stats {
 		Lanes: ps.Lanes, Session: ps.Session, Carrier: carrier, Mode: mode, Throttled: ps.Throttled,
 		Sent: ps.Scheduler.Sent, Dropped: ps.Scheduler.Dropped, Dupes: ps.Scheduler.Duplicated,
 		Held: ps.Resequencer.Held, Skipped: ps.Resequencer.Skipped, Late: ps.Resequencer.Late,
+		Lost: ps.Resequencer.Lost, Reported: ps.Scheduler.Reported,
 	}
 }
 

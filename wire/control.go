@@ -95,6 +95,45 @@ func ParsePing(body []byte) (token uint64, pong bool, err error) {
 	return v &^ pongBit, v&pongBit != 0, nil
 }
 
+// LostLen is the size of a LOST body:
+//
+//	key index   4 bytes   the WireGuard receiver index, as a number
+//	counter     8 bytes   the first datagram dropped
+//	count       4 bytes   how many, counting up from it
+//
+// all big-endian. A receiver ignores bytes after these.
+const LostLen = 4 + 8 + 4
+
+// Lost names a run of WireGuard data packets, by the key index and counter
+// in their headers, that the sender dropped and will never send: its queues
+// were full, or the packets never reached it. A receiver that is merging
+// lanes back into order stops waiting for them.
+type Lost struct {
+	Index   uint32
+	Counter uint64
+	Count   uint32
+}
+
+// AppendLost appends a LOST frame to dst.
+func AppendLost(dst []byte, l Lost) []byte {
+	dst = AppendHeader(dst, TypeLost, LostLen)
+	dst = binary.BigEndian.AppendUint32(dst, l.Index)
+	dst = binary.BigEndian.AppendUint64(dst, l.Counter)
+	return binary.BigEndian.AppendUint32(dst, l.Count)
+}
+
+// ParseLost decodes a LOST body.
+func ParseLost(body []byte) (Lost, error) {
+	if len(body) < LostLen {
+		return Lost{}, errors.New("wire: LOST body shorter than 16 bytes")
+	}
+	return Lost{
+		Index:   binary.BigEndian.Uint32(body),
+		Counter: binary.BigEndian.Uint64(body[4:]),
+		Count:   binary.BigEndian.Uint32(body[12:]),
+	}, nil
+}
+
 // CloseReason is the 1-byte body of a CLOSE frame.
 type CloseReason byte
 

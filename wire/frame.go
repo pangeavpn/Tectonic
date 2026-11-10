@@ -25,6 +25,7 @@ const (
 	TypePing    byte = 0x05 // PING and PONG: an 8-byte token
 	TypeRetire  byte = 0x06 // no new DATA on this lane
 	TypeClose   byte = 0x07 // ends the whole session; 1-byte reason
+	TypeLost    byte = 0x08 // WireGuard datagrams the sender dropped
 )
 
 // HeaderLen is the size of a frame header: type and big-endian length.

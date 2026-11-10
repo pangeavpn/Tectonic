@@ -184,6 +184,25 @@ func TestPingPong(t *testing.T) {
 	}
 }
 
+func TestLost(t *testing.T) {
+	want := Lost{Index: 0xA1B2C3D4, Counter: 1<<40 + 7, Count: 300}
+	frame := AppendLost(nil, want)
+	if len(frame) != HeaderLen+LostLen || frame[0] != TypeLost {
+		t.Fatalf("LOST frame % x", frame)
+	}
+	got, err := ParseLost(frame[HeaderLen:])
+	if err != nil || got != want {
+		t.Fatalf("ParseLost = %+v, %v; want %+v", got, err, want)
+	}
+	// Fields appended by a later version are ignored.
+	if got, err := ParseLost(append(frame[HeaderLen:], 1, 2, 3)); err != nil || got != want {
+		t.Fatalf("ParseLost with a longer body = %+v, %v", got, err)
+	}
+	if _, err := ParseLost(frame[HeaderLen : HeaderLen+LostLen-1]); err == nil {
+		t.Fatal("short LOST accepted")
+	}
+}
+
 func TestFrames(t *testing.T) {
 	var buf []byte
 	buf = AppendFrame(buf, TypeData, []byte("packet"))

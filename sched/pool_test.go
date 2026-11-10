@@ -48,6 +48,7 @@ func (l *fakeLane) Send(pkt []byte) bool {
 }
 func (l *fakeLane) ETA(int) time.Duration     { return time.Millisecond }
 func (l *fakeLane) Retransmitting() bool      { return false }
+func (l *fakeLane) Lost(wire.Lost) bool       { return true }
 func (l *fakeLane) Welcomed() <-chan struct{} { return l.welcomed }
 func (l *fakeLane) Welcome() (wire.Welcome, bool) {
 	select {
@@ -276,6 +277,36 @@ func TestPoolReceives(t *testing.T) {
 	l.req.Handler.Data(nil, []byte("hello"))
 	if b := <-got; string(b) != "hello" {
 		t.Fatalf("received %q", b)
+	}
+}
+
+func TestPoolDoesNotWaitForWhatTheNodeDropped(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 1
+	got := make(chan uint64, 8)
+	p := newTestPool(t, d, PoolConfig{Receive: func(pkt []byte) {
+		_, ctr, _ := transportHeader(pkt)
+		got <- ctr
+	}})
+	l1, l2 := d.next(t), d.next(t)
+	// Counter 0 arrives on one lane. The node dropped 1 and says so on the
+	// lane that carries 2, which is handed on without waiting for the
+	// first lane to show that it has passed 1.
+	l1.req.Handler.Data(nil, wgData(3, 0, 1400))
+	l2.req.Handler.Lost(nil, wire.Lost{Index: 3, Counter: 1, Count: 1})
+	l2.req.Handler.Data(nil, wgData(3, 2, 1400))
+	for _, want := range []uint64{0, 2} {
+		select {
+		case ctr := <-got:
+			if ctr != want {
+				t.Fatalf("received counter %d, want %d", ctr, want)
+			}
+		case <-time.After(HoldBase / 2):
+			t.Fatalf("counter %d was held back for a packet the node said it dropped", want)
+		}
+	}
+	if st := p.Stats().Resequencer; st.Lost != 1 || st.Skipped != 0 {
+		t.Fatalf("stats %+v", st)
 	}
 }
 

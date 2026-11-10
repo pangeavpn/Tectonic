@@ -189,6 +189,9 @@ type Handler struct {
 	Data func(l *Lane, pkt []byte)
 	// Welcome is called on a client lane when WELCOME arrives.
 	Welcome func(l *Lane, w wire.Welcome)
+	// Lost is called when the peer says it dropped WireGuard datagrams
+	// and will never send them.
+	Lost func(l *Lane, lost wire.Lost)
 	// Retire is called when the peer sends RETIRE.
 	Retire func(l *Lane)
 	// Close is called when the peer sends CLOSE, which ends the session.
@@ -501,6 +504,22 @@ func (l *Lane) Send(pkt []byte) bool {
 	l.mu.Unlock()
 	l.signal(l.wake)
 	l.kickMonitor()
+	return true
+}
+
+// Lost tells the peer that datagrams were dropped and will never be sent,
+// so that it does not wait for them (see wire.Lost). The notice goes out
+// ahead of any DATA queued on the lane. It returns false if the lane is
+// retiring or closed.
+func (l *Lane) Lost(lost wire.Lost) bool {
+	l.mu.Lock()
+	if l.retiring || l.closing || l.isDone() {
+		l.mu.Unlock()
+		return false
+	}
+	l.ctrl = wire.AppendLost(l.ctrl, lost)
+	l.mu.Unlock()
+	l.signal(l.wake)
 	return true
 }
 
@@ -947,6 +966,10 @@ func (l *Lane) readLoop() error {
 				}
 				l.mu.Unlock()
 				l.signal(l.wake)
+			}
+		case wire.TypeLost:
+			if lost, err := wire.ParseLost(body); err == nil && l.h.Lost != nil {
+				l.h.Lost(l, lost)
 			}
 		case wire.TypeRetire:
 			l.mu.Lock()

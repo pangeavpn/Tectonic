@@ -364,6 +364,11 @@ func (d *dialer) race(ctx context.Context, req sched.DialRequest, network string
 					h.Data(l, pkt)
 				}
 			},
+			Lost: func(l *lane.Lane, lost wire.Lost) {
+				if winner.Load() == l && h.Lost != nil {
+					h.Lost(l, lost)
+				}
+			},
 			Retire: func(l *lane.Lane) {
 				if winner.Load() == l && h.Retire != nil {
 					h.Retire(l)

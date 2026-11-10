@@ -22,9 +22,11 @@ import (
 // lane that has delivered counter c will never deliver anything below c. A
 // missing packet is therefore known to be lost, not late, the moment every
 // lane has delivered something beyond it, and the packets behind it go on
-// at once. Until then it is still on its way on some lane, and the packets
-// behind it wait: a lane that has lost a segment delivers nothing more
-// until TCP has sent the segment again, and then delivers all of it.
+// at once. The sender also says which packets it dropped or never had (a
+// LOST frame, see Scheduler.Send), and nothing waits for those. Any other
+// missing packet is still on its way on some lane, and the packets behind
+// it wait: a lane that has lost a segment delivers nothing more until TCP
+// has sent the segment again, and then delivers all of it.
 //
 // A timer bounds that wait, and there are two cases. A lane that was
 // delivering when the gap appeared and has gone silent has most likely lost
@@ -161,8 +163,12 @@ type heldPkt struct {
 	// already quiet.
 	at, soon, due time.Time
 	// buf is nil for a small packet that was handed on at once and is kept
-	// only to mark its counter as seen.
+	// only to mark its counter as seen, and for a packet the sender said
+	// it dropped.
 	buf []byte
+	// lost marks a packet the sender said it dropped. It takes the
+	// packet's place in the order, so nothing waits for it.
+	lost bool
 }
 
 // ResequencerStats counts what the Resequencer has done.
@@ -170,6 +176,7 @@ type ResequencerStats struct {
 	Held    uint64 // packets that arrived early and waited for earlier ones
 	Skipped uint64 // missing packets given up on: lost, or later than the hold
 	Late    uint64 // packets that arrived after being given up on, and duplicates
+	Lost    uint64 // packets the sender said it had dropped, which nothing waited for
 }
 
 // NewResequencer returns a Resequencer that hands packets to deliver.
@@ -233,7 +240,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 		f.next = ctr + 1
 	default:
 		i, dup := f.find(ctr)
-		if dup {
+		if dup && !f.q[i].lost {
 			r.stats.Late++
 			break
 		}
@@ -244,8 +251,14 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 		} else {
 			r.deliver(pkt)
 		}
-		f.insert(i, h)
-		r.held++
+		if dup {
+			// The sender said it had dropped this one, and sent it
+			// after all.
+			f.q[i] = h
+		} else {
+			f.insert(i, h)
+			r.held++
+		}
 		for r.held > maxHeld && f.len() > 0 {
 			r.skipTo(f, 0)
 			r.drain(f)
@@ -256,6 +269,52 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 	}
 	if ordered {
 		r.settle(fi)
+	}
+	r.regap(f, true)
+}
+
+// Lost takes the sender's word, received on a lane whose round trip is rtt,
+// that it dropped count packets of the key idx from counter ctr on and will
+// never send them. They keep their places in the order, so the packets
+// behind them go on as soon as everything earlier has arrived: a packet
+// that is still on its way on a lane is worth waiting for, and one that is
+// not coming is not.
+func (s *Source) Lost(idx uint32, ctr uint64, count uint32, rtt time.Duration) {
+	r := s.r
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || count == 0 {
+		return
+	}
+	fi := r.flow(idx, ctr)
+	f := &r.flows[fi]
+	now := time.Now()
+	due := now.Add(HoldFor(rtt))
+	for c, end := ctr, ctr+uint64(min(count, maxHeld)); c < end; c++ {
+		switch {
+		case c < f.next:
+			continue
+		case c == f.next:
+			f.next++
+			r.drain(f)
+		case c-f.next > maxJump:
+			return
+		default:
+			i, dup := f.find(c)
+			if dup {
+				continue
+			}
+			f.insert(i, heldPkt{ctr: c, at: now, soon: now.Add(IdleHoldFor(rtt)), due: due, lost: true})
+			r.held++
+		}
+		r.stats.Lost++
+	}
+	for r.held > maxHeld && f.len() > 0 {
+		r.skipTo(f, 0)
+		r.drain(f)
+	}
+	if f.len() > 0 {
+		r.schedule(due)
 	}
 	r.regap(f, true)
 }
