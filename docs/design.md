@@ -217,6 +217,20 @@ Where the socket option is missing (Windows, and the benchmark's simulated hosts
 
 The aim throughout is that anything the tunnel can't carry yet waits in Tectonic's queue, where it can be steered or dropped, and not below it. A queue on the path that overflows drops the lane's own TCP segments, and the lane then stalls on a retransmission.
 
+### When a lane's congestion control doesn't push back
+
+All of the above leans on each lane's own congestion control to say what the path carries: a connection that is sending all it may takes no more, its lane's queue fills, and a full queue drops. Not every congestion control says so. BBR starts a connection at nearly three times the rate it has measured, and leaves that phase only after several round trips with data always waiting to be sent. The TCP inside the tunnel is clocked by its own acknowledgements and rarely offers a lane more than the lane is carrying, so a BBR lane can stay in that phase for as long as it lives, passing on whatever it is given. Nothing then stands between the TCP inside the tunnel and the queue on the path. On a clean link with a BBR node, the lanes retransmitted a quarter of what they sent.
+
+So a session has a send limit of its own, shared by its lanes.
+
+- **Off until the path shows it is overloaded.** Over a stretch of two round trips, the lanes' connections retransmitted more than 5% of what they sent while their round trips had risen, which means a queue on the path. Two such stretches in a row bring the limit on. Loss alone doesn't: a path can lose packets at random, and a lane that rides that out is doing what it should. A connection that backs off when it loses packets has done so by the second stretch.
+- **Then the session writes no faster than the path has been delivering.** What the tunnel offers beyond that waits in the lanes' queues, where a full queue drops. Small packets and control frames don't wait.
+- **The rate follows the path smoothly.** Every time it falls, the lanes' queues fill and drop, and a TCP connection made to back off every second never gets back to what the path carries. So the rate moves a percent or two a stretch: up while there is no queue on the path, and with a queue it settles where the path drops about 2% of what it is sent. Only when the path is found overloaded again does it jump back to what is being delivered.
+- **It goes when it isn't needed,** once the session has used less than half of it for a while.
+- **It stands down on a path it doesn't fit.** On a path that limits each connection separately, a lane given more than its connection may carry loses the excess while another lane has room, so holding the session to what it delivers makes it deliver less again. If the rate falls under 70% of the highest it has been, the limit stands down, for 30 s the first time and twice as long each time after.
+
+The figures come from `TCP_INFO`, so the limit works where a lane has it and stays off elsewhere.
+
 ### Putting packets back in order
 
 Lanes are separate TCP connections, so packets spread across them arrive out of order. A TCP connection *inside* the tunnel reads a packet that turns up late as a lost one: it retransmits and slows down for a loss that never happened. The receiver therefore merges the lanes back into one ordered stream before handing packets to WireGuard.
