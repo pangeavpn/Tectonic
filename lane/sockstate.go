@@ -43,6 +43,10 @@ const (
 	// pacedAfter is how many times a connection must be seen holding back
 	// bytes its window had room for before it is taken to pace its packets.
 	pacedAfter = 3
+	// queuedMin is the least a round trip must have risen above the
+	// smallest seen, when a quarter of that is less, for the path to count
+	// as queueing.
+	queuedMin = 5 * time.Millisecond
 )
 
 // sockState is what the kernel last said about a lane's connection.
@@ -169,7 +173,11 @@ func (l *Lane) noteTCPInfo(ti tcpInfo, now time.Time) *sockState {
 		l.lastRetrans.Store(now.UnixNano())
 	}
 	l.lastRetransN = max(l.lastRetransN, ti.retrans)
+	progress, report := l.progress(ti)
 	l.pingMu.Unlock()
+	if report {
+		l.limit.Report(now, progress)
+	}
 	l.stalled.Store(ti.stalled)
 	if ti.cwnd <= 0 {
 		return nil
@@ -203,4 +211,39 @@ func (l *Lane) paces(ti tcpInfo) bool {
 		return l.paced.Add(1) >= pacedAfter
 	}
 	return false
+}
+
+// progress works out what the connection has done since the lane last
+// reported to the session's send limit, and whether there is anything to
+// report. Called with pingMu held.
+func (l *Lane) progress(ti tcpInfo) (Progress, bool) {
+	if l.limit == nil || ti.bytesSent == 0 {
+		return Progress{}, false
+	}
+	first := !l.limInit
+	if !first && (ti.bytesSent < l.limSent || ti.bytesResent < l.limResent || int32(ti.delivered-l.limDelivered) < 0) {
+		// Readings are taken on several goroutines and can arrive out of
+		// turn; an older one has nothing to add.
+		return Progress{}, false
+	}
+	p := Progress{RTT: ti.rtt}
+	if !first {
+		p.Sent = ti.bytesSent - l.limSent
+		p.Resent = ti.bytesResent - l.limResent
+		// The kernel counts deliveries in segments, and not every segment
+		// is full: take them at the size the connection's have been.
+		size := ti.mss
+		if ti.segsSent > 0 {
+			size = min(size, float64(ti.bytesSent)/float64(ti.segsSent))
+		}
+		p.Delivered = uint64(float64(ti.delivered-l.limDelivered) * size)
+	}
+	// A queue on the path shows as a round trip well above the least the
+	// connection has seen.
+	p.Queued = ti.minRTT > 0 && ti.rtt > ti.minRTT+max(ti.minRTT/4, queuedMin)
+	l.limSent, l.limResent, l.limDelivered, l.limInit = ti.bytesSent, ti.bytesResent, ti.delivered, true
+
+	// Acknowledgements keep arriving after the lane has stopped sending,
+	// so what was delivered is worth reporting by itself.
+	return p, !first && (p.Sent > 0 || p.Delivered > 0)
 }

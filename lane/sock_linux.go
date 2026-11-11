@@ -43,6 +43,11 @@ func readTCPInfo(rc syscall.RawConn) (tcpInfo, bool) {
 		notsent:  float64(ti.Notsent_bytes),
 		mss:      mss,
 		rto:      time.Duration(ti.Rto) * time.Microsecond,
+
+		bytesSent:   ti.Bytes_sent,
+		bytesResent: ti.Bytes_retrans,
+		segsSent:    ti.Data_segs_out,
+		delivered:   ti.Delivered,
 	}
 	if ti.Pacing_rate != ^uint64(0) {
 		info.pacing = float64(ti.Pacing_rate)

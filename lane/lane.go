@@ -179,6 +179,10 @@ const (
 	// with them, two TCP headers. A millisecond turns a train into one
 	// record.
 	flushDelay = time.Millisecond
+	// limitNap is the longest the writer sleeps at once while the
+	// session's send limit holds its DATA, so that a small packet or a
+	// control frame that arrives meanwhile goes within that.
+	limitNap = 2 * time.Millisecond
 )
 
 // Handler receives a lane's events. Every callback runs on the lane's reader
@@ -201,6 +205,33 @@ type Handler struct {
 	End func(l *Lane)
 }
 
+// Limiter is a limit on what a session sends, shared by its lanes (see
+// sched.Limiter). A lane reports what its connection does, asks before it
+// writes DATA, and says what it wrote.
+type Limiter interface {
+	// Report takes what the lane's connection has done since the lane
+	// last reported.
+	Report(now time.Time, p Progress)
+	// Wait is how long the lane must hold its next DATA. Control frames
+	// and small packets do not wait.
+	Wait(now time.Time) time.Duration
+	// Wrote notes n bytes of records carrying DATA written.
+	Wrote(now time.Time, n int)
+}
+
+// Progress is what a lane's connection did over a stretch of time, as the
+// kernel counts it.
+type Progress struct {
+	// Sent is the bytes sent, retransmissions included; Resent the bytes
+	// sent again; Delivered the bytes the peer has acknowledged, in order
+	// or not.
+	Sent, Resent, Delivered uint64
+	// RTT is the smoothed round trip, and Queued whether it is well above
+	// the least the connection has seen: a queue on the path.
+	RTT    time.Duration
+	Queued bool
+}
+
 // Options configure a lane.
 type Options struct {
 	Role    Role
@@ -214,6 +245,9 @@ type Options struct {
 	Raw net.Conn
 	// InitialRTT seeds the RTT estimate until the first measurement.
 	InitialRTT time.Duration
+	// Limiter, if set, is the send limit the lane shares with the other
+	// lanes of its session.
+	Limiter Limiter
 	// PingInterval, PingTimeout and Linger override the defaults.
 	PingInterval time.Duration
 	PingTimeout  time.Duration
@@ -294,8 +328,16 @@ type Lane struct {
 	sockPoll atomic.Int64
 	// paced counts the signs that the connection spaces its packets out
 	// (see paces).
-	paced      atomic.Int32
-	confirmedA atomic.Uint64 // mirrors confirmed, for ETA
+	paced atomic.Int32
+	// limit is the session's send limit, if it has one, and the counters
+	// below what the connection had done when the lane last looked
+	// (guarded by pingMu).
+	limit        Limiter
+	limSent      uint64
+	limResent    uint64
+	limDelivered uint32
+	limInit      bool
+	confirmedA   atomic.Uint64 // mirrors confirmed, for ETA
 	// tracked counts the bytes written in records that carry DATA or a
 	// PING. It is what PINGs mark positions in and PONGs confirm; records
 	// of control frames alone are left out, because on a lane that only
@@ -372,6 +414,7 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 		h:           opts.Handler,
 		created:     now,
 		profiles:    opts.Profiles,
+		limit:       opts.Limiter,
 		lastActive:  now,
 		wake:        make(chan struct{}, 1),
 		monitorWake: make(chan struct{}, 1),
@@ -665,7 +708,13 @@ func (l *Lane) ETA(n int) time.Duration {
 		now := time.Now()
 		if s := l.kernel(now); s != nil {
 			idle := time.Duration(now.UnixNano() - l.lastSend.Load())
-			return s.wait(float64(q), idle) + l.RTT()/2
+			wait := s.wait(float64(q), idle)
+			// The lane's own queue leaves no faster than it has been
+			// leaving: the session's send limit may be holding it.
+			if d := math.Float64frombits(l.drain.Load()); d > 0 {
+				wait = max(wait, time.Duration(float64(q)/d*float64(time.Second)))
+			}
+			return wait + l.RTT()/2
 		}
 		return l.backlog(q) + l.RTT()/2
 	}
@@ -1090,6 +1139,25 @@ func (l *Lane) writeLoop() error {
 			}
 			continue
 		}
+		// The session's send limit: DATA waits its turn. Control frames
+		// and small packets go regardless.
+		held := false
+		if l.limit != nil && !l.closing && len(l.data) > 0 {
+			if wait := l.limit.Wait(now); wait > 0 {
+				if len(l.ctrl) == 0 && len(l.small) == 0 {
+					l.mu.Unlock()
+					timer.Reset(min(wait, limitNap))
+					select {
+					case <-timer.C:
+					case <-l.done:
+						return nil
+					}
+					timer.Stop()
+					continue
+				}
+				held = true
+			}
+		}
 		if l.full.Load() && !gated && !l.closing && len(l.ctrl) == 0 && len(l.small) == 0 && len(l.data) > 0 {
 			if wait := pace.wait(now, paceGain*l.Rate()); wait > 0 {
 				l.mu.Unlock()
@@ -1104,7 +1172,7 @@ func (l *Lane) writeLoop() error {
 			}
 		}
 		// Give a record a moment to fill.
-		if !more && !gated && !idle && !l.retiring && !l.closing &&
+		if !more && !gated && !held && !idle && !l.retiring && !l.closing &&
 			l.queued+len(l.ctrl) < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
 				hold := min(flushDelay, l.RTT()/16)
@@ -1144,7 +1212,7 @@ func (l *Lane) writeLoop() error {
 		// An interactive record is padded up to a bucket, so a few queued
 		// packets may cost less padding divided between two records.
 		take := len(l.small) + len(l.data)
-		if n := take; n > 1 && n <= shape.MaxSplit && !gated && !busy && !idle &&
+		if n := take; n > 1 && n <= shape.MaxSplit && !gated && !held && !busy && !idle &&
 			pl.Mode(l.queued, false) == shape.Interactive {
 			var sizes [shape.MaxSplit]int
 			for i, p := range l.small {
@@ -1176,7 +1244,7 @@ func (l *Lane) writeLoop() error {
 		if len(l.small) == 0 {
 			l.small = l.small[:0:0]
 		}
-		for !gated && len(l.data) > 0 && take > 0 {
+		for !gated && !held && len(l.data) > 0 && take > 0 {
 			p := l.data[0]
 			if n := len(buf) + wire.HeaderLen + len(p); len(buf) > 0 && n > shape.MaxRecord || pkts > 0 && n > limit {
 				more = more || limit < shape.MaxRecord
@@ -1210,7 +1278,7 @@ func (l *Lane) writeLoop() error {
 		}
 		mode := pl.Mode(queuedBefore, idle)
 		switch {
-		case gated:
+		case gated, held:
 			mode = shape.Interactive
 		case busy && !idle:
 			mode = shape.Bulk
@@ -1244,6 +1312,9 @@ func (l *Lane) writeLoop() error {
 		l.lastSend.Store(after.UnixNano())
 		if pkts > 0 {
 			l.lastData.Store(after.UnixNano())
+			if l.limit != nil && !held {
+				l.limit.Wrote(after, len(buf))
+			}
 		}
 		if l.lowat {
 			// What was just written is in the kernel now; see how much
@@ -1650,4 +1721,8 @@ type tcpInfo struct {
 	// and its segment size; cwnd is zero where the platform doesn't say.
 	cwnd, inflight, notsent, pacing, mss float64
 	rto                                  time.Duration
+	// Running totals: bytes and segments of data sent, retransmissions
+	// included; bytes sent again; and segments delivered, in order or not.
+	bytesSent, bytesResent uint64
+	segsSent, delivered    uint32
 }
