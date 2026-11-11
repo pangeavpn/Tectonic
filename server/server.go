@@ -1,16 +1,14 @@
-// Package server is Tectonic's node side (design §4, §5, §9, §10): a TLS
-// listener that presents the right certificate for whatever name the client
-// sends, a constant-time HELLO check, a fallback that hands anything else to
-// the cover website, a table of sessions that outlive their lanes, and UDP
-// forwarding to the node's WireGuard.
+// Package server is Tectonic's node side (design §4, §5, §9, §10): a cover
+// website that every connection starts as and that presents the right
+// certificate for whatever name the client sends, a constant-time HELLO
+// check that makes a connection a lane, a table of sessions that outlive
+// their lanes, and UDP forwarding to the node's WireGuard.
 package server
 
 import (
-	"bufio"
 	"context"
 	"crypto/subtle"
 	"crypto/tls"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -79,8 +77,11 @@ type Config struct {
 	// CDN enables the CDN carrier. Nil disables it.
 	CDN *CDNConfig
 
-	// HandshakeTimeout bounds the TLS handshake and the wait for the
-	// client's first flight (10 s).
+	// HandshakeTimeout is the cover web server's ReadHeaderTimeout: it
+	// bounds the TLS handshake, and then the wait for the headers of an
+	// HTTP/1.1 request (10 s). On HTTP/2, net/http waits a fixed 10 s for
+	// the client's preface whatever this is, so a node that changes it
+	// looks like a Go web server whose owner changed it.
 	HandshakeTimeout time.Duration
 	// LaneIdleTimeout closes a lane that has received nothing this long
 	// (5 min). Clients close idle lanes far sooner; this only reaps dead
@@ -128,6 +129,12 @@ type Server struct {
 
 // New checks cfg and returns a Server.
 func New(cfg Config) (*Server, error) {
+	return newServer(cfg, httpServesTLSConns)
+}
+
+// newServer is New with the choice of how the cover web server is given its
+// connections (see cover.direct). The Go version makes that choice for New.
+func newServer(cfg Config, direct bool) (*Server, error) {
 	if len(cfg.NodeSecret) < 16 {
 		return nil, errors.New("server: node secret must be at least 16 bytes")
 	}
@@ -199,7 +206,14 @@ func New(cfg Config) (*Server, error) {
 		GetCertificate:              s.certificate,
 		DynamicRecordSizingDisabled: true, // the shaper sizes records
 	}
-	s.cover = newCover(s)
+	s.cover, err = newCover(s, direct)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if !direct {
+		log.Warn("built with Go before 1.27: the cover website's HTTP/2 is close to a Go web server's but not the same; build the node with Go 1.27 or newer")
+	}
 	go s.janitor()
 	return s, nil
 }
@@ -299,71 +313,39 @@ func (s *Server) track(c net.Conn, add bool) bool {
 	return true
 }
 
-// handle runs the TLS handshake, buffers the client's first flight and
-// decides: a valid HELLO makes the connection a lane, anything else goes to
-// the cover website with every byte it sent.
+// handle gives a connection to the cover web server, which is what every
+// connection starts as (see cover). A login is found in the web server's
+// first read, in conn.Read.
 func (s *Server) handle(raw net.Conn) {
 	if !s.track(raw, true) {
 		raw.Close()
 		return
 	}
-	handedOff := false
-	defer func() {
-		s.track(raw, false)
-		if !handedOff {
-			raw.Close()
-		}
-	}()
-
-	tc := tls.Server(raw, s.tls)
-	ctx, cancel := context.WithTimeout(s.ctx, s.cfg.HandshakeTimeout)
-	err := tc.HandshakeContext(ctx)
-	cancel()
-	if err != nil {
-		return
+	ok := s.cover.serve(raw)
+	s.track(raw, false)
+	if !ok {
+		raw.Close()
 	}
-	cs := tc.ConnectionState()
-	br := bufio.NewReaderSize(tc, 64<<10)
-
-	if cs.Version == tls.VersionTLS13 {
-		tc.SetReadDeadline(time.Now().Add(s.cfg.HandshakeTimeout))
-		if hdr, err := br.Peek(wire.HeaderLen); err == nil &&
-			hdr[0] == wire.TypeHello && binary.BigEndian.Uint16(hdr[1:]) == wire.HelloLen {
-			if frame, err := br.Peek(wire.HeaderLen + wire.HelloLen); err == nil {
-				exporter, err := cs.ExportKeyingMaterial(wire.ExporterLabel, []byte{}, wire.ExporterLen)
-				if err == nil {
-					if h, ok := s.checkHello(frame[wire.HeaderLen:], exporter); ok {
-						br.Discard(len(frame))
-						tc.SetReadDeadline(time.Time{})
-						handedOff = s.startLane(tc, raw, br, h)
-						return
-					}
-				}
-			}
-		} else if err != nil && isTimeout(err) && br.Buffered() == 0 {
-			return // said nothing at all: a web server would hang up too
-		}
-		tc.SetReadDeadline(time.Time{})
-	}
-	handedOff = s.cover.serve(tc, br, cs)
-}
-
-func isTimeout(err error) bool {
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // checkHello verifies a HELLO in constant time: every check runs whatever
 // the outcome of the others, so success and failure take the same time and
 // a probe learns nothing from how fast the server answers.
+//
+// body is a HELLO body, or the start of one that stops inside the tag. The
+// tag is then checked as far as it goes, which says whether the rest is
+// worth waiting for and nothing more: only a whole body logs a client in.
+// Whatever body is, even nothing, the same work is done on it.
 func (s *Server) checkHello(body, exporter []byte) (wire.Hello, bool) {
-	h, err := wire.ParseHello(body)
-	if err != nil {
-		return h, false
-	}
+	const signed = wire.HelloLen - wire.TagLen
+	var whole [wire.HelloLen]byte
+	n := copy(whole[:], body)
+	h, _ := wire.ParseHello(whole[:])
 	now := s.now()
-	lk := wire.LaneKey(wire.DeviceKey(s.cfg.NodeSecret, h.KeyID), exporter)
-	ok := b2i(h.Verify(lk))
+	want := h.ComputeTag(wire.LaneKey(wire.DeviceKey(s.cfg.NodeSecret, h.KeyID), exporter))
+	tag := max(n-signed, 0)
+	ok := subtle.ConstantTimeCompare(want[:tag], whole[signed:signed+tag])
+	ok &= b2i(tag > 0 && n == len(body))
 	ok &= subtle.ConstantTimeByteEq(h.Version, wire.Version)
 	ok &= b2i(h.TimestampOK(now))
 	ok &= b2i(!h.KeyID.Expired(now))

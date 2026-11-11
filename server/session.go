@@ -1,8 +1,8 @@
 package server
 
 import (
-	"bufio"
 	"crypto/rand"
+	"io"
 	"net"
 	"slices"
 	"sync"
@@ -52,7 +52,7 @@ type laneInfo struct {
 }
 
 // startLane logs a connection into its session and starts it as a lane.
-func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) bool {
+func (s *Server) startLane(conn, raw net.Conn, r io.Reader, h wire.Hello) bool {
 	ss, err := s.attach(h)
 	if err != nil {
 		s.log.Warn("cannot open session", "err", err)
@@ -69,7 +69,7 @@ func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) b
 		Profile:      s.profile.ID,
 	}
 	src := ss.reseq.Source()
-	l := lane.New(conn, br, lane.Options{
+	l := lane.New(conn, r, lane.Options{
 		Role:       lane.Server,
 		Planner:    shape.NewPlanner(s.profile),
 		Raw:        raw,
