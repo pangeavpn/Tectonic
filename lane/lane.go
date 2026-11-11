@@ -1347,7 +1347,13 @@ func (l *Lane) writeLoop() error {
 		}
 		mode := pl.Mode(queuedBefore, idle)
 		switch {
-		case gated, held:
+		case gated, held, pkts == 0:
+			// Control frames with no DATA to ride with are padded as
+			// an interactive record is, whatever the lane is carrying.
+			// The few bytes a bulk record takes are for whole packets,
+			// whose size is no secret; they would leave a PONG's record
+			// or a RETIRE's just longer than the frame, and say which
+			// it was.
 			mode = shape.Interactive
 		case busy && !idle:
 			mode = shape.Bulk
