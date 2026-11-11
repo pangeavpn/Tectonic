@@ -262,6 +262,7 @@ type Lane struct {
 	id      uint64
 	conn    net.Conn
 	rc      syscall.RawConn
+	br      *bufio.Reader // what rd reads from
 	rd      *wire.Reader
 	role    Role
 	h       Handler
@@ -298,6 +299,13 @@ type Lane struct {
 
 	welcomed chan struct{}
 	welcome  wire.Welcome
+
+	// ack is the size of the record that ends a client lane's opening, or
+	// 0 if it has none: the one Chrome acknowledges the server's SETTINGS
+	// with. The reader sets ackDue when the server's first bytes arrive,
+	// and the writer sends the record (see writeAck).
+	ack    int
+	ackDue atomic.Bool
 
 	queuedA     atomic.Int64
 	srtt        atomic.Int64 // ns
@@ -398,8 +406,9 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 	if r == nil {
 		r = conn
 	}
-	if _, ok := r.(*bufio.Reader); !ok {
-		r = bufio.NewReaderSize(r, readBufferSize)
+	br, ok := r.(*bufio.Reader)
+	if !ok {
+		br = bufio.NewReaderSize(r, readBufferSize)
 	}
 	log := opts.Logger
 	if log == nil {
@@ -409,7 +418,8 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 	l := &Lane{
 		id:          laneIDs.Add(1),
 		conn:        conn,
-		rd:          wire.NewReader(r),
+		br:          br,
+		rd:          wire.NewReader(br),
 		role:        opts.Role,
 		h:           opts.Handler,
 		created:     now,
@@ -467,10 +477,24 @@ func (l *Lane) ID() uint64 { return l.id }
 // Role returns which end of the lane this is.
 func (l *Lane) Role() Role { return l.role }
 
-// Start writes the lane's first flight and starts its goroutines. first holds
-// the frames that open the lane (HELLO and the first DATA from a client,
-// WELCOME from the server); Start pads them to the profile's first-flight
-// size and sends them in one record.
+// Start writes the lane's opening and starts its goroutines. first holds the
+// frames that open the lane: HELLO and the first DATA from a client, WELCOME
+// from the server.
+//
+// They go out as the records the shaping profile lists for a lane's start
+// (shape.Profile.ClientFirstFlight and ServerFirstFlight), which are the
+// records Chrome and an HTTP/2 server open a connection with. The frames and
+// the padding after them are one stream, cut where each record ends: HELLO
+// is longer than Chrome's first record, so it begins there and ends in the
+// second, ahead of the first DATA. Nothing goes in front of HELLO, and a
+// profile cannot make the first record shorter than the part of HELLO the
+// node needs in one record to know a login (shape.MinClientFirstRecord).
+// Every record is written before Start returns; nothing in first waits for
+// the peer. A client's opening has one more record, sent when the server's
+// first bytes arrive (see writeAck).
+//
+// The CDN carrier is a WebSocket. It has no such opening, and HELLO must
+// arrive in its first message, so there the same bytes go in one message.
 func (l *Lane) Start(first []byte) error {
 	l.mu.Lock()
 	if l.started {
@@ -481,35 +505,64 @@ func (l *Lane) Start(first []byte) error {
 	l.mu.Unlock()
 
 	now := time.Now()
+	pl := l.planner.Load()
+	n := len(first)
 	if !l.lowat {
-		// The PONG shows the first flight has arrived and how long a round
+		n += wire.HeaderLen + wire.PingLen
+	}
+	sizes := pl.FirstFlight(l.role == Client, n)
+	total := 0
+	for _, size := range sizes {
+		total += size
+	}
+	buf := wire.AppendPadding(first, total-n)
+	if !l.lowat {
+		// The PONG shows the opening has arrived and how long a round
 		// trip takes; until it is back the scheduler does not count on
-		// the lane. It fits inside the first flight's padding.
-		p := outPing{tok: wire.NewPingToken(), at: now, limited: true}
-		first = wire.AppendHeader(first, wire.TypePing, wire.PingLen)
-		first = wire.AppendPing(first, p.tok)
+		// the lane. The PING is the last frame, so its PONG answers for
+		// every record of the opening.
+		p := outPing{tok: wire.NewPingToken(), at: now, bytes: uint64(total), limited: true}
+		buf = wire.AppendHeader(buf, wire.TypePing, wire.PingLen)
+		buf = wire.AppendPing(buf, p.tok)
 		l.pingMu.Lock()
 		l.pings = append(l.pings, p)
+		l.lastPingSent, l.lastPingBytes = now, uint64(total)
 		l.pingMu.Unlock()
 	}
-	pl := l.planner.Load()
-	buf := wire.AppendPadding(first, pl.FirstFlightPadding(l.role == Client, len(first)))
-	if !l.lowat {
-		l.pingMu.Lock()
-		l.pings[0].bytes = uint64(len(buf))
-		l.lastPingSent, l.lastPingBytes = now, uint64(len(buf))
-		l.pingMu.Unlock()
+	if _, ws := l.conn.(*wsConn); ws {
+		sizes = []int{total}
+	} else if l.role == Client {
+		l.ack = pl.FirstFlightAck()
 	}
-	if _, err := l.conn.Write(buf); err != nil {
-		l.finish(err)
-		return err
+	for _, size := range sizes {
+		if _, err := l.conn.Write(buf[:size]); err != nil {
+			l.finish(err)
+			return err
+		}
+		buf = buf[size:]
 	}
-	l.bytesSent.Add(uint64(len(buf)))
+	l.bytesSent.Add(uint64(total))
 	if !l.lowat {
-		l.tracked.Add(uint64(len(buf)))
+		l.tracked.Add(uint64(total))
 	}
 	l.lastSend.Store(time.Now().UnixNano())
 	go l.run()
+	return nil
+}
+
+// writeAck writes the record that ends a client lane's opening. Chrome
+// acknowledges the server's SETTINGS in a record of its own as soon as it
+// arrives, whatever else it is sending, so this one is nothing but padding
+// and shares its record with nothing. It runs on the writer's goroutine,
+// which is the only one that writes once the lane has started.
+func (l *Lane) writeAck() error {
+	l.ackDue.Store(false)
+	buf := wire.AppendPadding(make([]byte, 0, l.ack), l.ack)
+	if _, err := l.conn.Write(buf); err != nil {
+		return err
+	}
+	l.bytesSent.Add(uint64(len(buf)))
+	l.lastSend.Store(time.Now().UnixNano())
 	return nil
 }
 
@@ -982,6 +1035,14 @@ func (l *Lane) run() {
 
 func (l *Lane) readLoop() error {
 	first := l.role == Client
+	if l.ack > 0 {
+		// The server's first bytes are here, or the connection is over.
+		if _, err := l.br.Peek(1); err != nil {
+			return fmt.Errorf("%w: %v", ErrLoginFailed, err)
+		}
+		l.ackDue.Store(true)
+		l.signal(l.wake)
+	}
 	for {
 		typ, body, err := l.rd.Next()
 		if err != nil {
@@ -1083,6 +1144,13 @@ func (l *Lane) writeLoop() error {
 	// go out at once in a record of their own (see shape.Planner.Split).
 	more := false
 	for {
+		// The record that ends a client's opening goes by itself, as soon
+		// as the reader has the server's first bytes.
+		if l.ackDue.Load() {
+			if err := l.writeAck(); err != nil {
+				return err
+			}
+		}
 		l.mu.Lock()
 		if len(l.ctrl) == 0 && len(l.data) == 0 && len(l.small) == 0 {
 			retiring := l.retiring

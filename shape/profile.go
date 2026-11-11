@@ -7,7 +7,7 @@
 //
 //	Bulk transfer  records packed up to 16 KB, no padding
 //	Interactive    record sizes rounded up to the profile's buckets
-//	Lane start     first flight padded to look like Chrome loading a page over HTTP/2
+//	Lane start     the first records each way sized like Chrome loading a page over HTTP/2
 //	Idle           keepalives delayed and padded like browser idle traffic; the
 //	               lane closes after a while and a fresh one opens later
 //
@@ -37,10 +37,31 @@ type Profile struct {
 	ID   uint16 `json:"id"`
 	Name string `json:"name"`
 
-	// Lane start: the first flight in each direction (all frames in the
-	// first record) is padded to a size drawn uniformly from these ranges.
-	ClientFirstFlight IntRange `json:"client_first_flight"`
-	ServerFirstFlight IntRange `json:"server_first_flight"`
+	// Lane start: the records that open a lane in each direction, in
+	// order, each of a size drawn uniformly from its range. They are the
+	// records Chrome and an HTTP/2 server exchange when a page is loaded:
+	//
+	//	client  the connection preface with SETTINGS and WINDOW_UPDATE,
+	//	        then the HEADERS of the first GET
+	//	server  SETTINGS ACK with WINDOW_UPDATE, the response HEADERS,
+	//	        then the start of the page
+	//
+	// (A server's own SETTINGS goes out before the client has said
+	// anything, so it is no part of what answers a login.) The lane's
+	// opening frames, HELLO and the first WireGuard packet or WELCOME, fill
+	// these records as one stream with padding after them, so a frame may
+	// begin in one record and end in the next. A flight has between 1 and
+	// MaxFirstFlight records of at least 3 bytes, and a client's first
+	// record holds at least MinClientFirstRecord: the node must find
+	// enough of HELLO in it to know a login. Sizes are what goes inside
+	// the TLS record, as everywhere in a profile; the record is 17 bytes
+	// longer on the wire.
+	ClientFirstFlight []IntRange `json:"client_first_flight"`
+	ServerFirstFlight []IntRange `json:"server_first_flight"`
+	// ClientAck is the record a client sends by itself when the server's
+	// first bytes arrive, as Chrome acknowledges the server's SETTINGS. A
+	// zero range means none.
+	ClientAck IntRange `json:"client_ack"`
 
 	// Interactive: a record's size is rounded up to the next bucket.
 	// Ascending, each at most MaxRecord.
@@ -110,12 +131,14 @@ func Default() *Profile {
 	return &Profile{
 		ID:   DefaultID,
 		Name: "default",
-		// Chrome's first HTTP/2 flight: connection preface, SETTINGS,
-		// WINDOW_UPDATE and the HEADERS of the first GET.
-		ClientFirstFlight: IntRange{Min: 380, Max: 620},
-		// A server's reply: SETTINGS, WINDOW_UPDATE, response HEADERS and
-		// the start of the page.
-		ServerFirstFlight: IntRange{Min: 1200, Max: 4200},
+		// Chrome's first HTTP/2 flight: the connection preface with
+		// SETTINGS and WINDOW_UPDATE, 70 bytes every time, then the HEADERS
+		// of the first GET. Its SETTINGS ACK follows the server's SETTINGS.
+		ClientFirstFlight: []IntRange{{Min: 70, Max: 70}, {Min: 443, Max: 453}},
+		ClientAck:         IntRange{Min: 9, Max: 9},
+		// A server's reply: SETTINGS ACK with WINDOW_UPDATE, the response
+		// HEADERS, and the start of the page.
+		ServerFirstFlight: []IntRange{{Min: 22, Max: 22}, {Min: 91, Max: 92}, {Min: 1090, Max: 4090}},
 		Buckets: []int{
 			64, 128, 192, 256, 384, 512, 768, 1024, 1536,
 			2048, 3072, 4096, 6144, 8192, 12288, MaxRecord,
@@ -143,16 +166,7 @@ func Parse(data []byte) (*Profile, error) {
 
 // Validate checks that the profile can be used.
 func (p *Profile) Validate() error {
-	check := func(name string, r IntRange) error {
-		if r.Min < 0 || r.Max < r.Min || r.Max > MaxRecord {
-			return fmt.Errorf("shape: %s range [%d, %d] invalid", name, r.Min, r.Max)
-		}
-		return nil
-	}
-	if err := check("client_first_flight", p.ClientFirstFlight); err != nil {
-		return err
-	}
-	if err := check("server_first_flight", p.ServerFirstFlight); err != nil {
+	if err := p.validateFirstFlight(); err != nil {
 		return err
 	}
 	if len(p.Buckets) == 0 {

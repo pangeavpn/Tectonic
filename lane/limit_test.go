@@ -52,7 +52,7 @@ func (f *fakeLimiter) written() int {
 
 func TestSendLimitHoldsDataAndNothingElse(t *testing.T) {
 	prof := shape.Default()
-	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
 	l, rc := pipeLane(t, prof)
 	lim := &fakeLimiter{hold: true}
 	l.limit = lim

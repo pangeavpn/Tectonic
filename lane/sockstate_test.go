@@ -126,7 +126,7 @@ func TestRecordLimitFollowsTheSendingRate(t *testing.T) {
 func laneWithSock(t *testing.T, s *sockState) (*Lane, *recordConn) {
 	t.Helper()
 	prof := shape.Default()
-	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
 	l, rc := pipeLane(t, prof)
 	l.lowat = true
 	l.sock.Store(s)

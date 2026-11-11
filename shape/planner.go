@@ -149,24 +149,6 @@ func (pl *Planner) Split(base int, sizes []int) int {
 	return take
 }
 
-// FirstFlightPadding returns the padding that brings a lane's first flight
-// of size bytes up to a size drawn from the profile's range for that
-// direction. A flight already at or above the drawn size gets none.
-func (pl *Planner) FirstFlightPadding(fromClient bool, size int) int {
-	r := pl.p.ServerFirstFlight
-	if fromClient {
-		r = pl.p.ClientFirstFlight
-	}
-	gap := pl.intIn(r) - size
-	if gap <= 0 {
-		return 0
-	}
-	if !wire.CanPad(gap) {
-		gap += wire.HeaderLen // overshoot by a few bytes rather than undershoot
-	}
-	return gap
-}
-
 // KeepaliveDelay draws the delay for a keepalive on an idle lane.
 func (pl *Planner) KeepaliveDelay() time.Duration { return pl.durationIn(pl.p.KeepaliveDelay) }
 

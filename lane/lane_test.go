@@ -387,7 +387,7 @@ func pipeLane(t *testing.T, prof *shape.Profile) (*Lane, *recordConn) {
 
 func TestRecordShaping(t *testing.T) {
 	prof := shape.Default()
-	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
 	l, rc := pipeLane(t, prof)
 	welcome := wire.Welcome{}
 	if err := l.Start(wire.AppendFrame(nil, wire.TypeWelcome, welcome.AppendBody(nil))); err != nil {
@@ -425,7 +425,7 @@ func TestRecordShaping(t *testing.T) {
 
 func TestRecordWaitsAMomentToFill(t *testing.T) {
 	prof := shape.Default()
-	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
 	l, rc := pipeLane(t, prof)
 	if err := l.Start(nil); err != nil {
 		t.Fatal(err)
@@ -455,7 +455,7 @@ func TestRecordWaitsAMomentToFill(t *testing.T) {
 
 func TestInteractiveRecordsAreDividedToFitBuckets(t *testing.T) {
 	prof := shape.Default()
-	prof.ServerFirstFlight = shape.IntRange{Min: 2000, Max: 2000}
+	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
 	l, rc := pipeLane(t, prof)
 	if err := l.Start(nil); err != nil {
 		t.Fatal(err)
@@ -482,6 +482,7 @@ func TestIdleKeepalivesAreDelayedAndPadded(t *testing.T) {
 	prof := shape.Default()
 	prof.IdleAfter = shape.Duration(time.Millisecond)
 	prof.KeepaliveDelay = shape.DurationRange{Min: shape.Duration(150 * time.Millisecond), Max: shape.Duration(150 * time.Millisecond)}
+	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
 	l, rc := pipeLane(t, prof)
 	if err := l.Start(nil); err != nil {
 		t.Fatal(err)

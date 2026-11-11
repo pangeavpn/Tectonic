@@ -42,16 +42,16 @@ func TestValidateRejects(t *testing.T) {
 		"unsorted buckets":   func(p *Profile) { p.Buckets = []int{512, 256} },
 		"duplicate buckets":  func(p *Profile) { p.Buckets = []int{256, 256} },
 		"oversized bucket":   func(p *Profile) { p.Buckets = []int{MaxRecord + 1} },
-		"bad flight range":   func(p *Profile) { p.ClientFirstFlight = IntRange{Min: 10, Max: 5} },
+		"bad flight range":   func(p *Profile) { p.ClientFirstFlight = []IntRange{{Min: 10, Max: 5}} },
 		"zero bulk":          func(p *Profile) { p.BulkThreshold = 0 },
 		"zero idle after":    func(p *Profile) { p.IdleAfter = 0 },
 		"zero idle close":    func(p *Profile) { p.IdleClose = DurationRange{} },
 		"bad keepalive":      func(p *Profile) { p.KeepaliveDelay = DurationRange{Min: 5, Max: 1} },
 		"no idle sizes":      func(p *Profile) { p.IdleSizes = nil },
 		"zero idle size":     func(p *Profile) { p.IdleSizes = []int{0, 64} },
-		"negative flight":    func(p *Profile) { p.ServerFirstFlight = IntRange{Min: -1, Max: 5} },
+		"negative flight":    func(p *Profile) { p.ServerFirstFlight = []IntRange{{Min: -1, Max: 5}} },
 		"zero idle reopen":   func(p *Profile) { p.IdleReopen = DurationRange{} },
-		"flight too big":     func(p *Profile) { p.ServerFirstFlight = IntRange{Min: 1, Max: MaxRecord + 1} },
+		"flight too big":     func(p *Profile) { p.ServerFirstFlight = []IntRange{{Min: 3, Max: MaxRecord + 1}} },
 		"descending buckets": func(p *Profile) { p.Buckets = []int{64, 32} },
 	} {
 		p := Default()
@@ -238,29 +238,6 @@ func TestIdlePadding(t *testing.T) {
 	}
 	if pl.Padding(Idle, 5000) != 0 {
 		t.Fatal("a record bigger than every idle size gets no padding")
-	}
-}
-
-func TestFirstFlight(t *testing.T) {
-	pl := NewPlanner(nil)
-	p := pl.Profile()
-	for range 1000 {
-		size := 81 + 151 // HELLO + first WireGuard initiation
-		pad := pl.FirstFlightPadding(true, size)
-		if !wire.CanPad(pad) {
-			t.Fatalf("pad %d", pad)
-		}
-		total := size + pad
-		if total < p.ClientFirstFlight.Min || total > p.ClientFirstFlight.Max+wire.HeaderLen {
-			t.Fatalf("client first flight %d outside [%d, %d]", total, p.ClientFirstFlight.Min, p.ClientFirstFlight.Max)
-		}
-		total = 24 + pl.FirstFlightPadding(false, 24)
-		if total < p.ServerFirstFlight.Min || total > p.ServerFirstFlight.Max+wire.HeaderLen {
-			t.Fatalf("server first flight %d", total)
-		}
-	}
-	if pl.FirstFlightPadding(true, 5000) != 0 {
-		t.Fatal("a flight already past the range gets no padding")
 	}
 }
 
