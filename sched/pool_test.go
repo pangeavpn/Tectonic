@@ -310,6 +310,19 @@ func TestPoolDoesNotWaitForWhatTheNodeDropped(t *testing.T) {
 	}
 }
 
+func TestPoolGivesEveryLaneTheSessionsSendLimit(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 1
+	p := newTestPool(t, d, PoolConfig{})
+	l1, l2 := d.next(t), d.next(t)
+	if l1.req.Limiter != lane.Limiter(&p.limit) || l2.req.Limiter != lane.Limiter(&p.limit) {
+		t.Fatalf("lanes were given limiters %v and %v, want the session's", l1.req.Limiter, l2.req.Limiter)
+	}
+	if st := p.Stats().Limit; st.Rate != 0 || st.On != 0 {
+		t.Fatalf("a new session has a send limit: %+v", st)
+	}
+}
+
 func TestPoolChurnReplacesBeforeRetiring(t *testing.T) {
 	d := newFakeDialer()
 	d.welcome = 1

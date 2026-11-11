@@ -33,7 +33,9 @@ type session struct {
 	udp      *net.UDPConn
 	sched    sched.Scheduler
 	reseq    *sched.Resequencer
-	done     chan struct{}
+	// limit holds what the session sends to what its path delivers.
+	limit sched.Limiter
+	done  chan struct{}
 
 	mu        sync.Mutex
 	lanes     []*laneInfo
@@ -72,6 +74,7 @@ func (s *Server) startLane(conn, raw net.Conn, br *bufio.Reader, h wire.Hello) b
 		Planner:    shape.NewPlanner(s.profile),
 		Raw:        raw,
 		InitialRTT: ss.baseRTT(),
+		Limiter:    &ss.limit,
 		Logger:     s.log,
 		Handler: lane.Handler{
 			Data: func(l *lane.Lane, pkt []byte) { src.Push(pkt, l.BaseRTT()) },
@@ -135,6 +138,7 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 	}
 	ss := &session{s: s, keyID: h.KeyID, cellular: h.Cellular(), udp: udp, done: make(chan struct{})}
 	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
+	ss.limit.Log = s.log.Debug
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.closed {

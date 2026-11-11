@@ -52,6 +52,8 @@ type DialRequest struct {
 	// Planner is the session's current shaping profile, for the first
 	// flight before WELCOME arrives.
 	Planner *shape.Planner
+	// Limiter is the session's send limit, to be installed on the lane.
+	Limiter lane.Limiter
 	// Reason says why the lane is wanted, for logs: "first", "pool",
 	// "churn", "probe", "reopen" or "reconnect".
 	Reason string
@@ -110,6 +112,9 @@ type Pool struct {
 	log   *slog.Logger
 	sched Scheduler
 	reseq *Resequencer
+	// limit holds what the session sends to what its path delivers (see
+	// Limiter). Every lane shares it.
+	limit Limiter
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -212,6 +217,7 @@ func NewPool(cfg PoolConfig) *Pool {
 		thr:       newThrottle(),
 		rng:       rand.New(rand.NewChaCha8(seed)),
 	}
+	p.limit.Log = log.Debug
 	p.reseq = NewResequencer(func(pkt []byte) {
 		if cfg.Receive != nil {
 			cfg.Receive(pkt)
@@ -320,6 +326,8 @@ type PoolStats struct {
 	// Resequencer counts how packets from the server were put back in
 	// order.
 	Resequencer ResequencerStats
+	// Limit is the session's send limit.
+	Limit LimiterStats
 }
 
 // Stats returns a snapshot of the pool.
@@ -329,16 +337,16 @@ func (p *Pool) Stats() PoolStats {
 		ch <- PoolStats{
 			Lanes: len(p.lanes), Dialing: p.dialing, Session: p.session,
 			Throttled: p.thr.throttled, Extra: p.thr.extra,
-			Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats(),
+			Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats(), Limit: p.limit.Stats(),
 		}
 	}) {
-		return PoolStats{Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats()}
+		return PoolStats{Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats(), Limit: p.limit.Stats()}
 	}
 	select {
 	case s := <-ch:
 		return s
 	case <-p.done:
-		return PoolStats{Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats()}
+		return PoolStats{Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats(), Limit: p.limit.Stats()}
 	}
 }
 
@@ -605,7 +613,7 @@ func (p *Pool) sampleThrottle(now time.Time, live int) int {
 // dial opens a lane in the background. replaces is the lane it will take
 // over from, for churn.
 func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
-	req := DialRequest{Reason: reason, Planner: p.planner}
+	req := DialRequest{Reason: reason, Planner: p.planner, Limiter: &p.limit}
 	if p.haveSession && (p.liveCount() > 0 || now.Sub(p.lastLaneAt) < p.welcome.ResumeWindow) {
 		req.Join = true
 		req.SessionID = p.session

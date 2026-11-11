@@ -271,6 +271,7 @@ func (d *dialer) laneConfig(req sched.DialRequest, cellular bool) lane.DialConfi
 			Planner:    req.Planner,
 			Profiles:   d.profiles,
 			InitialRTT: req.InitialRTT,
+			Limiter:    req.Limiter,
 			Logger:     d.log,
 		},
 	}
