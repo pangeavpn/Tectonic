@@ -46,6 +46,12 @@ type Profile struct {
 	// Pins are base64 SHA-256 hashes of the node's default certificate's
 	// public key, checked in Borrowed and None mode.
 	Pins []string `json:"pins,omitempty"`
+	// OwnPins are base64 SHA-256 hashes of the public keys the node's own
+	// certificate may hold. When set, Own mode accepts the certificate only
+	// if it is valid for the cover domain and its key matches one of them,
+	// so an interceptor whose CA the device trusts never sees a login. Give
+	// the next key's pin too before a renewal changes the key.
+	OwnPins []string `json:"own_pins,omitempty"`
 	// BorrowedSNI is the hub's list of names to borrow on SNI-allowlist
 	// networks.
 	BorrowedSNI []string `json:"borrowed_sni,omitempty"`

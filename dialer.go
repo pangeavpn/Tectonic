@@ -77,6 +77,7 @@ type dialer struct {
 	keyID     wire.KeyID
 	deviceKey [wire.KeyLen]byte
 	pins      []lane.Pin
+	ownPins   []lane.Pin
 	profiles  *shape.Set
 	sessions  utls.ClientSessionCache
 	modes     ModeStore
@@ -128,6 +129,13 @@ func newDialer(cfg Config) (*dialer, error) {
 			return nil, err
 		}
 		d.pins = append(d.pins, pin)
+	}
+	for _, s := range p.OwnPins {
+		pin, err := lane.ParsePin(s)
+		if err != nil {
+			return nil, err
+		}
+		d.ownPins = append(d.ownPins, pin)
 	}
 	var err error
 	if d.profiles, err = shape.NewSet(p.Shaping...); err != nil {
@@ -297,6 +305,7 @@ func (d *dialer) laneConfig(req sched.DialRequest, cellular bool) lane.DialConfi
 	return lane.DialConfig{
 		Addr:            d.node,
 		Pins:            d.pins,
+		OwnPins:         d.ownPins,
 		RootCAs:         d.cfg.RootCAs,
 		SessionCache:    d.sessions,
 		DialContext:     d.cfg.DialContext,

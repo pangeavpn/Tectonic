@@ -88,6 +88,11 @@ type DialConfig struct {
 	ServerName string
 	// Pins are the node's default-certificate pins, for Borrowed and None.
 	Pins []Pin
+	// OwnPins, if set, are the keys the node's own certificate may hold. Own
+	// mode then requires a match as well as a valid certificate for the
+	// name, so a TLS interceptor the device trusts is refused before the
+	// login goes out.
+	OwnPins []Pin
 	// RootCAs verifies certificates checked by name; nil means the system
 	// roots.
 	RootCAs *x509.CertPool
@@ -303,6 +308,12 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 		h2 = false
 	case cfg.SNIMode == SNIOwn:
 		tc.ServerName = cfg.ServerName
+		if pins := cfg.OwnPins; len(pins) > 0 {
+			// Runs after the usual check by name, which stays on.
+			tc.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
+				return verifyPinned(raw, pins, nil, "")
+			}
+		}
 	case cfg.SNIMode == SNIBorrowed:
 		if cfg.ServerName == "" {
 			return nil, errors.New("lane: borrowed mode needs a server name")
