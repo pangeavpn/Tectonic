@@ -71,7 +71,7 @@ func (s *Server) startLane(conn, raw net.Conn, r io.Reader, h wire.Hello) bool {
 	src := ss.reseq.Source()
 	l := lane.New(conn, r, lane.Options{
 		Role:       lane.Server,
-		Planner:    shape.NewPlanner(s.profile),
+		Planner:    shape.NewPlanner(s.lanePlannerProfile()),
 		Raw:        raw,
 		InitialRTT: ss.baseRTT(),
 		Limiter:    &ss.limit,

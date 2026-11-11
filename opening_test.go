@@ -4,10 +4,15 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/binary"
+	"io"
 	"net"
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/pangeavpn/tectonic"
 )
@@ -148,8 +153,11 @@ func (tap *recordTap) openings() []opening {
 // Record lengths are as an observer reads them, 17 bytes more than what is
 // inside: the client's 87 (Chrome's preface, SETTINGS and WINDOW_UPDATE),
 // then 460 to 470 (the HEADERS of its first GET), then 26 (its SETTINGS
-// ACK) once the server has spoken; the server's 39 (SETTINGS ACK and
-// WINDOW_UPDATE), then 108 to 109 (response HEADERS), then the page.
+// ACK) once the server has spoken. The server's are the web server's own
+// SETTINGS, then the records the node's cover web server answers a page
+// load with (its WINDOW_UPDATE, SETTINGS ACK, the response's HEADERS and
+// DATA, grouped as it happens to group them): together they hold what a
+// browser loading the page is sent, give or take a byte of the Date header.
 func TestLanesOpenLikeChromeOnTheWire(t *testing.T) {
 	wg, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -160,6 +168,44 @@ func TestLanesOpenLikeChromeOnTheWire(t *testing.T) {
 	tap := newRecordTap(t, n.addr)
 	p := n.profile(t)
 	p.Node = tap.addr
+
+	// A visitor loads the page through the tap first, opening the
+	// connection as Chrome does.
+	vc, err := tls.Dial("tcp", tap.addr, &tls.Config{RootCAs: certs().roots, ServerName: p.CoverDomain, NextProtos: []string{"h2"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range chromeOpening(p.CoverDomain) {
+		vc.Write(rec)
+	}
+	vc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	for {
+		hdr := make([]byte, 9)
+		if _, err := io.ReadFull(vc, hdr); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.CopyN(io.Discard, vc, int64(hdr[0])<<16|int64(hdr[1])<<8|int64(hdr[2])); err != nil {
+			t.Fatal(err)
+		}
+		if hdr[3] == 0x0 && hdr[4]&0x1 != 0 { // DATA that ends the page
+			break
+		}
+	}
+	vc.Close()
+	page := -1
+	for deadline := time.Now().Add(5 * time.Second); page < 0; time.Sleep(5 * time.Millisecond) {
+		if got := tap.openings(); len(got) > 0 && len(got[0].reply()) > 0 {
+			page = 0
+			for _, n := range got[0].reply() {
+				page += n - 17
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the visitor's page load never passed the tap")
+		}
+	}
+	visits := len(tap.openings())
+
 	c, err := tectonic.Dial(context.Background(), tectonic.Config{
 		Profile: p, RootCAs: certs().roots, Network: "test-net", SNIMode: tectonic.SNIOwn,
 	})
@@ -183,10 +229,10 @@ func TestLanesOpenLikeChromeOnTheWire(t *testing.T) {
 	const lanes = 2
 	var got []opening
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(5 * time.Millisecond) {
-		got = tap.openings()
+		got = tap.openings()[visits:]
 		done := 0
 		for _, o := range got {
-			if o.ack() >= 0 && len(o.reply()) >= 3 {
+			if o.ack() >= 0 && o.carries(page) >= 0 {
 				done++
 			}
 		}
@@ -194,7 +240,7 @@ func TestLanesOpenLikeChromeOnTheWire(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("saw %d lanes open in full, want %d: %+v", done, lanes, got)
+			t.Fatalf("saw %d lanes open in full, want %d (the page is %d bytes): %+v", done, lanes, page, got)
 		}
 	}
 	for i, o := range got[:lanes] {
@@ -206,10 +252,24 @@ func TestLanesOpenLikeChromeOnTheWire(t *testing.T) {
 			t.Errorf("lane %d: none of the client's records %v is a 26 that follows the server's first bytes (which do: %v)",
 				i+1, o.client, o.afterServer)
 		}
-		if s := o.reply(); len(s) < 3 || s[0] != 39 || s[1] < 108 || s[1] > 109 || s[2] < 1090+17 || s[2] > 4090+17+3 {
-			t.Errorf("lane %d: the server's records begin %v, want 39, then 108 to 109, then 1107 to 4110", i+1, o.server)
+		if len(o.server) == 0 || o.server[0] != 62 {
+			t.Errorf("lane %d: the server's records begin %v, want the web server's SETTINGS (62)", i+1, o.server)
 		}
 	}
+}
+
+// carries reports how many of the server's records after its SETTINGS hold,
+// together, what a visitor loading the page is sent (give or take two
+// bytes), or -1 if no run of them from the first does.
+func (o opening) carries(page int) int {
+	total := 0
+	for i, n := range o.reply() {
+		total += n - 17
+		if total >= page-2 && total <= page+2 {
+			return i + 1
+		}
+	}
+	return -1
 }
 
 // ack is which of the client's records is the one that ends its opening: a
@@ -233,4 +293,44 @@ func (o opening) reply() []int {
 		return o.server[1:]
 	}
 	return o.server
+}
+
+// chromeOpening is what Chrome sends first when it loads https://authority/,
+// in its two TLS records: the preface with its SETTINGS and WINDOW_UPDATE,
+// then the request.
+func chromeOpening(authority string) [2][]byte {
+	frame := func(b []byte, typ, flags byte, stream uint32, payload []byte) []byte {
+		b = append(b, byte(len(payload)>>16), byte(len(payload)>>8), byte(len(payload)), typ, flags)
+		b = binary.BigEndian.AppendUint32(b, stream)
+		return append(b, payload...)
+	}
+	var settings []byte
+	for _, s := range [][2]uint32{{0x1, 65536}, {0x2, 0}, {0x4, 6291456}, {0x6, 262144}} {
+		settings = binary.BigEndian.AppendUint16(settings, uint16(s[0]))
+		settings = binary.BigEndian.AppendUint32(settings, s[1])
+	}
+	first := frame([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"), 0x4, 0, 0, settings)
+	first = frame(first, 0x8, 0, 0, binary.BigEndian.AppendUint32(nil, 15663105))
+	var hb bytes.Buffer
+	enc := hpack.NewEncoder(&hb)
+	for _, f := range [][2]string{
+		{":method", "GET"}, {":authority", authority}, {":scheme", "https"}, {":path", "/"},
+		{"sec-ch-ua", `"Chromium";v="157", "Not?A_Brand";v="8"`},
+		{"sec-ch-ua-mobile", "?0"},
+		{"sec-ch-ua-platform", `"Windows"`},
+		{"upgrade-insecure-requests", "1"},
+		{"user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"},
+		{"accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"},
+		{"sec-fetch-site", "none"},
+		{"sec-fetch-mode", "navigate"},
+		{"sec-fetch-user", "?1"},
+		{"sec-fetch-dest", "document"},
+		{"accept-encoding", "gzip, deflate, br, zstd"},
+		{"accept-language", "en-US,en;q=0.9"},
+		{"priority", "u=0, i"},
+	} {
+		enc.WriteField(hpack.HeaderField{Name: f[0], Value: f[1]})
+	}
+	req := frame(nil, 0x1, 0x1|0x4|0x20, 1, append([]byte{0x80, 0, 0, 0, 255}, hb.Bytes()...))
+	return [2][]byte{first, req}
 }

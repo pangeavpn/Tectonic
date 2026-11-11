@@ -163,10 +163,13 @@ func isSettings(b []byte) bool {
 // rehearsal is a TLS 1.3 connection that negotiated HTTP/2, as far as the
 // web server can tell. It keeps the first thing the web server writes.
 type rehearsal struct {
-	says  []byte // what the client sends before it goes quiet
-	wrote chan []byte
-	done  chan struct{}
-	once  sync.Once
+	says []byte // what the client sends before it goes quiet
+	// chunks, if set, is what the client sends instead, one TLS record
+	// each: a read returns from one record only, as tls.Conn's does.
+	chunks [][]byte
+	wrote  chan []byte
+	done   chan struct{}
+	once   sync.Once
 }
 
 func (r *rehearsal) ConnectionState() tls.ConnectionState {
@@ -179,6 +182,15 @@ func (r *rehearsal) ConnectionState() tls.ConnectionState {
 }
 
 func (r *rehearsal) Read(p []byte) (int, error) {
+	for len(r.chunks) > 0 {
+		if len(r.chunks[0]) == 0 {
+			r.chunks = r.chunks[1:]
+			continue
+		}
+		n := copy(p, r.chunks[0])
+		r.chunks[0] = r.chunks[0][n:]
+		return n, nil
+	}
 	if len(r.says) > 0 {
 		n := copy(p, r.says)
 		r.says = r.says[n:]

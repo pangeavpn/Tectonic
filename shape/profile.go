@@ -154,7 +154,9 @@ func Default() *Profile {
 		ClientFirstFlight: []IntRange{{Min: 70, Max: 70}, {Min: 443, Max: 453}},
 		ClientAck:         IntRange{Min: 9, Max: 9},
 		// A server's reply: SETTINGS ACK with WINDOW_UPDATE, the response
-		// HEADERS, and the start of the page.
+		// HEADERS, and the start of the page. A node built with Go 1.27 or
+		// newer opens with what its own cover web server sends instead
+		// (see server.learnOpening); these are for one that can't learn it.
 		ServerFirstFlight: []IntRange{{Min: 22, Max: 22}, {Min: 91, Max: 92}, {Min: 1090, Max: 4090}},
 
 		Buckets:        defaultBuckets(),

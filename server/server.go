@@ -110,7 +110,10 @@ type Server struct {
 	now     func() time.Time
 	tls     *tls.Config
 	profile *shape.Profile
-	wgAddr  *net.UDPAddr
+	// laneProfiles are profile with the records the cover web server opens
+	// with, one per rehearsed page load (see learnOpening), once known.
+	laneProfiles atomic.Pointer[[]*shape.Profile]
+	wgAddr       *net.UDPAddr
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -214,6 +217,7 @@ func newServer(cfg Config, direct bool) (*Server, error) {
 	if !direct {
 		log.Warn("built with Go before 1.27: the cover website's HTTP/2 is close to a Go web server's but not the same; build the node with Go 1.27 or newer")
 	}
+	s.learnOpening()
 	go s.janitor()
 	return s, nil
 }
@@ -446,11 +450,16 @@ func (s *Server) EnforceRevocation() {
 func (s *Server) janitor() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
+	learnt := time.Now()
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-t.C:
+		}
+		if time.Since(learnt) >= relearnOpening {
+			s.learnOpening()
+			learnt = time.Now()
 		}
 		s.EnforceRevocation()
 		s.mu.Lock()
