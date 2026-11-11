@@ -1130,6 +1130,13 @@ func (l *Lane) readLoop() error {
 
 func (l *Lane) writeLoop() error {
 	buf := make([]byte, 0, shape.MaxRecord+wire.MaxFrameLen)
+	// carry is the rest of a DATA frame that the last record began and
+	// had no room to finish. It opens the next record, ahead of everything
+	// else, and waits for nothing that would not have held the whole
+	// packet back. Until it is written it counts as queued, like the
+	// packets behind it, so that the scheduler's estimate for the lane
+	// misses nothing.
+	var carry []byte
 	timer := time.NewTimer(time.Hour)
 	timer.Stop()
 	// Bulk detection: bytes written in the current busyWindow.
@@ -1141,19 +1148,26 @@ func (l *Lane) writeLoop() error {
 	var drainFrom time.Time
 	var drainBytes int
 	var pace pacer
-	// more is set when the last record left packets behind on purpose, to
-	// go out at once in a record of their own (see shape.Planner.Split).
+	// more is set when the last record left packets behind on purpose
+	// (see shape.Planner.Split), or stopped part of the way through one:
+	// the next record goes out at once.
 	more := false
 	for {
 		// The record that ends a client's opening goes by itself, as soon
-		// as the reader has the server's first bytes.
-		if l.ackDue.Load() {
+		// as the reader has the server's first bytes. It cannot go between
+		// the two parts of a packet, so while one is unfinished it waits,
+		// and the record that finishes that packet ends with a whole one
+		// (see put): in a transfer every full record ends inside a packet,
+		// and the opening would wait for the transfer to be over.
+		ackWaits := l.ackDue.Load()
+		if ackWaits && len(carry) == 0 {
 			if err := l.writeAck(); err != nil {
 				return err
 			}
+			ackWaits = false
 		}
 		l.mu.Lock()
-		if len(l.ctrl) == 0 && len(l.data) == 0 && len(l.small) == 0 {
+		if len(carry) == 0 && len(l.ctrl) == 0 && len(l.data) == 0 && len(l.small) == 0 {
 			retiring := l.retiring
 			l.mu.Unlock()
 			drainFrom = time.Time{}
@@ -1171,7 +1185,7 @@ func (l *Lane) writeLoop() error {
 
 		now := time.Now()
 		pl := l.planner.Load()
-		kaOnly := len(l.ctrl) == 0 && len(l.small) == 0 && l.keepalives == len(l.data)
+		kaOnly := len(carry) == 0 && len(l.ctrl) == 0 && len(l.small) == 0 && l.keepalives == len(l.data)
 		idle := kaOnly && now.Sub(l.lastActive) >= pl.IdleAfter()
 		if idle && !l.retiring {
 			// Absorb keepalives into idle behaviour: hold them a random
@@ -1265,107 +1279,184 @@ func (l *Lane) writeLoop() error {
 		}
 		coalesceUntil = time.Time{}
 
-		buf = append(buf[:0], l.ctrl...)
-		l.ctrl = l.ctrl[:0]
-		closing := l.closing
+		// The rest of a frame the last record began goes first. Nothing
+		// may come between the two parts of a frame, so a record that
+		// cannot hold all of what is left holds nothing else.
+		carried := min(len(carry), shape.MaxRecord)
+		buf = append(buf[:0], carry[:carried]...)
+		carry = carry[:copy(carry, carry[carried:])]
+		// cut is set when the record ends inside a frame: it is full to
+		// the last byte, and what did not fit is in carry.
+		cut := len(carry) > 0
+		closing, pinged := false, false
+		limit, reserve := shape.MaxRecord, 0
 		queuedBefore := l.queued
+		// A CLOSE may have emptied the queue from under it.
+		l.queued = max(l.queued-carried, 0)
 		var dataBytes, pkts, real int
-		// A record is no larger than the connection sends in a moment
-		// (see sockState.recordLimit); what is left over follows in the next.
-		limit := shape.MaxRecord
-		if l.lowat {
-			if s := l.sock.Load(); s != nil {
-				limit = s.recordLimit()
+		if !cut {
+			buf = append(buf, l.ctrl...)
+			l.ctrl = l.ctrl[:0]
+			closing = l.closing
+			// A record is no larger than the connection sends in a moment
+			// (see sockState.recordLimit); what is left over follows in
+			// the next.
+			if l.lowat {
+				if s := l.sock.Load(); s != nil {
+					limit = s.recordLimit()
+				}
 			}
-		}
-		// An interactive record is padded up to a bucket, so a few queued
-		// packets may cost less padding divided between two records.
-		take := len(l.small) + len(l.data)
-		if n := take; n > 1 && n <= shape.MaxSplit && !gated && !held && !busy && !idle &&
-			pl.Mode(l.queued, false) == shape.Interactive {
-			var sizes [shape.MaxSplit]int
-			for i, p := range l.small {
-				sizes[i] = wire.HeaderLen + len(p)
+			// A PING rides at the end of a record; if one is due, it
+			// has a place kept.
+			if l.pingDue(now, gated) {
+				reserve = wire.HeaderLen + wire.PingLen
 			}
-			for i, p := range l.data {
-				sizes[len(l.small)+i] = wire.HeaderLen + len(p)
+			// However small the limit, a record takes one packet: it
+			// finishes the one it opens with, or holds as much as the
+			// first one waiting.
+			first := 0
+			switch {
+			case len(l.small) > 0:
+				first = wire.HeaderLen + len(l.small[0])
+			case !gated && !held && len(l.data) > 0:
+				first = wire.HeaderLen + len(l.data[0])
 			}
-			take = pl.Split(len(buf), sizes[:n])
-		}
-		more = take < len(l.small)+len(l.data)
-		// Small packets first, and even while the window is closed: they
-		// add next to nothing to what is outstanding.
-		for len(l.small) > 0 && take > 0 {
-			p := l.small[0]
-			if n := len(buf) + wire.HeaderLen + len(p); len(buf) > 0 && n > shape.MaxRecord || pkts > 0 && n > limit {
-				more = more || limit < shape.MaxRecord
-				break
+			// room is how many more bytes of DATA frames the record
+			// takes.
+			room := min(max(limit, len(buf)-carried+max(carried, first)+reserve), shape.MaxRecord) - len(buf) - reserve
+			// An interactive record is padded past a bucket, so a few
+			// queued packets that fit in one record may cost less padding
+			// divided between two.
+			take := len(l.small) + len(l.data)
+			if n := take; n > 1 && n <= shape.MaxSplit && l.queued <= room && !gated && !held && !busy && !idle &&
+				pl.Mode(l.queued, false) == shape.Interactive {
+				var sizes [shape.MaxSplit]int
+				for i, p := range l.small {
+					sizes[i] = wire.HeaderLen + len(p)
+				}
+				for i, p := range l.data {
+					sizes[len(l.small)+i] = wire.HeaderLen + len(p)
+				}
+				take = pl.Split(len(buf), sizes[:n])
 			}
-			take--
-			buf = wire.AppendFrame(buf, wire.TypeData, p)
-			l.small[0] = nil
-			l.small = l.small[1:]
-			l.queued -= wire.HeaderLen + len(p)
-			real++
-			dataBytes += len(p)
-			pkts++
-		}
-		if len(l.small) == 0 {
-			l.small = l.small[:0:0]
-		}
-		for !gated && !held && len(l.data) > 0 && take > 0 {
-			p := l.data[0]
-			if n := len(buf) + wire.HeaderLen + len(p); len(buf) > 0 && n > shape.MaxRecord || pkts > 0 && n > limit {
-				more = more || limit < shape.MaxRecord
-				break
+			split := take < len(l.small)+len(l.data)
+			// put adds p to the record as a DATA frame and reports
+			// whether it did. A packet that does not fit in a record
+			// that may be full is cut: what there is room for goes in,
+			// and the next record opens with the rest. The reader on the
+			// other side puts frames together from a stream of bytes and
+			// does not see where records end.
+			//
+			// A record that its connection's limit ends holds whole
+			// packets. It is there so that a packet does not wait on
+			// more than the connection sends in a moment, and a packet
+			// in two records waits on both. So does a record written
+			// while the opening's last record waits to follow it.
+			put := func(p []byte, keepalive bool) bool {
+				n := wire.HeaderLen + len(p)
+				if n > room && reserve > 0 && keepalive && real == 0 && !gated {
+					room, reserve = room+reserve, 0 // no PING rides with keepalives alone
+				}
+				switch {
+				case n <= room:
+					buf = wire.AppendFrame(buf, wire.TypeData, p)
+					room -= n
+					return true
+				case room <= 0, (limit < shape.MaxRecord || ackWaits) && pkts+carried > 0:
+					return false
+				}
+				if reserve > 0 {
+					// A PING cannot follow part of a frame, so it goes
+					// in ahead of it.
+					buf, pinged, reserve = l.ping(buf, now, true), true, 0
+				}
+				end := len(buf) + room
+				buf = wire.AppendFrame(buf, wire.TypeData, p)
+				carry = append(carry[:0], buf[end:]...)
+				buf, room, cut = buf[:end], 0, true
+				l.queued += len(carry)
+				return true
 			}
-			take--
-			buf = wire.AppendFrame(buf, wire.TypeData, p)
-			l.data[0] = nil
-			l.data, l.dataAt = l.data[1:], l.dataAt[1:]
-			l.queued -= wire.HeaderLen + len(p)
-			if shape.IsKeepalive(p) {
-				l.keepalives--
-			} else {
+			// Small packets first, and even while the window is closed:
+			// they add next to nothing to what is outstanding.
+			for len(l.small) > 0 && take > 0 && !cut {
+				p := l.small[0]
+				if !put(p, false) {
+					break
+				}
+				take--
+				l.small[0] = nil
+				l.small = l.small[1:]
+				l.queued -= wire.HeaderLen + len(p)
 				real++
+				dataBytes += len(p)
+				pkts++
 			}
-			dataBytes += len(p)
-			pkts++
+			if len(l.small) == 0 {
+				l.small = l.small[:0:0]
+			}
+			for !gated && !held && len(l.data) > 0 && take > 0 && !cut {
+				p := l.data[0]
+				ka := shape.IsKeepalive(p)
+				if !put(p, ka) {
+					break
+				}
+				take--
+				l.data[0] = nil
+				l.data, l.dataAt = l.data[1:], l.dataAt[1:]
+				l.queued -= wire.HeaderLen + len(p)
+				if ka {
+					l.keepalives--
+				} else {
+					real++
+				}
+				dataBytes += len(p)
+				pkts++
+			}
+			if len(l.data) == 0 {
+				l.data, l.dataAt = l.data[:0:0], l.dataAt[:0:0]
+			}
+			// Packets a record on a slow connection had no room for go
+			// in the next, without waiting for it to fill.
+			left := len(l.small) > 0 || !gated && !held && len(l.data) > 0
+			more = split || left && limit < shape.MaxRecord
 		}
-		if len(l.data) == 0 {
-			l.data, l.dataAt = l.data[:0:0], l.dataAt[:0:0]
-		}
-		backlogged := len(l.data) > 0 || len(l.small) > 0
+		more = more || cut
+		backlogged := len(carry) > 0 || len(l.data) > 0 || len(l.small) > 0
 		l.queuedA.Store(int64(l.queued))
 		l.mu.Unlock()
 
-		pinged := false
-		if real > 0 || gated {
+		if reserve > 0 && (real > 0 || gated) {
 			// A gated record exists to carry a PING whose PONG will
 			// reopen the window.
-			buf, pinged = l.maybePing(buf, now, backlogged, gated)
+			buf, pinged = l.ping(buf, now, backlogged), true
 		}
-		mode := pl.Mode(queuedBefore, idle)
-		switch {
-		case gated, held, pkts == 0:
-			// Control frames with no DATA to ride with are padded as
-			// an interactive record is, whatever the lane is carrying.
-			// The few bytes a bulk record takes are for whole packets,
-			// whose size is no secret; they would leave a PONG's record
-			// or a RETIRE's just longer than the frame, and say which
-			// it was.
-			mode = shape.Interactive
-		case busy && !idle:
-			mode = shape.Bulk
-		}
-		if len(buf) < shape.MaxRecord {
+		// data is whether the record carries DATA: packets that begin in
+		// it, or the end of one that began in the last.
+		data := pkts > 0 || carried > 0
+		// A record that ends inside a packet is full, and is left as it
+		// is. Any other is padded.
+		if !cut && len(buf) < shape.MaxRecord {
+			mode := pl.Mode(queuedBefore, idle)
+			switch {
+			case gated, held, !data:
+				// Control frames with no DATA to ride with are padded
+				// as an interactive record is, whatever the lane is
+				// carrying. The few bytes a bulk record takes are for
+				// whole packets, whose size is no secret; they would
+				// leave a PONG's record or a RETIRE's just longer than
+				// the frame, and say which it was.
+				mode = shape.Interactive
+			case busy && !idle:
+				mode = shape.Bulk
+			}
 			buf = wire.AppendPadding(buf, pl.Padding(mode, len(buf)))
 		}
 		// Only this goroutine writes, so the totals after the write are
 		// known now; record the PING's before a fast PONG can arrive.
 		total := l.bytesSent.Load() + uint64(len(buf))
 		tracked := l.tracked.Load()
-		if pkts > 0 || pinged {
+		if data || pinged {
 			tracked += uint64(len(buf))
 		}
 		l.pingMu.Lock()
@@ -1385,10 +1476,16 @@ func (l *Lane) writeLoop() error {
 		l.pktsSent.Add(uint64(pkts))
 		after := time.Now()
 		l.lastSend.Store(after.UnixNano())
-		if pkts > 0 {
+		if data {
 			l.lastData.Store(after.UnixNano())
-			if l.limit != nil && !held {
+			switch {
+			case l.limit == nil:
+			case !held:
 				l.limit.Wrote(after, len(buf))
+			case carried > 0:
+				// Of what a held record carries, only the end of a
+				// packet begun before the limit held is its to count.
+				l.limit.Wrote(after, carried)
 			}
 		}
 		if l.lowat {
@@ -1401,7 +1498,7 @@ func (l *Lane) writeLoop() error {
 			// Not pacing. What was written at the rate of a lane still
 			// growing must not count against it once it is full.
 			pace = pacer{}
-		case pkts > 0:
+		case data:
 			pace.wrote(now, len(buf), paceGain*l.Rate())
 		}
 		switch {
@@ -1459,34 +1556,40 @@ func (p *pacer) wrote(now time.Time, n int, rate float64) {
 	p.until = p.until.Add(time.Duration(float64(n) / rate * float64(time.Second)))
 }
 
-// maybePing adds a PING to a record. PINGs only ride in records that carry
-// DATA, so an idle lane sends none. With TCP_NOTSENT_LOWAT they go once per
-// ping interval, for liveness and, without TCP_INFO, the estimates. Without
-// it they go several times a round trip, because their PONGs are what
-// reopen the window; cover forces one when none is outstanding.
-func (l *Lane) maybePing(buf []byte, now time.Time, backlogged, cover bool) ([]byte, bool) {
+// pingDue reports whether a PING should ride in the record being built.
+// PINGs only ride in records that carry DATA, so an idle lane sends none.
+// With TCP_NOTSENT_LOWAT they go once per ping interval, for liveness and,
+// without TCP_INFO, the estimates. Without it they go several times a round
+// trip, because their PONGs are what reopen the window; cover forces one
+// when none is outstanding.
+func (l *Lane) pingDue(now time.Time, cover bool) bool {
 	l.pingMu.Lock()
 	defer l.pingMu.Unlock()
-	var due bool
+	if cover && len(l.pings) == 0 {
+		return true
+	}
 	if l.lowat {
-		due = len(l.pings) == 0 && now.Sub(l.lastPingSent) >= l.pingInterval
-	} else {
-		// Spread PINGs through the window, by time and by bytes, so
-		// confirmations keep pace with what is in flight.
-		every := max(uint64(l.windowBytes()/8), shape.MaxRecord)
-		due = len(l.pings) < maxPings &&
-			(now.Sub(l.lastPingSent) >= l.pingSpacing() || l.tracked.Load()-l.lastPingBytes >= every)
+		return len(l.pings) == 0 && now.Sub(l.lastPingSent) >= l.pingInterval
 	}
-	if !due && !(cover && len(l.pings) == 0) {
-		return buf, false
-	}
+	// Spread PINGs through the window, by time and by bytes, so
+	// confirmations keep pace with what is in flight.
+	every := max(uint64(l.windowBytes()/8), shape.MaxRecord)
+	return len(l.pings) < maxPings &&
+		(now.Sub(l.lastPingSent) >= l.pingSpacing() || l.tracked.Load()-l.lastPingBytes >= every)
+}
+
+// ping adds a PING to a record and notes that it is outstanding. backlogged
+// is whether the lane has more to send once the record is written.
+func (l *Lane) ping(buf []byte, now time.Time, backlogged bool) []byte {
+	l.pingMu.Lock()
+	defer l.pingMu.Unlock()
 	p := outPing{tok: wire.NewPingToken(), at: now, limited: l.appLimited || !backlogged}
 	l.pings = append(l.pings, p)
 	l.lastPingSent = now
 	l.lastPingBytes = l.tracked.Load()
 	l.appLimited = false
 	buf = wire.AppendHeader(buf, wire.TypePing, wire.PingLen)
-	return wire.AppendPing(buf, p.tok), true
+	return wire.AppendPing(buf, p.tok)
 }
 
 // windowOpen reports whether a lane pacing itself on PONGs may write more
