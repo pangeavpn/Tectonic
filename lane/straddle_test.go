@@ -92,23 +92,18 @@ func TestBacklogGoesOutInFullRecords(t *testing.T) {
 		t.Fatalf("lane counted %d packets, %d bytes of them", st.PacketsSent, st.DataSent)
 	}
 
-	// A lane that paces itself on PONGs fills its records the same way,
-	// and its PINGs fit inside them.
+	// A lane that paces itself on PONGs keeps whole packets in its
+	// records. It stops writing while its window is full, and a packet
+	// cut by the last record before that would wait half sent. Eleven
+	// packets, a PING and the padding come to less than a full record.
 	l, rc, far = recordLane(t, nil)
 	queuePackets(l, pkts)
 	samePackets(t, far.packets(60), pkts)
 	drained(t, l, rc)
-	full := 0
 	for _, s := range rc.sizes()[1:] {
-		if s > shape.MaxRecord {
-			t.Fatalf("a record of %d bytes: TLS will send it as two", s)
+		if s >= shape.MaxRecord {
+			t.Fatalf("records %v: one of %d bytes does not end with a whole packet", rc.sizes()[1:], s)
 		}
-		if s == shape.MaxRecord {
-			full++
-		}
-	}
-	if full < 4 {
-		t.Fatalf("records %v: %d full ones, want at least 4", rc.sizes()[1:], full)
 	}
 }
 
@@ -335,44 +330,43 @@ func TestPingMarksTheEndOfItsRecord(t *testing.T) {
 	a, b := net.Pipe()
 	rc := &recordConn{Conn: a}
 	l := New(rc, nil, Options{Role: Server, Planner: shape.NewPlanner(testProfile())})
+	l.lowat = true
+	l.sock.Store(fastSock())
 	far := &farEnd{t: t, conn: b, done: make(chan struct{}), quiet: true}
 	go far.read()
 	t.Cleanup(func() { l.Close(); b.Close(); <-far.done })
 	if err := l.Start(nil); err != nil {
 		t.Fatal(err)
 	}
+	// The lane has sent no PING yet, so one is due in the first record
+	// that carries DATA; with no PONG coming back it stays outstanding
+	// and no other follows.
 	pkts := numbered(60, fullSize)
 	queuePackets(l, pkts)
-	// With no PONG coming back the window closes after four records.
-	far.packets(44)
-	time.Sleep(20 * time.Millisecond)
+	samePackets(t, far.packets(60), pkts)
+	drained(t, l, rc)
 	sizes := rc.sizes()
-	if len(sizes) != 5 {
-		t.Fatalf("records %v, want the opening and four more", sizes)
+	if len(sizes) < 3 || sizes[1] != shape.MaxRecord {
+		t.Fatalf("records %v: the first after the opening should be full", sizes)
 	}
-	ends := map[uint64]bool{}
 	sum := uint64(0)
-	for i, s := range sizes {
-		if i > 0 && s != shape.MaxRecord {
-			t.Fatalf("records %v: all after the opening should be full", sizes)
-		}
+	for _, s := range sizes[1:] {
 		sum += uint64(s)
-		ends[sum] = true
+	}
+	far.mu.Lock()
+	pinged := bytes.Count(far.ctrl, []byte{wire.TypePing})
+	far.mu.Unlock()
+	if pinged != 1 {
+		t.Fatalf("%d PINGs arrived, want one", pinged)
 	}
 	l.pingMu.Lock()
 	defer l.pingMu.Unlock()
-	// The opening carried one, and a record carries another once a
-	// record's worth has been written since.
-	if len(l.pings) != 4 {
-		t.Fatalf("%d PINGs outstanding, want the opening's and three more", len(l.pings))
+	if len(l.pings) != 1 || l.pings[0].bytes != shape.MaxRecord {
+		t.Fatalf("PINGs outstanding %+v, want one that stands for the %d bytes of its record", l.pings, shape.MaxRecord)
 	}
-	for _, p := range l.pings {
-		if !ends[p.bytes] {
-			t.Fatalf("a PING stands for %d bytes; records end at %v", p.bytes, sizes)
-		}
-	}
+	// A lane with TCP_NOTSENT_LOWAT does not count its opening.
 	if got := l.tracked.Load(); got != sum {
-		t.Fatalf("%d bytes tracked, %d written", got, sum)
+		t.Fatalf("%d bytes tracked, %d written after the opening", got, sum)
 	}
 }
 

@@ -1352,6 +1352,14 @@ func (l *Lane) writeLoop() error {
 			// more than the connection sends in a moment, and a packet
 			// in two records waits on both. So does a record written
 			// while the opening's last record waits to follow it.
+			//
+			// So does every record of a lane without TCP_NOTSENT_LOWAT.
+			// Such a lane stops writing DATA while its window of
+			// unconfirmed bytes is full, for a round trip or longer on a
+			// path that is losing packets, and a packet cut by the last
+			// record before that is left half sent, where its queue no
+			// longer shows it waiting. On a path with bursts of loss
+			// such lanes carried about a third less with packets cut.
 			put := func(p []byte, keepalive bool) bool {
 				n := wire.HeaderLen + len(p)
 				if n > room && reserve > 0 && keepalive && real == 0 && !gated {
@@ -1362,7 +1370,7 @@ func (l *Lane) writeLoop() error {
 					buf = wire.AppendFrame(buf, wire.TypeData, p)
 					room -= n
 					return true
-				case room <= 0, (limit < shape.MaxRecord || ackWaits) && pkts+carried > 0:
+				case room <= 0, (limit < shape.MaxRecord || ackWaits || !l.lowat) && pkts+carried > 0:
 					return false
 				}
 				if reserve > 0 {

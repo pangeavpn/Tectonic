@@ -278,7 +278,7 @@ TLS hides what's inside the traffic, but WireGuard still has a recognisable shap
 
 | Traffic state | What Tectonic does | Overhead |
 |---|---|---|
-| Bulk transfer | While more is waiting than a record holds, fills every record to the full 16 KB, as a real download does, so a packet may begin in one record and end in the next. A record that goes out with less holds whole packets and 3 to 34 bytes of padding. A slow lane that paces sends smaller ones (see [Choosing a lane](#choosing-a-lane)). | ≈ 0% |
+| Bulk transfer | While more is waiting than a record holds, fills every record to the full 16 KB, as a real download does, so a packet may begin in one record and end in the next. A record that goes out with less holds whole packets and 3 to 34 bytes of padding, and so does every record of a lane [without `TCP_NOTSENT_LOWAT`](#without-tcp_notsent_lowat). A slow lane that paces sends smaller ones (see [Choosing a lane](#choosing-a-lane)). | ≈ 0% |
 | Interactive | Gives a record up to a millisecond to fill, then pads it to a length drawn evenly from the band above the one its size falls in. The profile's buckets are the band edges. | Small |
 | Lane start | Sends the first flight in each direction as the records Chrome and an HTTP/2 server open with. From the client: 87 bytes, a request-sized record (460–470), and a 26 once the server answers. From the server, after the web server's own `SETTINGS` (62): a 39, a 108–109 and a page-sized record | About 3.4 KB per lane |
 | Idle | Absorbs WireGuard keepalives into browser-like idle behaviour: holds each one a random while and pads it to a length drawn from the profile's idle sizes. Then closes the lane, and opens a fresh one when traffic resumes | Tiny |
