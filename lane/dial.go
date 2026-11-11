@@ -3,8 +3,10 @@ package lane
 import (
 	"context"
 	"crypto/x509"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"syscall"
 	"time"
@@ -153,6 +155,7 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 		return nil, err
 	}
 	var conn net.Conn = uconn
+	var from io.Reader // where the lane reads frames; nil means conn
 	var binding []byte
 	switch cfg.Carrier {
 	case Direct:
@@ -160,6 +163,9 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 		binding, err = cs.ExportKeyingMaterial(wire.ExporterLabel, []byte{}, wire.ExporterLen)
 		if err != nil {
 			return nil, err
+		}
+		if cs.NegotiatedProtocol == "h2" {
+			from = &pastSettings{r: uconn}
 		}
 	case CDN:
 		ws, key, err := clientWebSocket(uconn, cfg.ServerName, cfg.Path, cfg.UserAgent)
@@ -198,7 +204,7 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 	opts := cfg.Lane
 	opts.Role = Client
 	opts.Raw = raw
-	l := New(conn, nil, opts)
+	l := New(conn, from, opts)
 	if len(cfg.FirstPacket) > 0 {
 		l.dataSent.Add(uint64(len(cfg.FirstPacket)))
 		l.pktsSent.Add(1)
@@ -208,6 +214,60 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 	}
 	ok = true
 	return l, nil
+}
+
+// pastSettings reads a direct lane's frames from a node that speaks first.
+//
+// Until a client logs in, the node is a web server, and a web server opens
+// an HTTP/2 connection by sending its SETTINGS frame the moment the TLS
+// handshake ends, before it has read anything. So that frame is on every
+// connection that negotiated HTTP/2, a lane's included, and Tectonic's
+// frames come after it. An HTTP/2 frame starts with its length in three
+// bytes, so a SETTINGS frame starts with a zero byte, which no Tectonic
+// frame does: a server that sends none is read as it always was.
+//
+// The frame is read past on the lane's first read, not in Dial, so Dial
+// still returns without waiting for the server.
+type pastSettings struct {
+	r    io.Reader
+	past bool
+}
+
+var errNotSettings = errors.New("lane: the server opened with an HTTP/2 frame that is not SETTINGS")
+
+func (s *pastSettings) Read(p []byte) (int, error) {
+	if s.past || len(p) == 0 {
+		return s.r.Read(p)
+	}
+	// An HTTP/2 frame header: length (3 bytes), type, flags, stream.
+	const settings, ack = 0x4, 0x1
+	var hdr [9]byte
+	if _, err := io.ReadFull(s.r, hdr[:1]); err != nil {
+		return 0, err
+	}
+	s.past = true
+	if hdr[0] != 0 {
+		p[0] = hdr[0]
+		return 1, nil
+	}
+	if _, err := io.ReadFull(s.r, hdr[1:]); err != nil {
+		return 0, midFrame(err)
+	}
+	if hdr[3] != settings || hdr[4]&ack != 0 || binary.BigEndian.Uint32(hdr[5:])&0x7fffffff != 0 {
+		return 0, errNotSettings
+	}
+	if _, err := io.CopyN(io.Discard, s.r, int64(binary.BigEndian.Uint16(hdr[1:]))); err != nil {
+		return 0, midFrame(err)
+	}
+	return s.r.Read(p)
+}
+
+// midFrame is err for a stream that ended inside a frame.
+func midFrame(err error) error {
+	if err == io.EOF {
+		return io.ErrUnexpectedEOF
+	}
+	return err
 }
 
 func dialTCP(ctx context.Context, cfg DialConfig) (net.Conn, error) {
