@@ -163,6 +163,31 @@ func (pl *Planner) padTo(size, lo, n int) int {
 	return gap
 }
 
+const (
+	// CutMin is the fewest bytes Cut leaves on either side of a cut, so
+	// that neither part of a packet makes a record of next to nothing.
+	CutMin = 64
+	// CutFrom is the smallest frame Cut divides. A record that ends in a
+	// smaller one is not a whole number of full-size packets.
+	CutFrom = 4 * CutMin
+)
+
+// Cut says where to divide the frame of n bytes that ends a bulk record:
+// how many of its bytes stay in the record, the rest opening the next one.
+// It returns 0 if the frame is too small to divide.
+//
+// A bulk record that ends between packets holds a whole number of them,
+// and full-size packets are all the same size, so its length is that size
+// times a count plus a little: a lattice that marks the traffic out. Ended
+// at a point drawn evenly inside its last packet, the record's length is
+// spread evenly over the packet's size, and costs no padding at all.
+func (pl *Planner) Cut(n int) int {
+	if n < CutFrom {
+		return 0
+	}
+	return CutMin + pl.intn(n-2*CutMin+1)
+}
+
 // cost is twice the padding an interactive record of size bytes takes on
 // average: what brings it up to its bucket, and half the band above.
 func (pl *Planner) cost(size int) int {

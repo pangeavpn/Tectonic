@@ -181,13 +181,16 @@ func TestControlFramesAreNeverSentBare(t *testing.T) {
 	}
 }
 
-func TestLastRecordOfABurstIsPadded(t *testing.T) {
+func TestLastRecordOfABurstEndsInsideAPacket(t *testing.T) {
 	// During a bulk transfer, a record that goes out because the queue ran
-	// dry holds whole packets. Left as it is, its length is a multiple of
-	// the packet size; it takes a few bytes of padding, and no more.
+	// dry would hold whole packets, and its length would be a multiple of
+	// the packet size and a little. Instead it ends at a point drawn inside
+	// its last packet, and the rest of that packet follows at once in a
+	// record of its own. Neither is padded.
 	l, rc, far := recordLane(t, nil)
 	const frame = wire.HeaderLen + 1420
 	sent := 0
+	seen := map[int]bool{}
 	for range 20 {
 		n := keepBusy(t, l, rc)
 		sent += 6 * 14
@@ -196,13 +199,21 @@ func TestLastRecordOfABurstIsPadded(t *testing.T) {
 		far.packets(sent)
 		drained(t, l, rc)
 		sizes := rc.sizes()[n:]
-		if len(sizes) != 1 {
-			t.Fatalf("five packets left in records %v, want one", sizes)
+		if len(sizes) != 2 {
+			t.Fatalf("five packets left in records %v, want two", sizes)
 		}
-		// Five packets, with or without a PING, and a PAD frame of 3 to
-		// 34 bytes.
-		if size := sizes[0]; size%frame == 0 || size < 5*frame+3 || size >= 5*frame+11+35 {
-			t.Fatalf("five packets left in a record of %d bytes", size)
+		// Five packets, with or without a PING, and nothing else.
+		if sum := sizes[0] + sizes[1]; sum != 5*frame && sum != 5*frame+wire.HeaderLen+wire.PingLen {
+			t.Fatalf("five packets left in records %v", sizes)
 		}
+		// The second record is the end of the fifth packet: at least
+		// CutMin bytes of it, and at least CutMin are left in the first.
+		if s := sizes[1]; s < shape.CutMin || s > frame-shape.CutMin {
+			t.Fatalf("five packets left in records %v", sizes)
+		}
+		seen[sizes[0]] = true
+	}
+	if len(seen) < 10 {
+		t.Fatalf("20 bursts ended in only %d record lengths", len(seen))
 	}
 }

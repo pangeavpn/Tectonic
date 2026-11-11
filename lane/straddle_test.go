@@ -111,7 +111,9 @@ func TestLastRecordOfABacklogFollowsAtOnce(t *testing.T) {
 	// 14 packets are one full record and 3986 bytes: the end of the
 	// packet the record stopped in, and two more. Nothing else is coming,
 	// and that must not wait for a record to fill, which is a millisecond
-	// or two. The quickest of twenty tries says whether the lane waits.
+	// or two. Once the lane has been busy, the last record also ends
+	// inside its last packet, and the end of that follows, at once too.
+	// The quickest of twenty tries says whether the lane waits.
 	l, rc, far := recordLane(t, fastSock())
 	quickest := time.Hour
 	sent := 0
@@ -125,46 +127,56 @@ func TestLastRecordOfABacklogFollowsAtOnce(t *testing.T) {
 		rc.mu.Lock()
 		sizes, times := slices.Clone(rc.writes[n:]), slices.Clone(rc.times[n:])
 		rc.mu.Unlock()
-		if len(sizes) != 2 || sizes[0] != shape.MaxRecord {
-			t.Fatalf("14 packets left in records %v, want a full one and one more", sizes)
+		if len(sizes) < 2 || len(sizes) > 3 || sizes[0] != shape.MaxRecord {
+			t.Fatalf("14 packets left in records %v, want a full one and one or two more", sizes)
 		}
-		quickest = min(quickest, times[1].Sub(times[0]))
+		gap := time.Duration(0)
+		for i := 1; i < len(times); i++ {
+			gap = max(gap, times[i].Sub(times[i-1]))
+		}
+		quickest = min(quickest, gap)
 	}
 	if quickest > 300*time.Microsecond {
 		t.Fatalf("the record that finishes a packet followed %v after the one that began it", quickest)
 	}
 }
 
-func TestConnectionLimitEndsRecordsBetweenPackets(t *testing.T) {
+func TestConnectionLimitBoundsRecords(t *testing.T) {
 	// A connection with its window full, sending 4.5 MB/s, sends 4525
-	// bytes in the millisecond a record may take: three packets. A record
-	// is there so that a packet waits on no more than that, and a packet
-	// in two records would wait on both. So with a backlog its records
-	// still hold whole packets, three each, and a few bytes of padding
-	// that keep them from all being one length.
+	// bytes in the millisecond a record may take: three packets. Its
+	// records hold no more than that. Each ends inside its last packet,
+	// at a point drawn evenly, and the next opens with the rest, so their
+	// lengths say nothing of the packets' size.
 	s := &sockState{cwnd: 100 * 1448, inflight: 100 * 1448, rtt: 32 * time.Millisecond}
 	if got := s.recordLimit(); got != 4525 {
 		t.Fatalf("record limit = %d, want 4525", got)
 	}
 	l, rc, far := recordLane(t, s)
-	pkts := numbered(30, fullSize)
+	pkts := numbered(120, fullSize)
 	queuePackets(l, pkts)
-	samePackets(t, far.packets(30), pkts)
+	samePackets(t, far.packets(120), pkts)
 	drained(t, l, rc)
 	sizes := rc.sizes()[1:]
-	if len(sizes) != 10 {
-		t.Fatalf("30 packets left in %d records %v, want 10", len(sizes), sizes)
-	}
-	seen := map[int]bool{}
+	seen, onLattice := map[int]bool{}, 0
 	for _, size := range sizes {
-		// Three packets, a PING in the first, and padding: 3 to 34
-		// bytes, or into the band above once the backlog is nearly gone.
-		if pad := size - 3*fullFrame; pad < 3 || pad >= 11+51 {
-			t.Fatalf("records %v: each should be three packets and a little padding", sizes)
+		// No more than the limit, or the last, padded into the band
+		// above once the backlog is nearly gone.
+		if size > 4525+51 {
+			t.Fatalf("records %v: one is over the limit", sizes)
+		}
+		if size%fullFrame < shape.CutMin {
+			onLattice++
 		}
 		seen[size] = true
 	}
-	if len(seen) < 4 {
+	// A record that opens with the end of one packet and ends inside
+	// another has a length spread evenly over a packet's size, so one in
+	// twenty-odd lands within CutMin of a multiple of it. Holding whole
+	// packets, all of them would.
+	if onLattice > len(sizes)/5 {
+		t.Fatalf("records %v: %d are whole packets and a little", sizes, onLattice)
+	}
+	if len(seen) < len(sizes)*3/4 {
 		t.Fatalf("records %v: lengths barely vary", sizes)
 	}
 }

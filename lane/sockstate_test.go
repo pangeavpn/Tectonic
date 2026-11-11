@@ -158,12 +158,11 @@ func TestSlowConnectionSendsSmallRecords(t *testing.T) {
 	queue(l, 8)
 	waitBytes(t, rc, 2000+8*1423)
 	sizes := rc.sizes()[1:]
-	if len(sizes) != 8 {
-		t.Fatalf("8 packets left in %d records %v, want one each", len(sizes), sizes)
-	}
+	// A record holds no more than a packet: one whole, or the end of one
+	// and the start of the next.
 	for _, s := range sizes {
-		if s < 1423 || s > 1536 {
-			t.Fatalf("records %v: each should hold one packet", sizes)
+		if s > 1536 {
+			t.Fatalf("records %v: each should hold a packet or less", sizes)
 		}
 	}
 	// They follow one another at once: a record cut short does not wait

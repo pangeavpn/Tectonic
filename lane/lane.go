@@ -1152,6 +1152,14 @@ func (l *Lane) writeLoop() error {
 	// (see shape.Planner.Split), or stopped part of the way through one:
 	// the next record goes out at once.
 	more := false
+	// tail is set when the last record, a bulk one, ended inside its last
+	// packet on purpose (see shape.Planner.Cut). The rest of that packet,
+	// in carry, goes in the next record without waiting on the window,
+	// the session's send limit or the pacer. Those hold back packets not
+	// yet begun; one begun and left half sent would wait where its queue
+	// no longer shows it. frame holds that packet while it is divided.
+	tail := false
+	var frame []byte
 	for {
 		// The record that ends a client's opening goes by itself, as soon
 		// as the reader has the server's first bytes. It cannot go between
@@ -1213,7 +1221,7 @@ func (l *Lane) writeLoop() error {
 		// Without TCP_NOTSENT_LOWAT, DATA waits while the window of
 		// unconfirmed bytes is full; control frames still go.
 		gated := !l.lowat && !l.closing && len(l.data) > 0 && !l.windowOpen()
-		if gated && len(l.ctrl) == 0 && len(l.small) == 0 && !l.needCoverPing() {
+		if gated && !tail && len(l.ctrl) == 0 && len(l.small) == 0 && !l.needCoverPing() {
 			l.mu.Unlock()
 			select {
 			case <-l.wake: // a PONG opened the window, or new control frames
@@ -1227,7 +1235,7 @@ func (l *Lane) writeLoop() error {
 		held := false
 		if l.limit != nil && !l.closing && len(l.data) > 0 {
 			if wait := l.limit.Wait(now); wait > 0 {
-				if len(l.ctrl) == 0 && len(l.small) == 0 {
+				if !tail && len(l.ctrl) == 0 && len(l.small) == 0 {
 					l.mu.Unlock()
 					timer.Reset(min(wait, limitNap))
 					select {
@@ -1241,8 +1249,13 @@ func (l *Lane) writeLoop() error {
 				held = true
 			}
 		}
+		// paced is set when the pacer holds DATA back from a record that
+		// goes anyway, with the end of a packet.
+		paced := false
 		if l.full.Load() && !gated && !l.closing && len(l.ctrl) == 0 && len(l.small) == 0 && len(l.data) > 0 {
-			if wait := pace.wait(now, paceGain*l.Rate()); wait > 0 {
+			if wait := pace.wait(now, paceGain*l.Rate()); wait > 0 && tail {
+				paced = true
+			} else if wait > 0 {
 				l.mu.Unlock()
 				timer.Reset(wait)
 				select {
@@ -1255,7 +1268,7 @@ func (l *Lane) writeLoop() error {
 			}
 		}
 		// Give a record a moment to fill.
-		if !more && !gated && !held && !idle && !l.retiring && !l.closing &&
+		if !more && !gated && !held && !paced && !idle && !l.retiring && !l.closing &&
 			l.queued+len(l.ctrl) < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
 				hold := min(flushDelay, l.RTT()/16)
@@ -1278,6 +1291,10 @@ func (l *Lane) writeLoop() error {
 			}
 		}
 		coalesceUntil = time.Time{}
+		// The DATA a record may take beyond the end of a packet.
+		dataOK := !gated && !held && !paced
+		tailRec := tail
+		tail = false
 
 		// The rest of a frame the last record began goes first. Nothing
 		// may come between the two parts of a frame, so a record that
@@ -1294,6 +1311,8 @@ func (l *Lane) writeLoop() error {
 		// A CLOSE may have emptied the queue from under it.
 		l.queued = max(l.queued-carried, 0)
 		var dataBytes, pkts, real int
+		// lastAt is where the record's last whole DATA frame begins, or -1.
+		lastAt := -1
 		if !cut {
 			buf = append(buf, l.ctrl...)
 			l.ctrl = l.ctrl[:0]
@@ -1318,7 +1337,7 @@ func (l *Lane) writeLoop() error {
 			switch {
 			case len(l.small) > 0:
 				first = wire.HeaderLen + len(l.small[0])
-			case !gated && !held && len(l.data) > 0:
+			case dataOK && len(l.data) > 0:
 				first = wire.HeaderLen + len(l.data[0])
 			}
 			// room is how many more bytes of DATA frames the record
@@ -1328,7 +1347,7 @@ func (l *Lane) writeLoop() error {
 			// queued packets that fit in one record may cost less padding
 			// divided between two.
 			take := len(l.small) + len(l.data)
-			if n := take; n > 1 && n <= shape.MaxSplit && l.queued <= room && !gated && !held && !busy && !idle &&
+			if n := take; n > 1 && n <= shape.MaxSplit && l.queued <= room && dataOK && !busy && !idle &&
 				pl.Mode(l.queued, false) == shape.Interactive {
 				var sizes [shape.MaxSplit]int
 				for i, p := range l.small {
@@ -1367,6 +1386,7 @@ func (l *Lane) writeLoop() error {
 				}
 				switch {
 				case n <= room:
+					lastAt = len(buf)
 					buf = wire.AppendFrame(buf, wire.TypeData, p)
 					room -= n
 					return true
@@ -1403,7 +1423,7 @@ func (l *Lane) writeLoop() error {
 			if len(l.small) == 0 {
 				l.small = l.small[:0:0]
 			}
-			for !gated && !held && len(l.data) > 0 && take > 0 && !cut {
+			for dataOK && len(l.data) > 0 && take > 0 && !cut {
 				p := l.data[0]
 				ka := shape.IsKeepalive(p)
 				if !put(p, ka) {
@@ -1426,7 +1446,7 @@ func (l *Lane) writeLoop() error {
 			}
 			// Packets a record on a slow connection had no room for go
 			// in the next, without waiting for it to fill.
-			left := len(l.small) > 0 || !gated && !held && len(l.data) > 0
+			left := len(l.small) > 0 || dataOK && len(l.data) > 0
 			more = split || left && limit < shape.MaxRecord
 		}
 		more = more || cut
@@ -1434,30 +1454,58 @@ func (l *Lane) writeLoop() error {
 		l.queuedA.Store(int64(l.queued))
 		l.mu.Unlock()
 
-		if reserve > 0 && (real > 0 || gated) {
-			// A gated record exists to carry a PING whose PONG will
-			// reopen the window.
-			buf, pinged = l.ping(buf, now, backlogged), true
-		}
 		// data is whether the record carries DATA: packets that begin in
 		// it, or the end of one that began in the last.
 		data := pkts > 0 || carried > 0
-		// A record that ends inside a packet is full, and is left as it
-		// is. Any other is padded.
-		if !cut && len(buf) < shape.MaxRecord {
-			mode := pl.Mode(queuedBefore, idle)
-			switch {
-			case gated, held, !data:
-				// Control frames with no DATA to ride with are padded
-				// as an interactive record is, whatever the lane is
-				// carrying. The few bytes a bulk record takes are for
-				// whole packets, whose size is no secret; they would
-				// leave a PONG's record or a RETIRE's just longer than
-				// the frame, and say which it was.
-				mode = shape.Interactive
-			case busy && !idle:
-				mode = shape.Bulk
+		mode := pl.Mode(queuedBefore, idle)
+		switch {
+		case gated, held, !data:
+			// Control frames with no DATA to ride with are padded as an
+			// interactive record is, whatever the lane is carrying. The
+			// few bytes a bulk record takes are for whole packets, whose
+			// size is no secret; they would leave a PONG's record or a
+			// RETIRE's just longer than the frame, and say which it was.
+			mode = shape.Interactive
+		case busy && !idle:
+			mode = shape.Bulk
+		}
+		// A bulk record that would end between packets ends inside its
+		// last one instead, and the rest of that packet opens the next
+		// record (see shape.Planner.Cut). Not while the opening's last
+		// record waits to follow, which cannot go between the parts of a
+		// packet, nor once the lane is closing.
+		var head int
+		if mode == shape.Bulk && !cut && lastAt >= 0 && !ackWaits && !closing && len(buf) < shape.MaxRecord {
+			if head = pl.Cut(len(buf) - lastAt); head > 0 {
+				frame = append(frame[:0], buf[lastAt:]...)
+				buf = buf[:lastAt]
+				carry = append(carry[:0], frame[head:]...)
+				// The rest goes at once, as it does after a full record:
+				// a packet half sent must not wait for a record to fill.
+				// It is not a backlog: a record that ran the queue dry
+				// still says the lane was given less than it could carry.
+				cut, tail, more = true, true, true
+				l.mu.Lock()
+				l.queued += len(carry)
+				l.queuedA.Store(int64(l.queued))
+				l.mu.Unlock()
 			}
+		}
+		if reserve > 0 && (real > 0 || gated) {
+			// A gated record exists to carry a PING whose PONG will
+			// reopen the window. A PING cannot follow part of a frame,
+			// so in a record that ends inside one it goes ahead of it.
+			buf, pinged = l.ping(buf, now, backlogged), true
+		}
+		if head > 0 {
+			buf = append(buf, frame[:head]...)
+		}
+		// A record that ends inside a packet is left as it is: it is full,
+		// or its length was drawn when it was cut. So is the one that
+		// finishes a packet a bulk record cut, if it holds nothing else
+		// of size: where the cut fell already decided its length. Any
+		// other is padded.
+		if !cut && len(buf) < shape.MaxRecord && !(tailRec && pkts == 0 && len(buf) >= shape.CutMin) {
 			buf = wire.AppendPadding(buf, pl.Padding(mode, len(buf)))
 		}
 		// Only this goroutine writes, so the totals after the write are

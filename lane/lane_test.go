@@ -407,7 +407,11 @@ func TestRecordShaping(t *testing.T) {
 		t.Fatalf("interactive record = %d, want [160, 192)", interactive)
 	}
 
-	// Bulk: a large backlog goes out in full, unpadded records.
+	// Bulk: a large backlog goes out in nearly full, unpadded records. This
+	// lane has no TCP_NOTSENT_LOWAT, so a record holds whole packets, and
+	// then ends inside the last of them; the next opens with the rest. So
+	// a record is short of full by less than two packets, but for the
+	// last two: the one the queue ran dry in, and the end of its packet.
 	l.mu.Lock() // hold the writer while the backlog builds
 	for range 40 {
 		l.data = append(l.data, make([]byte, 1420))
@@ -418,8 +422,8 @@ func TestRecordShaping(t *testing.T) {
 	l.signal(l.wake)
 	waitBytes(t, rc, 2000+interactive+40*1423)
 	sizes := rc.sizes()[2:]
-	for i, s := range sizes[:len(sizes)-1] {
-		if s > shape.MaxRecord || s < shape.MaxRecord-1423 {
+	for i, s := range sizes[:len(sizes)-2] {
+		if s > shape.MaxRecord || s < shape.MaxRecord-2*1423 {
 			t.Fatalf("bulk record %d = %d bytes", i, s)
 		}
 	}
