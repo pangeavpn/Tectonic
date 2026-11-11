@@ -147,8 +147,9 @@ type Pool struct {
 	lastLaneAt  time.Time
 	backoff     time.Duration
 	nextDial    time.Time
-	idleFor     time.Time // the activity mark idleClose was drawn for
-	idleClose   time.Duration
+	idleFor     time.Time     // the activity mark idleClose was drawn for
+	idleClose   time.Duration // how long after it the last lane closes
+	idleShrink  time.Duration // how long after the last real packet the pool shrinks to one lane
 	lastReopen  time.Time
 	dormantAt   time.Time
 	reopenAfter time.Duration
@@ -436,7 +437,26 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	}
 	if !p.idleFor.Equal(idleRef) {
 		p.idleFor = idleRef
-		p.idleClose = pl.IdleAfter() + pl.IdleClose()
+		hold := pl.IdleClose()
+		p.idleClose = pl.IdleAfter() + hold
+		if idleRef.Equal(lastActive) {
+			// Real traffic began this idle period, not a lane reopened
+			// for keepalives. Draw the moment in it at which the pool
+			// shrinks to one lane: anywhere between the tunnel going idle
+			// and its last lane closing. IdleAfter is fixed in a profile,
+			// so shrinking the instant the tunnel goes idle put a
+			// connection's close at the same offset from the last traffic
+			// in every session.
+			p.idleShrink = pl.IdleAfter() + time.Duration(p.rng.Float64()*float64(hold))
+		}
+	}
+	// wake is how long until the next of those moments, so that the pool
+	// acts at the moment drawn and not on its next tick after it: ticks
+	// keep time from the pool's last event, a lane's WELCOME say, and a
+	// close rounded to them sits on a half-second grid from it.
+	wake := p.idleShrink - now.Sub(lastActive)
+	if wake <= 0 {
+		wake = p.idleClose - now.Sub(idleRef)
 	}
 	active := now.Sub(lastActive) < pl.IdleAfter() || nPending > 0
 	live := 0
@@ -459,6 +479,11 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 			extra = p.thr.extra
 		}
 		target = min(baseLanes+extra, p.maxLanes)
+	case now.Sub(lastActive) < p.idleShrink:
+		// Idle, but not yet for as long as was drawn for this idle period:
+		// the pool keeps the lanes it has. It opens none, short of having
+		// no lane at all, and nothing else treats the tunnel as active.
+		target = max(1, min(live, baseLanes+p.thr.extra, p.maxLanes))
 	case now.Sub(idleRef) < p.idleClose:
 		target = 1 // idle: shrink to a single lane
 	default:
@@ -562,6 +587,9 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 
 	switch {
 	case len(p.lanes) > 0 || p.dialing > 0:
+		if wake > 0 {
+			return min(activeTick, max(time.Millisecond, wake))
+		}
 		return activeTick
 	case target > 0 || nPending > 0:
 		// Waiting out a dial backoff.
