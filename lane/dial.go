@@ -2,6 +2,7 @@ package lane
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/x509"
 	"encoding/binary"
 	"errors"
@@ -357,6 +358,11 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 // lane can resume TLS like a returning browser. uTLS leaves the extension out
 // when there is no ticket to resume, as Chrome does. With h2 false it offers
 // only HTTP/1.1, as Chrome does on a WebSocket connection.
+//
+// uTLS's Chrome 133 is a few releases behind the browser in one respect: its
+// signature_algorithms list. Chrome now opens that list with a GREASE value
+// and the three ML-DSA schemes (see chromeSigAlgs), which sets it apart from
+// every uTLS-based client by JA4 alone.
 func chromeSpec(h2 bool) (*utls.ClientHelloSpec, error) {
 	spec, err := utls.UTLSIdToSpec(utls.HelloChrome_133)
 	if err != nil {
@@ -365,6 +371,8 @@ func chromeSpec(h2 bool) (*utls.ClientHelloSpec, error) {
 	exts := spec.Extensions[:0]
 	for _, ext := range spec.Extensions {
 		switch e := ext.(type) {
+		case *utls.SignatureAlgorithmsExtension:
+			e.SupportedSignatureAlgorithms = chromeSigAlgs()
 		case *utls.ALPNExtension:
 			if !h2 {
 				e.AlpnProtocols = []string{"http/1.1"}
@@ -378,6 +386,45 @@ func chromeSpec(h2 bool) (*utls.ClientHelloSpec, error) {
 	}
 	spec.Extensions = append(exts, &utls.UtlsPreSharedKeyExtension{})
 	return &spec, nil
+}
+
+// ML-DSA signature schemes (draft-ietf-tls-mldsa). Chrome offers them; a
+// lane can't verify them, which does not matter, since a server signs with
+// the key its certificate holds, and no public certificate holds an ML-DSA
+// key yet.
+const (
+	sigMLDSA44 utls.SignatureScheme = 0x0904
+	sigMLDSA65 utls.SignatureScheme = 0x0905
+	sigMLDSA87 utls.SignatureScheme = 0x0906
+)
+
+// chromeSigAlgs is the signature_algorithms list Chrome sends (captured from
+// Brave 1.99 on Chromium 157): a GREASE value, the ML-DSA schemes, then the
+// eight that uTLS's Chrome 133 has. Chrome draws the GREASE value afresh for
+// every connection, separately from those in the rest of the ClientHello;
+// uTLS fills in the others but not this one, so it is drawn here.
+func chromeSigAlgs() []utls.SignatureScheme {
+	return []utls.SignatureScheme{
+		utls.SignatureScheme(greaseValue()),
+		sigMLDSA44, sigMLDSA65, sigMLDSA87,
+		utls.ECDSAWithP256AndSHA256,
+		utls.PSSWithSHA256,
+		utls.PKCS1WithSHA256,
+		utls.ECDSAWithP384AndSHA384,
+		utls.PSSWithSHA384,
+		utls.PKCS1WithSHA384,
+		utls.PSSWithSHA512,
+		utls.PKCS1WithSHA512,
+	}
+}
+
+// greaseValue draws one of the sixteen GREASE code points (RFC 8701),
+// 0x0a0a, 0x1a1a, ... 0xfafa.
+func greaseValue() uint16 {
+	var b [1]byte
+	rand.Read(b[:])
+	v := uint16(b[0]&0xf0 | 0x0a)
+	return v<<8 | v
 }
 
 // ResumedTLS reports whether a lane's TLS session was resumed. It is meant

@@ -347,7 +347,7 @@ The client switches carriers within the same session, and direct and CDN lanes c
 
 | Attack | Tectonic's answer | What's left |
 |---|---|---|
-| Passive DPI on the handshake | Chrome's ClientHello via uTLS. In Own mode, SNI, IP and certificate all agree. | uTLS has to keep up with Chrome releases |
+| Passive DPI on the handshake | Chrome's ClientHello via uTLS, brought up to date where uTLS lags: the `signature_algorithms` list opens with its own GREASE value and the three ML-DSA schemes, as Chrome's has since uTLS's last Chrome profile (133). Checked field by field against Brave 1.99 on Chromium 157. In Own mode, SNI, IP and certificate all agree. | uTLS has to keep up with Chrome releases, and so does `chromeSpec` |
 | Active probing | Every connection is the cover website's web server until a valid login takes it, so a probe gets what a Go web server gives anyone: `SETTINGS` first on HTTP/2, the site, the same timeouts and the same close | The cover site has to look real and maintained. The node must be built with Go 1.27 or newer for an exact match. What a probe sees is a Go web server, which is itself a recognisable kind |
 | Replaying a captured login | The login is bound to its TLS session's exporter, and checked against a timestamp window | None known |
 | Long-connection heuristics | Lane churn limits each connection's lifetime to minutes | A fast tunnel puts gigabytes on one connection, as a browser's download does. Several connections from one client to one server is itself a pattern, though browsers make more than one too |
