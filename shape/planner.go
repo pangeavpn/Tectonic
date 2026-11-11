@@ -3,6 +3,7 @@ package shape
 import (
 	crand "crypto/rand"
 	"math/rand/v2"
+	"sort"
 	"sync"
 	"time"
 
@@ -13,11 +14,14 @@ import (
 type Mode int
 
 const (
-	// Bulk packs frames into records of up to MaxRecord with no padding.
+	// Bulk fills records up to MaxRecord. One that is not full is padded
+	// by a few bytes, so that its length is not a whole number of packets.
 	Bulk Mode = iota
-	// Interactive rounds the record up to the next bucket.
+	// Interactive pads the record to a length drawn from the band above
+	// the one its content falls in.
 	Interactive
-	// Idle pads a keepalive-only record to one of the idle sizes.
+	// Idle pads a keepalive-only record to a length drawn from the idle
+	// sizes.
 	Idle
 )
 
@@ -71,31 +75,99 @@ func (pl *Planner) Mode(queued int, idle bool) Mode {
 }
 
 // Padding returns how many bytes of PAD frames to add to a record that holds
-// size bytes of frames. The result is always 0 or at least wire.HeaderLen.
+// size bytes of frames. The result is 0 or at least wire.HeaderLen, and
+// never takes the record past MaxRecord.
+//
+// An interactive record is padded to a length drawn evenly from the band
+// above its own (see Profile.Buckets). An idle one is padded to a length
+// drawn from the idle sizes (see Profile.IdleSizes), or as an interactive
+// one if it is larger than all of them.
+//
+// A bulk record is whole full-size packets, whose sizes are no secret; its
+// padding only has to take its length off the multiples of a packet's
+// size, and every byte of it is one the transfer has to wait for. So it is
+// not brought up to a bucket first: it takes a PAD frame with a body of
+// less than the width of the band above, drawn evenly.
+//
+// Whatever the mode, the record ends up holding at least MinRecord bytes.
 func (pl *Planner) Padding(mode Mode, size int) int {
 	switch mode {
+	case Bulk:
+		lo, n := pl.band(size)
+		if n > 1 {
+			lo = max(size+wire.HeaderLen, MinRecord)
+		}
+		return pl.padTo(size, lo, n)
 	case Interactive:
-		for _, b := range pl.p.Buckets {
-			if gap := b - size; gap >= 0 && wire.CanPad(gap) {
-				return gap
-			}
-		}
+		lo, n := pl.band(size)
+		return pl.padTo(size, lo, n)
 	case Idle:
-		pl.mu.Lock()
-		defer pl.mu.Unlock()
-		// Draw among the idle sizes that fit, so absorbed keepalives don't
-		// all come out the same size.
-		var fit []int
-		for _, s := range pl.p.IdleSizes {
-			if gap := s - size; gap >= 0 && wire.CanPad(gap) {
-				fit = append(fit, gap)
-			}
+		// The record with the header of its PAD frame, as in band.
+		s := pl.p.IdleSizes
+		i := sort.SearchInts(s, size+wire.HeaderLen)
+		if i == len(s) {
+			return pl.Padding(Interactive, size)
 		}
-		if len(fit) > 0 {
-			return fit[pl.rng.IntN(len(fit))]
+		// One of the ranges that start at or above it, then a length
+		// within that range.
+		lo, n := s[i], 1
+		if ranges := len(s) - 1 - i; ranges > 0 {
+			i += pl.intn(ranges)
+			lo, n = s[i], s[i+1]-s[i]
 		}
+		return pl.padTo(size, lo, n)
 	}
 	return 0
+}
+
+// band returns the lengths an interactive record that holds size bytes of
+// frames may be padded to: the n lengths from lo up.
+//
+// Padding is a PAD frame, which is at least its 3-byte header. The band a
+// record falls in is the one that holds it with that header, and it is
+// padded into the band above. So every size in a band is padded the same
+// way, by 3 bytes or more, and a padded length says which band the record
+// was in and nothing closer.
+func (pl *Planner) band(size int) (lo, n int) {
+	b := pl.p.Buckets
+	i := sort.SearchInts(b, size+wire.HeaderLen) // the bucket that ends its band
+	switch {
+	case i == len(b):
+		// Larger than every bucket: left as it is, unless it is smaller
+		// than any record should be.
+		if size >= MinRecord {
+			return size, 1
+		}
+		return max(size+wire.HeaderLen, MinRecord), 1
+	case i == len(b)-1:
+		lo, n = b[i], 1
+	default:
+		lo, n = b[i], b[i+1]-b[i]
+	}
+	if lo < MinRecord {
+		lo, n = MinRecord, max(lo+n-MinRecord, 1)
+	}
+	return lo, n
+}
+
+// padTo returns the padding that takes a record of size bytes to one of the
+// n lengths from lo up, each as likely as another.
+func (pl *Planner) padTo(size, lo, n int) int {
+	gap := lo - size
+	if n > 1 {
+		gap += pl.intn(n)
+	}
+	if !wire.CanPad(gap) || gap < 0 || size+gap > MaxRecord {
+		return 0
+	}
+	return gap
+}
+
+// cost is twice the padding an interactive record of size bytes takes on
+// average: what brings it up to its bucket, and half the band above.
+func (pl *Planner) cost(size int) int {
+	lo, n := pl.band(size)
+	return 2*(lo-size) + n - 1
 }
 
 const (
@@ -111,28 +183,28 @@ const (
 // Split reports how many of the frames waiting to be sent, of the given
 // sizes and in that order, should go in the next record, which already
 // holds base bytes. It is for interactive records, each of which is padded
-// up to a bucket: how the frames are divided between records then decides
-// how much padding they take. Three full-size packets in one record pad
-// from 4.4 KB to 6.1 KB; as two and then one they pad by 250 bytes in all,
-// and every record still comes out at a bucket's size.
+// up to its bucket and into the band above: how the frames are divided
+// between records then decides how much padding they take. Where the
+// buckets are far apart, a few frames that fall just past one together
+// may fall just short of others apart.
 //
-// Split picks the division that puts the fewest bytes on the wire,
-// counting splitCost for each record after the first, and returns how many
-// frames the first record takes. That is all of them when one record is
-// best, or when there are more than MaxSplit.
+// Split picks the division that puts the fewest bytes on the wire on
+// average, counting splitCost for each record after the first, and returns
+// how many frames the first record takes. That is all of them when one
+// record is best, or when there are more than MaxSplit.
 func (pl *Planner) Split(base int, sizes []int) int {
 	n := len(sizes)
 	if n <= 1 || n > MaxSplit {
 		return n
 	}
 	// rest[i] is the least it costs to send frames i onwards in records of
-	// their own.
+	// their own. Costs are doubled throughout, as cost's are.
 	var rest [MaxSplit + 1]int
 	for i := n - 1; i >= 0; i-- {
 		best, sum := -1, 0
 		for j := i; j < n; j++ {
 			sum += sizes[j]
-			if c := splitCost + pl.Padding(Interactive, sum) + rest[j+1]; best < 0 || c < best {
+			if c := 2*splitCost + pl.cost(sum) + rest[j+1]; best < 0 || c < best {
 				best = c
 			}
 		}
@@ -142,7 +214,7 @@ func (pl *Planner) Split(base int, sizes []int) int {
 	for j := range n {
 		sum += sizes[j]
 		// On a tie the later division wins: fewer records.
-		if c := pl.Padding(Interactive, sum) + rest[j+1]; best < 0 || c <= best {
+		if c := pl.cost(sum) + rest[j+1]; best < 0 || c <= best {
 			best, take = c, j+1
 		}
 	}
@@ -160,6 +232,12 @@ func (pl *Planner) IdleClose() time.Duration { return pl.durationIn(pl.p.IdleClo
 
 // IdleReopen draws how long held keepalives wait for a fresh lane.
 func (pl *Planner) IdleReopen() time.Duration { return pl.durationIn(pl.p.IdleReopen) }
+
+func (pl *Planner) intn(n int) int {
+	pl.mu.Lock()
+	defer pl.mu.Unlock()
+	return pl.rng.IntN(n)
+}
 
 func (pl *Planner) intIn(r IntRange) int {
 	if r.Max <= r.Min {

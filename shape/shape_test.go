@@ -89,49 +89,65 @@ func TestSet(t *testing.T) {
 
 func TestInteractivePadding(t *testing.T) {
 	pl := NewPlanner(nil)
+	buckets := pl.Profile().Buckets
 	for size := 1; size <= MaxRecord; size++ {
 		pad := pl.Padding(Interactive, size)
 		if !wire.CanPad(pad) {
 			t.Fatalf("size %d: padding %d can't be expressed", size, pad)
 		}
 		total := size + pad
-		found := false
-		for _, b := range pl.Profile().Buckets {
-			if b == total {
-				found = true
+		if total < MinRecord || total > MaxRecord {
+			t.Fatalf("size %d padded to %d", size, total)
+		}
+		// With the header of its PAD frame the record falls in one band,
+		// and it ends up in the band above: at least the bucket that ends
+		// its own, and less than the next.
+		i, _ := slices.BinarySearch(buckets, size+wire.HeaderLen)
+		if i == len(buckets) {
+			if pad != 0 {
+				t.Fatalf("size %d, with no room for a PAD frame, padded by %d", size, pad)
 			}
+			continue
 		}
-		if !found && pad != 0 {
-			t.Fatalf("size %d padded to %d, not a bucket", size, total)
+		lo, hi := buckets[i], MaxRecord+1
+		if i+1 < len(buckets) {
+			hi = buckets[i+1]
 		}
-		if found {
-			// It must be the smallest usable bucket.
-			for _, b := range pl.Profile().Buckets {
-				if b >= size && b < total && wire.CanPad(b-size) {
-					t.Fatalf("size %d padded to %d but bucket %d fits", size, total, b)
-				}
-			}
+		if total < lo || total >= hi {
+			t.Fatalf("size %d padded to %d, outside [%d, %d)", size, total, lo, hi)
 		}
 	}
-	// A WireGuard keepalive frame (35 bytes) lands in the 64 bucket, a
-	// handshake initiation (151) in 192.
-	if got := 35 + pl.Padding(Interactive, 35); got != 64 {
-		t.Fatalf("keepalive record = %d", got)
+	// A WireGuard keepalive frame (35 bytes) lands in [48, 64), a
+	// handshake initiation (151) in [160, 176).
+	for range 200 {
+		if got := 35 + pl.Padding(Interactive, 35); got < 48 || got >= 64 {
+			t.Fatalf("keepalive record = %d", got)
+		}
+		if got := 151 + pl.Padding(Interactive, 151); got < 160 || got >= 176 {
+			t.Fatalf("initiation record = %d", got)
+		}
 	}
-	if got := 151 + pl.Padding(Interactive, 151); got != 192 {
-		t.Fatalf("initiation record = %d", got)
-	}
-	// Sizes 1 and 2 short of a bucket skip to the next one.
-	if got := 62 + pl.Padding(Interactive, 62); got != 128 {
-		t.Fatalf("62 → %d, want 128", got)
-	}
-	if pl.Padding(Bulk, 100) != 0 {
-		t.Fatal("bulk records must not be padded")
+	// A size just short of a bucket has no room for a PAD frame under it,
+	// and is padded as the band above is.
+	for range 200 {
+		if got := 62 + pl.Padding(Interactive, 62); got < 80 || got >= 96 {
+			t.Fatalf("a record of 62 bytes padded to %d, want [80, 96)", got)
+		}
 	}
 }
 
+// coarse is a profile whose buckets are far apart, as the built-in ones
+// used to be, so that how frames are divided between records matters.
+func coarse() *Profile {
+	p := Default()
+	p.Buckets = []int{
+		64, 128, 192, 256, 384, 512, 768, 1024, 1536,
+		2048, 3072, 4096, 6144, 8192, 12288, MaxRecord,
+	}
+	return p
+}
+
 func TestSplitDividesFramesToFitBuckets(t *testing.T) {
-	pl := NewPlanner(nil)
 	const pkt = 1455 // a full-size WireGuard packet in its DATA frame
 	full := func(n int) []int {
 		s := make([]int, n)
@@ -140,9 +156,9 @@ func TestSplitDividesFramesToFitBuckets(t *testing.T) {
 		}
 		return s
 	}
-	// records sends frames the way a lane would, and returns each record's
-	// size on the wire and the padding in all.
-	records := func(base int, sizes []int) (out []int, pad int) {
+	// divide sends frames the way a lane would, and returns how many go
+	// in each record and twice the padding they take on average.
+	divide := func(pl *Planner, base int, sizes []int) (out []int, cost int) {
 		for len(sizes) > 0 {
 			k := pl.Split(base, sizes)
 			if k < 1 || k > len(sizes) {
@@ -152,57 +168,61 @@ func TestSplitDividesFramesToFitBuckets(t *testing.T) {
 			for _, s := range sizes[:k] {
 				size += s
 			}
-			p := pl.Padding(Interactive, size)
-			out, pad = append(out, size+p), pad+p
+			out, cost = append(out, k), cost+pl.cost(size)
 			sizes, base = sizes[k:], 0
 		}
-		return out, pad
+		return out, cost
 	}
+	pl := NewPlanner(coarse())
 	for _, tc := range []struct {
 		n    int
 		want []int
 	}{
-		{1, []int{1536}},
-		{2, []int{3072}},
-		// Three in one record would pad to 6144, wasting 1779 bytes.
-		{3, []int{3072, 1536}},
-		{4, []int{6144}},
-		// Five in one would pad to 8192, wasting 917.
-		{5, []int{6144, 1536}},
+		{1, []int{1}},
+		{2, []int{2}},
+		// Three in one record come up to 6144 and into the band above
+		// it, 2.8 KB of padding on average; as two and one they take 1 KB.
+		{3, []int{2, 1}},
+		{4, []int{4}},
+		{5, []int{4, 1}},
 	} {
-		got, _ := records(0, full(tc.n))
+		got, _ := divide(pl, 0, full(tc.n))
 		if !slices.Equal(got, tc.want) {
-			t.Errorf("%d full packets go out as %v, want %v", tc.n, got, tc.want)
+			t.Errorf("%d full packets go out as %v to a record, want %v", tc.n, got, tc.want)
 		}
 	}
 	// However the frames fall, dividing them never costs more than sending
-	// them in one record, and every record is a bucket's size.
+	// them in one record: with buckets far apart, and with the built-in
+	// ones, which are close enough that one record is nearly always best.
 	rng := rand.New(rand.NewPCG(1, 2))
-	for range 2000 {
-		n := 1 + rng.IntN(MaxSplit)
-		sizes := make([]int, n)
-		sum := 0
-		for i := range sizes {
-			sizes[i] = 35 + rng.IntN(1421)
-			if sum+sizes[i] >= pl.Profile().BulkThreshold {
-				sizes = sizes[:i]
-				break
+	for _, pl := range []*Planner{pl, NewPlanner(nil)} {
+		divided := 0
+		for range 2000 {
+			n := 1 + rng.IntN(MaxSplit)
+			sizes := make([]int, n)
+			sum := 0
+			for i := range sizes {
+				sizes[i] = 35 + rng.IntN(1421)
+				if sum+sizes[i] >= pl.Profile().BulkThreshold {
+					sizes = sizes[:i]
+					break
+				}
+				sum += sizes[i]
 			}
-			sum += sizes[i]
-		}
-		if len(sizes) == 0 {
-			continue
-		}
-		base := rng.IntN(2) * 11 // sometimes a PONG goes first
-		got, pad := records(base, sizes)
-		one := pl.Padding(Interactive, base+sum)
-		if cost := pad + (len(got)-1)*splitCost; cost > one {
-			t.Fatalf("%v after %d: divided as %v costing %d, but one record costs %d", sizes, base, got, cost, one)
-		}
-		for _, r := range got {
-			if !slices.Contains(pl.Profile().Buckets, r) {
-				t.Fatalf("%v after %d: record of %d bytes is not a bucket", sizes, base, r)
+			if len(sizes) == 0 {
+				continue
 			}
+			base := rng.IntN(2) * 11 // sometimes a PONG goes first
+			got, cost := divide(pl, base, sizes)
+			if len(got) > 1 {
+				divided++
+			}
+			if one := pl.cost(base + sum); cost+2*splitCost*(len(got)-1) > one {
+				t.Fatalf("%v after %d: divided as %v costing %d, but one record costs %d", sizes, base, got, cost/2, one/2)
+			}
+		}
+		if far := len(pl.Profile().Buckets) < 100; far && divided == 0 {
+			t.Error("with buckets far apart, no run of frames was divided")
 		}
 	}
 	// Too many frames to weigh, or just one: all in one record.
@@ -216,8 +236,9 @@ func TestSplitDividesFramesToFitBuckets(t *testing.T) {
 
 func TestIdlePadding(t *testing.T) {
 	pl := NewPlanner(nil)
+	sizes := pl.Profile().IdleSizes
 	seen := map[int]bool{}
-	for range 500 {
+	for range 2000 {
 		pad := pl.Padding(Idle, 35)
 		if !wire.CanPad(pad) {
 			t.Fatalf("idle padding %d", pad)
@@ -225,19 +246,26 @@ func TestIdlePadding(t *testing.T) {
 		seen[35+pad] = true
 	}
 	for s := range seen {
-		ok := false
-		for _, want := range pl.Profile().IdleSizes {
-			ok = ok || s == want
-		}
-		if !ok {
-			t.Fatalf("idle record size %d not in idle_sizes", s)
+		if s < sizes[0] || s >= sizes[len(sizes)-1] {
+			t.Fatalf("idle record size %d outside the idle sizes %v", s, sizes)
 		}
 	}
-	if len(seen) < 3 {
-		t.Fatalf("idle sizes don't vary: %v", seen)
+	if len(seen) < 40 {
+		t.Fatalf("idle sizes don't vary: %d of them", len(seen))
 	}
-	if pl.Padding(Idle, 5000) != 0 {
-		t.Fatal("a record bigger than every idle size gets no padding")
+	// Two keepalives together start no lower than the next idle size up.
+	for range 200 {
+		if got := 70 + pl.Padding(Idle, 70); got < 80 || got >= 128 {
+			t.Fatalf("two keepalives padded to %d", got)
+		}
+	}
+	// One that only the largest idle size holds is padded to that.
+	if got := 100 + pl.Padding(Idle, 100); got != 128 {
+		t.Fatalf("a record of 100 bytes padded to %d, want the largest idle size", got)
+	}
+	// A record bigger than every idle size is padded as an interactive one.
+	if got := 5000 + pl.Padding(Idle, 5000); got < 5024 || got >= 5056 {
+		t.Fatalf("a record bigger than every idle size padded to %d", got)
 	}
 }
 

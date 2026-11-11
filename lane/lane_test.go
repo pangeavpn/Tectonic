@@ -398,11 +398,13 @@ func TestRecordShaping(t *testing.T) {
 		t.Fatalf("first flight sizes %v, want [2000]", got)
 	}
 
-	// Interactive: a handshake-sized record rounds up to a bucket.
+	// Interactive: a handshake-sized record is padded into the band above
+	// its own, [160, 176), or the next one up if a PING rides with it.
 	l.Send(wgInitiation())
 	waitWrites(t, rc, 2)
-	if got := rc.sizes()[1]; got != 192 {
-		t.Fatalf("interactive record = %d, want 192", got)
+	interactive := rc.sizes()[1]
+	if interactive < 160 || interactive >= 192 {
+		t.Fatalf("interactive record = %d, want [160, 192)", interactive)
 	}
 
 	// Bulk: a large backlog goes out in full, unpadded records.
@@ -414,7 +416,7 @@ func TestRecordShaping(t *testing.T) {
 	}
 	l.mu.Unlock()
 	l.signal(l.wake)
-	waitBytes(t, rc, 2000+192+40*1423)
+	waitBytes(t, rc, 2000+interactive+40*1423)
 	sizes := rc.sizes()[2:]
 	for i, s := range sizes[:len(sizes)-1] {
 		if s > shape.MaxRecord || s < shape.MaxRecord-1423 {
@@ -440,9 +442,10 @@ func TestRecordWaitsAMomentToFill(t *testing.T) {
 	l.Send(wgInitiation())
 	waitWrites(t, rc, 2)
 	time.Sleep(20 * time.Millisecond)
-	// Two 151-byte frames, with or without a PING, round up to 384.
-	if got := rc.sizes()[1:]; len(got) != 1 || got[0] != 384 {
-		t.Fatalf("records %v, want one of 384 bytes", got)
+	// Two 151-byte frames, with or without a PING, are padded into the
+	// band above theirs.
+	if got := rc.sizes()[1:]; len(got) != 1 || got[0] < 320 || got[0] >= 352 {
+		t.Fatalf("records %v, want one of [320, 352) bytes", got)
 	}
 	// A packet on its own still goes within the flush delay.
 	start := time.Now()
@@ -456,13 +459,20 @@ func TestRecordWaitsAMomentToFill(t *testing.T) {
 func TestInteractiveRecordsAreDividedToFitBuckets(t *testing.T) {
 	prof := shape.Default()
 	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}
+	// Buckets far apart, so that how packets are divided matters. With
+	// the built-in ones, close together, one record is best.
+	prof.Buckets = []int{
+		64, 128, 192, 256, 384, 512, 768, 1024, 1536,
+		2048, 3072, 4096, 6144, 8192, 12288, shape.MaxRecord,
+	}
 	l, rc := pipeLane(t, prof)
 	if err := l.Start(nil); err != nil {
 		t.Fatal(err)
 	}
 	// Three full-size packets in one record would be padded from 4.4 KB to
-	// the 6144 bucket. Two and then one pad to 3072 and 1536, and both
-	// records go out without waiting on each other.
+	// the 6144 bucket and into the band above it. Two and then one are
+	// padded past 3072 and 1536, and both records go out without waiting
+	// on each other.
 	l.mu.Lock() // hold the writer while the packets queue
 	for range 3 {
 		l.data = append(l.data, make([]byte, 1452))
@@ -473,8 +483,8 @@ func TestInteractiveRecordsAreDividedToFitBuckets(t *testing.T) {
 	l.signal(l.wake)
 	waitWrites(t, rc, 3)
 	time.Sleep(20 * time.Millisecond)
-	if got := rc.sizes()[1:]; len(got) != 2 || got[0] != 3072 || got[1] != 1536 {
-		t.Fatalf("records %v, want [3072 1536]", got)
+	if got := rc.sizes()[1:]; len(got) != 2 || got[0] < 3072 || got[0] >= 4096 || got[1] < 1536 || got[1] >= 2048 {
+		t.Fatalf("records %v, want one of [3072, 4096) and one of [1536, 2048)", got)
 	}
 }
 
@@ -499,12 +509,8 @@ func TestIdleKeepalivesAreDelayedAndPadded(t *testing.T) {
 	if d := sent.Sub(start); d < 140*time.Millisecond {
 		t.Fatalf("keepalive went out after %v, want the 150ms idle delay", d)
 	}
-	ok := false
-	for _, s := range prof.IdleSizes {
-		ok = ok || s == size
-	}
-	if !ok {
-		t.Fatalf("idle keepalive record = %d bytes, not an idle size", size)
+	if size < prof.IdleSizes[0] || size >= prof.IdleSizes[len(prof.IdleSizes)-1] {
+		t.Fatalf("idle keepalive record = %d bytes, outside the idle sizes %v", size, prof.IdleSizes)
 	}
 
 	// Real traffic is never delayed.

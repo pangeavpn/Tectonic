@@ -167,7 +167,8 @@ const (
 
 	// A lane that wrote at least busyBytes in the last busyWindow is in a
 	// bulk transfer: its records are packed up to 16 KB, waiting up to
-	// coalesceDelay for one to fill, and never padded (design §8).
+	// coalesceDelay for one to fill, and one that is not full takes only a
+	// few bytes of padding (design §8).
 	busyWindow    = 10 * time.Millisecond
 	busyBytes     = 16 << 10
 	coalesceDelay = 2 * time.Millisecond

@@ -5,11 +5,14 @@
 // data. Shaping changes only what an observer can measure from outside: TLS
 // record sizes and their timing (design §8).
 //
-//	Bulk transfer  records packed up to 16 KB, no padding
-//	Interactive    record sizes rounded up to the profile's buckets
+//	Bulk transfer  records filled to 16 KB, a frame running on into the next;
+//	               one that is not full padded by a few bytes
+//	Interactive    each record padded to a length drawn from the band above
+//	               the one its content falls in, between the profile's buckets
 //	Lane start     the first records each way sized like Chrome loading a page over HTTP/2
-//	Idle           keepalives delayed and padded like browser idle traffic; the
-//	               lane closes after a while and a fresh one opens later
+//	Idle           keepalives delayed and padded to a length drawn from the
+//	               profile's idle sizes; the lane closes after a while and a
+//	               fresh one opens later
 //
 // Profiles are data, not code. WELCOME names the profile the session uses by
 // ID, so new profiles can be rolled out from the hub without a protocol
@@ -27,6 +30,10 @@ import (
 // MaxRecord is the largest TLS record payload (2^14 bytes), which is also the
 // most the shaper puts in one record.
 const MaxRecord = 16384
+
+// MinRecord is the least a padded record holds: an HTTP/2 frame header, the
+// smallest thing a browser's connection ever sends in a record.
+const MinRecord = 9
 
 // DefaultID is the ID of the built-in profile. A client that doesn't know the
 // profile a WELCOME names falls back to it.
@@ -63,13 +70,21 @@ type Profile struct {
 	// zero range means none.
 	ClientAck IntRange `json:"client_ack"`
 
-	// Interactive: a record's size is rounded up to the next bucket.
-	// Ascending, each at most MaxRecord.
+	// Interactive: the buckets divide record sizes into bands, each
+	// running from just above one bucket up to the next. A record is padded
+	// with a PAD frame, whose header is 3 bytes. With that header it falls
+	// in one band, and the PAD frame's body brings it to a length drawn
+	// evenly from the band above: at least the next bucket and less than
+	// the one after. Its length then says which band the record was in and
+	// nothing closer, and no length is more likely than its neighbours. A
+	// record in the last band is padded to the last bucket; one larger
+	// than that is not padded. Ascending, each at most MaxRecord.
 	Buckets []int `json:"buckets"`
 
-	// Bulk: when at least this many bytes are waiting, records are packed
-	// up to MaxRecord and not padded, because a download already looks like
-	// a download.
+	// Bulk: when at least this many bytes are waiting, the lane is carrying
+	// a transfer. Its records are filled, one that is not full is padded
+	// by a few bytes and not up to a bucket, and the packets waiting are
+	// not weighed for dividing between records (see Planner.Split).
 	BulkThreshold int `json:"bulk_threshold"`
 
 	// Idle: the tunnel is idle once nothing but WireGuard keepalives has
@@ -84,8 +99,10 @@ type Profile struct {
 	// KeepaliveDelay is the random delay added to keepalives on an idle
 	// lane, so they don't tick on WireGuard's fixed timer.
 	KeepaliveDelay DurationRange `json:"keepalive_delay"`
-	// IdleSizes are the record sizes for keepalive-only records on an idle
-	// lane; one at least as large as the content is drawn at random.
+	// IdleSizes shape the keepalive-only records of an idle lane. Each
+	// size and the next bound a range; a record is padded to a length
+	// drawn evenly from one of the ranges that start at or above it, each
+	// range as likely as another. Ascending, each at most MaxRecord.
 	IdleSizes []int `json:"idle_sizes"`
 }
 
@@ -139,10 +156,8 @@ func Default() *Profile {
 		// A server's reply: SETTINGS ACK with WINDOW_UPDATE, the response
 		// HEADERS, and the start of the page.
 		ServerFirstFlight: []IntRange{{Min: 22, Max: 22}, {Min: 91, Max: 92}, {Min: 1090, Max: 4090}},
-		Buckets: []int{
-			64, 128, 192, 256, 384, 512, 768, 1024, 1536,
-			2048, 3072, 4096, 6144, 8192, 12288, MaxRecord,
-		},
+
+		Buckets:        defaultBuckets(),
 		BulkThreshold:  8192,
 		IdleAfter:      Duration(20 * time.Second),
 		IdleClose:      DurationRange{Min: Duration(45 * time.Second), Max: Duration(120 * time.Second)},
@@ -150,6 +165,29 @@ func Default() *Profile {
 		KeepaliveDelay: DurationRange{Min: 0, Max: Duration(2 * time.Second)},
 		IdleSizes:      []int{48, 64, 80, 96, 128},
 	}
+}
+
+// defaultBuckets are the built-in profile's buckets: 16 bytes apart up to
+// 256, and 32 apart from there to a full record.
+//
+// WireGuard's packets come in sizes 16 bytes apart, with its handshake
+// messages in between, so a band 16 bytes wide that holds a handshake also
+// holds a data packet. Larger records are full-size packets, alone or
+// several together, whose sizes need no hiding. There the band has only to
+// be wide enough that record lengths do not fall on multiples of a
+// packet's size, and narrow enough to cost little: a record takes about a
+// band's width of padding on average, which is 2% of one full-size packet
+// and 0.3% of a record of eight.
+func defaultBuckets() []int {
+	var b []int
+	size := 0
+	for _, s := range []struct{ upTo, step int }{{256, 16}, {MaxRecord, 32}} {
+		for size < s.upTo {
+			size += s.step
+			b = append(b, size)
+		}
+	}
+	return b
 }
 
 // Parse decodes and validates a JSON profile.
