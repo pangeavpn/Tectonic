@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/big"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -93,6 +94,7 @@ func serve(args []string) error {
 	keyFile := fs.String("key", "", "key for -cert (PEM)")
 	defCert := fs.String("default-cert", "default.crt", "default certificate for other names, created if missing")
 	defKey := fs.String("default-key", "default.key", "key for -default-cert, created if missing")
+	defName := fs.String("default-cert-name", defaultCertName, "name to put in the default certificate when it is created; an existing one is left as it is")
 	coverDir := fs.String("cover-dir", "", "serve the cover website from this directory")
 	coverProxy := fs.String("cover-proxy", "", "or proxy the cover website to this URL")
 	wg := fs.String("wireguard", "127.0.0.1:51820", "the node's WireGuard UDP address")
@@ -118,12 +120,19 @@ func serve(args []string) error {
 		return fmt.Errorf("node secret: %w", err)
 	}
 
-	def := &certFiles{cert: *defCert, key: *defKey}
+	def := &certFiles{cert: *defCert, key: *defKey, name: *defName}
 	if err := ensureDefaultCert(def, log); err != nil {
 		return err
 	}
 	if err := def.reload(); err != nil {
 		return fmt.Errorf("default certificate: %w", err)
+	}
+	if host, _ := os.Hostname(); def.names(host) {
+		// It was made before the name could be chosen, and is left alone
+		// because clients pin it.
+		log.Warn("the default certificate names this machine, and it is shown to anyone who connects without the cover name; "+
+			"remove both files to have one made under a neutral name, which has a new pin for the hub",
+			"cert", def.cert, "key", def.key, "name", host)
 	}
 	var own *certFiles
 	if *certFile != "" || *keyFile != "" {
@@ -268,7 +277,10 @@ func readSecret(path string) ([]byte, error) {
 // server runs.
 type certFiles struct {
 	cert, key string
-	cur       atomic.Pointer[tls.Certificate]
+	// name is what ensureDefaultCert calls a certificate it creates. Empty
+	// means defaultCertName.
+	name string
+	cur  atomic.Pointer[tls.Certificate]
 }
 
 func (c *certFiles) reload() error {
@@ -300,9 +312,35 @@ func (c *certFiles) pin() string {
 	return lane.PinOf(tc.Leaf).String()
 }
 
+// names reports whether the loaded certificate carries host as its subject
+// or one of its DNS names.
+func (c *certFiles) names(host string) bool {
+	tc := c.cur.Load()
+	if host == "" || tc == nil || tc.Leaf == nil {
+		return false
+	}
+	if strings.EqualFold(tc.Leaf.Subject.CommonName, host) {
+		return true
+	}
+	for _, n := range tc.Leaf.DNSNames {
+		if strings.EqualFold(n, host) {
+			return true
+		}
+	}
+	return false
+}
+
+// defaultCertName is what a default certificate is called unless
+// -default-cert-name says otherwise. The certificate goes to anyone who
+// connects without the cover name, so its name must say nothing about the
+// machine, and must not tell one node from another. "localhost" is among
+// the commonest names on the self-signed certificates of web servers that
+// nobody has configured.
+const defaultCertName = "localhost"
+
 // ensureDefaultCert creates a self-signed default certificate if the files
-// don't exist, named after the host the way a stock web server's is. Its
-// pin must stay stable, because clients pin it.
+// don't exist, called c.name. A certificate that exists is left as it is,
+// whatever it is called: clients pin it.
 func ensureDefaultCert(c *certFiles, log *slog.Logger) error {
 	_, errC := os.Stat(c.cert)
 	_, errK := os.Stat(c.key)
@@ -321,20 +359,25 @@ func ensureDefaultCert(c *certFiles, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	host, _ := os.Hostname()
-	if host == "" {
-		host = "localhost"
+	// Not the machine's hostname: every prober would be told it.
+	name := c.name
+	if name == "" {
+		name = defaultCertName
 	}
 	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 127))
 	tmpl := &x509.Certificate{
 		SerialNumber:          serial,
-		Subject:               pkix.Name{CommonName: host},
-		DNSNames:              []string{host},
+		Subject:               pkix.Name{CommonName: name},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().AddDate(10, 0, 0),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(name); ip != nil {
+		tmpl.IPAddresses = []net.IP{ip}
+	} else {
+		tmpl.DNSNames = []string{name}
 	}
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
 	if err != nil {
@@ -351,7 +394,7 @@ func ensureDefaultCert(c *certFiles, log *slog.Logger) error {
 		return err
 	}
 	leaf, _ := x509.ParseCertificate(der)
-	log.Info("created a default certificate; give its pin to the hub", "cert", c.cert, "pin", lane.PinOf(leaf).String())
+	log.Info("created a default certificate; give its pin to the hub", "cert", c.cert, "name", name, "pin", lane.PinOf(leaf).String())
 	return nil
 }
 
