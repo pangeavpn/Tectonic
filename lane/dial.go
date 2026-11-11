@@ -112,8 +112,8 @@ type DialConfig struct {
 	// Now is the clock for HELLO's timestamp; nil means time.Now.
 	Now func() time.Time
 
-	// FirstPacket, if set, rides in the same record as HELLO, so the first
-	// WireGuard packet reaches the node within two round trips.
+	// FirstPacket, if set, follows HELLO in the lane's opening records, so
+	// the first WireGuard packet reaches the node within two round trips.
 	FirstPacket []byte
 	// TakeFirstPacket, if FirstPacket is nil, is called the moment TLS
 	// completes, so a packet that arrived during the handshake still makes
@@ -128,10 +128,10 @@ type DialConfig struct {
 var ErrNotTLS13 = errors.New("lane: server did not negotiate TLS 1.3")
 
 // Dial opens a client lane: TCP, a Chrome ClientHello, the TLS 1.3
-// handshake, and then HELLO and the first WireGuard packet in one write. It
-// returns as soon as that first flight is written, without waiting for
-// WELCOME; Welcomed reports the server's answer, and a lane whose login
-// fails ends with ErrLoginFailed.
+// handshake, and then HELLO and the first WireGuard packet in the records
+// a lane opens with (see Lane.Start). It returns as soon as that first
+// flight is written, without waiting for WELCOME; Welcomed reports the
+// server's answer, and a lane whose login fails ends with ErrLoginFailed.
 func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 	if cfg.Carrier == Direct && (cfg.SNIMode < SNIOwn || cfg.SNIMode > SNINone) {
 		return nil, fmt.Errorf("lane: SNI mode %d", cfg.SNIMode)

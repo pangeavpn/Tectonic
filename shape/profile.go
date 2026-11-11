@@ -88,10 +88,10 @@ type Profile struct {
 	BulkThreshold int `json:"bulk_threshold"`
 
 	// Idle: the tunnel is idle once nothing but WireGuard keepalives has
-	// moved for IdleAfter. The pool then shrinks to one lane, which closes
-	// after IdleClose more. With no lane open, held keepalives wait
-	// IdleReopen before a fresh lane carries them; any other traffic opens a
-	// lane at once.
+	// moved for IdleAfter. The last lane closes IdleClose after that, and
+	// the pool shrinks to one lane at a moment drawn between the two. With
+	// no lane open, held keepalives wait IdleReopen before a fresh lane
+	// carries them; any other traffic opens a lane at once.
 	IdleAfter  Duration      `json:"idle_after"`
 	IdleClose  DurationRange `json:"idle_close"`
 	IdleReopen DurationRange `json:"idle_reopen"`

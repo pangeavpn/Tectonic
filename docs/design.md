@@ -80,11 +80,11 @@ Most of these ideas exist somewhere in some form. What's new is combining them, 
 |---|---|---|
 | 01 | **Unordered lanes** | WireGuard packets are spread across several TLS lanes, with no order shared between them. The receiver merges them back into WireGuard's own order, waiting for a late packet while its lane's TCP recovers. Each lane has its own congestion window, so on a lossy path the lanes together carry more than one connection would. |
 | 02 | **Free deduplication** | WireGuard's anti-replay window already drops duplicate packets. That lets us send a small, urgent packet on two lanes without any bookkeeping on the receiving end. |
-| 03 | **Lane churn** | Each lane lives from tens of seconds to a few minutes, and a replacement opens before the old one closes, the way a browser cycles connections. No single connection runs for hours or carries gigabytes. |
+| 03 | **Lane churn** | Each lane lives from tens of seconds to a few minutes, and a replacement opens before the old one closes, the way a browser cycles connections. No single connection runs for hours, and how often lanes turn over is set by time, never by how fast the tunnel runs. |
 | 04 | **Throttle detection** | If adding a lane raises total throughput while each lane stays capped, the network is throttling per connection. Tectonic responds by adding lanes, up to a limit. |
 | 05 | **Our own identity** | By default each node serves a real website on a domain we own, with a real certificate. SNI, IP address and certificate all agree. |
 | 06 | **Channel-bound login** | The login is tied to its TLS session through a TLS exporter, so a captured login doesn't work on any other connection. A probe that fails it is served the website. |
-| 07 | **Shaping budget** | Padding is added only when the real traffic would give WireGuard away: handshakes, keepalives and idle periods. A large download already looks like a download, so it gets no padding. |
+| 07 | **Shaping budget** | Padding goes where the real traffic would give WireGuard away: handshakes, keepalives, idle periods and small packets. A large download already looks like a download, so its records are filled the way a download's are and take almost none. |
 | 08 | **Sessions outlive connections** | A session belongs to the device, not to a TCP connection. Every lane can drop during a network change, and the new lanes rejoin the same session. |
 | 09 | **Any SNI, or none** | The login happens inside TLS, so the server accepts whatever name the network allows, or no name at all. |
 
@@ -112,14 +112,14 @@ From the daemon's point of view, Tectonic is one more transport. It brings up a 
 
 1. **Provisioning.** When the user connects, the hub returns a `tectonic` profile block containing the node address, a cover domain, a `key_id` and a `device_key`, plus an optional CDN route.
 2. **First lane.** The client opens TCP to the node and starts a TLS 1.3 handshake with Chrome's ClientHello (via uTLS), offering ALPN `h2`. The SNI depends on the [SNI mode](#9-sni-modes).
-3. **Login in the first flight.** As soon as the TLS handshake completes, the client sends `HELLO`, padded to the size of Chrome's first HTTP/2 flight, without waiting for a reply. The first WireGuard packet goes out in the same write.
-4. **The server decides.** The server buffers the client's first flight and checks the `HELLO`. If it passes, the server replies `WELCOME` and the lane carries tunnel traffic. If it fails, the buffered bytes go to the cover website's HTTP server, which answers as it would answer any visitor.
+3. **Login in the first flight.** As soon as the TLS handshake completes, the client sends `HELLO` and the first WireGuard packet without waiting for a reply, in the two records Chrome opens HTTP/2 with: one of 87 bytes on the wire, then one the size of a first request. `HELLO` begins the first record and ends in the second.
+4. **The server decides.** Every connection belongs to the cover website's web server from the moment it is accepted. The web server runs the TLS handshake and, on HTTP/2, sends its `SETTINGS` frame at once, as it does for any visitor. The node looks for a `HELLO` in the first record the web server reads. A valid one takes the connection for a lane: the server replies `WELCOME` in records sized like the start of a page, and the lane carries tunnel traffic. Anything else stays with the web server, which answers as it would answer any visitor.
 5. **More lanes.** A second lane opens straight away using TLS session resumption, the way a returning browser reconnects, and joins the same session.
 6. **Steady state.** Lanes are retired and replaced on a browser-like schedule, and the pool grows if per-connection throttling is detected.
 7. **Network change.** If every lane dies, the client reconnects with the same `session_id` within the resume window (60 s by default). WireGuard's session carries on without noticing.
 
 > [!TIP]
-> **Time to first packet** is one TCP round trip plus one TLS 1.3 round trip. Logging in adds nothing, because the client doesn't wait for `WELCOME` before it starts sending.
+> **Time to first packet** is one TCP round trip plus one TLS 1.3 round trip. Logging in adds nothing, because the client doesn't wait for `WELCOME` before it starts sending. On a network the client hasn't seen, that holds while the first SNI mode it tries is the only attempt under way; once a second mode has been started alongside it, the first packet goes on whichever lane logs in, right after its `WELCOME`.
 
 ---
 
@@ -157,13 +157,20 @@ HELLO
 
 ### When the login fails
 
-The server never sends a Tectonic-specific error. Whatever bytes arrived go to the cover website's HTTP handler. A valid HTTP request gets the site, and anything else gets an ordinary `400 Bad Request` and the connection closed.
+The server never sends a Tectonic-specific error, and it never waits where a web server would not. The cover website's web server has every connection from the start, so a client that doesn't log in gets exactly what that web server gives anyone: its `SETTINGS` frame first on HTTP/2, the site for a valid request, an ordinary `400 Bad Request` for anything else, one timeout if it stalls, and a TLS close alert when the server hangs up.
+
+A login is looked for only on a TLS 1.3 connection that negotiated HTTP/2, in the first record the client sends. That record must hold `HELLO`'s fields and at least 16 bytes of its tag. The rest of the tag may follow in the next record, and the node waits for it only if the part that arrived is right. The check runs on every first record, whatever is in it, so how long it takes says nothing about what the client sent.
+
+> [!NOTE]
+> Build the node with Go 1.27 or newer. From that version Go's web server serves a connection the node has wrapped exactly as it serves one it accepted itself. Built with an older Go, the node runs the handshake itself and sends `SETTINGS` on the web server's behalf, which is close to a Go web server but not identical, and it logs a warning at start.
 
 ---
 
 ## 6. Wire format
 
-Inside TLS, a lane carries a series of frames. Several frames can share one TLS record, and the shaper decides how big each record is.
+Inside TLS, a lane carries a series of frames. Several frames can share one TLS record, a frame can begin in one record and end in the next, and the shaper decides how big each record is.
+
+On a direct lane the server's first bytes are the web server's HTTP/2 `SETTINGS` frame, sent before the node knows the connection is a lane. The client reads past it, and Tectonic's frames follow.
 
 ```text
 frame = type (1 byte) ‖ length (2 bytes, big-endian) ‖ body (length bytes)
@@ -194,13 +201,15 @@ For each outgoing WireGuard packet, the scheduler estimates when each lane would
 eta(lane) = queued_bytes(lane) / rate(lane) + srtt(lane) / 2
 ```
 
+`queued_bytes` is everything the lane has yet to write, including the rest of a packet that the last record began.
+
 It keeps the lanes in order of preference, newest first, and sends the packet on the most preferred lane whose estimate is within a small margin (a sixteenth of that lane's round trip) of the earliest.
 
 - **One lane while one lane is enough.** Traffic a single lane can carry stays on that lane, in order. Once the lane falls behind, the overflow spills to the next, and each packet still goes where it should arrive about as early as anywhere.
 - **Shallow socket buffers.** Each lane sets `TCP_NOTSENT_LOWAT`, so the operating system holds only a little unsent data. The queue stays in Tectonic's scheduler, which can still steer packets to the fastest lane. This also keeps latency low while the tunnel is busy.
 - **What the kernel holds counts.** Where the platform has `TCP_INFO`, `queued_bytes` includes the bytes the kernel has taken and not sent, and `rate` is what the connection can send now: its congestion window each round trip, or its pacing rate if it paces. The lane reads them again whenever it writes, and at most every millisecond while anything is in flight. A connection that has just opened may send ten segments and then nothing for a round trip. Counted by its own queue alone it looks empty, and takes packets that then wait in the kernel while another lane had room.
 - **Without `TCP_INFO`,** rate and RTT come from `PING`/`PONG`.
-- **A record is no larger than the lane sends in a moment.** Nothing in a TLS record can be used until all of it has arrived, so a record holds no more than its connection sends in a thirty-second of the round trip (between 1 and 4 ms), and always at least one packet. At 100 Mbit/s that is a full 16 KB record. On a paced connection that has just opened it is one packet.
+- **A record is no larger than the lane sends in a moment.** Nothing in a TLS record can be used until all of it has arrived, so a record holds no more than its connection sends in a thirty-second of the round trip (between 1 and 4 ms), and always at least one packet. At 100 Mbit/s that is a full 16 KB record. On a paced connection that has just opened it is one packet. A record this limit ends holds whole packets, because a packet in two records waits on both.
 - **Paced or not.** A connection that paces (BBR, or any connection on a host whose queueing discipline is `fq`) sends at its pacing rate however much window it has. One that doesn't sends whatever its window has room for at once, so that much can share a record. The kernel reports a pacing rate either way. A lane takes its connection to pace if it runs BBR, or once it has been seen holding back segments its window had room for.
 - **Small packets first.** Within a lane, packets of 128 bytes or less go out ahead of the larger ones queued there, so a download doesn't make pings and ACKs wait behind it.
 - **A full queue drops.** A lane's queue is full once its oldest packet has waited about a round trip. When every lane is full the packet is dropped, which the TCP connections inside the tunnel read the way they would read a full link. The sender tells the receiver which packets it dropped (`LOST`), so the receiver does not wait for them.
@@ -249,16 +258,17 @@ While any lane is retransmitting, packets of 128 bytes or less are also copied o
 
 ### Lane churn
 
-- Each lane's lifetime is drawn from a browser-like distribution (median about 90 s, range 20 s to 6 min), and its byte budget is drawn the same way (median about 40 MB).
+- Each lane's lifetime is drawn from a browser-like distribution (median about 90 s, range 20 s to 6 min), and its replacement opens when that is up, whatever the lane has carried. Time decides how often lanes turn over, not throughput. A download that opened a fresh connection every few seconds for as long as it lasted would mark the client far more plainly than anything one connection carries.
+- Each lane also has a byte budget, drawn the same way around 2 GiB (455 MiB to 8 GiB). A lane that has carried its budget is replaced early, but never younger than a second lifetime drawn for it. So at any speed a lane lives for one lifetime or for the shorter of two, a median of about 60 s at worst. Below about 190 Mbit/s the budget rarely comes into it.
 - Shortly before a lane expires, a replacement opens with TLS resumption. As the newest lane it takes the traffic, as fast as its connection can grow, while the old lane carries the rest. Once the traffic has moved off the old lane, it is sent `RETIRE`, finishes sending, and closes. The number of working lanes never drops during the switch.
-- A new TCP connection next to a busy one grows slowly, so on a saturated link the old lane can stay for many seconds. It is retired regardless after 30 s, or once it has carried the most any lane's byte budget can be.
+- A new TCP connection next to a busy one grows slowly, so on a saturated link the old lane can stay for many seconds. It is retired regardless after 30 s, or once it has carried the most any lane's byte budget can be (8 GiB).
 - If the network kills a lane, for example with a forged reset or a middlebox timeout, traffic moves to the remaining lanes at once and a replacement opens.
 
 ### Lane count and throttle detection
 
 - The pool starts with 2 lanes and can grow to `max_lanes`. The server sets that limit: 6 by default, and 3 on cellular.
 - **Throttle check.** Under load, if every lane settles at about the same rate and adding a lane adds about that much more again, the network is limiting each connection separately. The client keeps adding lanes while each one pays off, and closes lanes once they stop helping.
-- When the tunnel is idle, the pool shrinks to a single lane.
+- When the tunnel is idle, the pool shrinks to a single lane. The moment is drawn for each idle period, anywhere between the tunnel going idle and its last lane closing (20 to 140 s after the last traffic with the default profile), so a connection doesn't close at the same offset in every session. Until then the pool keeps the lanes it has and opens none.
 
 ---
 
@@ -268,14 +278,22 @@ TLS hides what's inside the traffic, but WireGuard still has a recognisable shap
 
 | Traffic state | What Tectonic does | Overhead |
 |---|---|---|
-| Bulk transfer | Packs `DATA` frames into records of up to 16 KB, like a real download. A slow lane that paces sends smaller ones (see [Choosing a lane](#choosing-a-lane)). | ≈ 0% |
-| Interactive | Gives a record up to a millisecond to fill, then rounds its size up to a bucket taken from a recorded browsing profile. A few packets that would need a lot of padding together are divided between two records that each fit a bucket closely. | Small |
-| Lane start | Pads the first flight in each direction to match Chrome loading a page over HTTP/2 | Once per lane |
-| Idle | Absorbs WireGuard keepalives into browser-like idle behaviour, closes the lane, and opens a fresh one when traffic resumes | Tiny |
+| Bulk transfer | While more is waiting than a record holds, fills every record to the full 16 KB, as a real download does, so a packet may begin in one record and end in the next. A record that goes out with less holds whole packets and 3 to 34 bytes of padding. A slow lane that paces sends smaller ones (see [Choosing a lane](#choosing-a-lane)). | ≈ 0% |
+| Interactive | Gives a record up to a millisecond to fill, then pads it to a length drawn evenly from the band above the one its size falls in. The profile's buckets are the band edges. | Small |
+| Lane start | Sends the first flight in each direction as the records Chrome and an HTTP/2 server open with. From the client: 87 bytes, a request-sized record (460–470), and a 26 once the server answers. From the server, after the web server's own `SETTINGS` (62): a 39, a 108–109 and a page-sized record | About 3.4 KB per lane |
+| Idle | Absorbs WireGuard keepalives into browser-like idle behaviour: holds each one a random while and pads it to a length drawn from the profile's idle sizes. Then closes the lane, and opens a fresh one when traffic resumes | Tiny |
 
 The wait matters as much as the padding. Packets inside the tunnel come in trains: the segments of a reply, the ACKs that answer them. Sent one to a record, each pays for its own TLS framing, its own padding and, being slightly larger than one TCP segment with them, two TCP headers. A millisecond is enough to turn a train into one record.
 
+Padding to a fixed set of sizes would swap one pattern for another: every record would be one of a few lengths that nothing else on the network sends. So the buckets divide sizes into bands, and a record is padded to a length drawn evenly from the band above its own. Its length says which band it was in and nothing closer, and no length is more likely than the next. The default profile's bands are 16 bytes wide up to 256 and 32 wide above. WireGuard's fixed sizes share their bands with ordinary packets: a lone handshake initiation comes out at the lengths a 144-byte packet does, and a response at those of a TCP ACK. Neither is ever left at its own size.
+
+Two more rules keep control frames from standing out. A `PONG` or `RETIRE` sent alone is padded as an interactive record whatever the lane is carrying. And no record is padded to fewer than 9 bytes, the size of HTTP/2's smallest frame (26 on the wire).
+
 Shaping profiles are data, not code. `WELCOME` tells the client which profile to use, so new profiles can be rolled out from the hub without a protocol change.
+
+The opening is data too. `client_first_flight` and `server_first_flight` list the records of each direction's first flight as size ranges, and `client_ack` is the record the client sends when the server's first bytes arrive. The frames and their padding are one byte stream cut at those record ends, so `HELLO` and `WELCOME` each straddle two records. The first client record must hold at least 65 bytes, enough for the node to recognise a login. The default profile's sizes were measured from Chromium loading a node's cover site; the page-sized record is a placeholder that keeps the cost where it was.
+
+The other fields: `buckets` are the band edges, `idle_sizes` are the edges of the ranges an idle record's length is drawn from, and `bulk_threshold` is how many waiting bytes make a lane's traffic a transfer. A profile whose buckets are far apart pays more padding for coarser sizes, and there the planner divides a few waiting packets between two records when that pads less. With the default profile's bands one record is always cheapest.
 
 > [!WARNING]
 > **The limit of shaping.** Shaping makes classification harder and more expensive. It can't rule out a well-resourced censor running machine-learning classifiers over whole flows. That's why the rest of the PangeaVPN transport cascade stays in place behind Tectonic.
@@ -298,9 +316,10 @@ Networks filter on the handshake's server name in different ways, so the SNI is 
 | **None** | No SNI extension, which is exactly what Chrome sends when it opens `https://<IP>` | Default certificate, verified by SPKI pin, or a Let's Encrypt IP certificate | SNI allowlists that let connections without an SNI through |
 
 - **The certificate is hidden from the filter.** TLS 1.3 encrypts the server certificate, so a filter watching passively never sees that it doesn't match a borrowed name. The client still verifies the node through the pin.
-- **How the server chooses a certificate.** If the SNI is the node's own domain, the server presents the real certificate. For any other name, or no name, it presents its default certificate, which is how most web servers behave.
+- **How the server chooses a certificate.** If the SNI is the node's own domain, the server presents the real certificate. For any other name, or no name, it presents its default certificate, which is how most web servers behave. The default certificate is self-signed for `localhost` unless the node is given another name (`-default-cert-name`). It never carries the machine's hostname, which would publish every node's name to anyone who connects without the cover name.
 - **Active probes in borrowed mode** receive the default certificate and the cover website. That's ordinary behaviour for a server, though not a perfect disguise. REALITY handles this case better, which is one reason it stays in the cascade.
-- **Picking the mode automatically.** On a network it hasn't seen before, the client tries all three modes in parallel for the first lane and keeps the first one that logs in. It remembers that mode for the network, so the next connection goes straight to it. Allowlist filters usually reject a blocked handshake within one round trip, so trying all three costs very little.
+- **Picking the mode automatically.** On a network it hasn't seen before, the client tries the modes one after another for the first lane, the best disguise first: Own, then Borrowed, then None. The next mode's ClientHello goes out only when the mode before it has failed after its own went out (a reset, a failed handshake or a failed login), or has had no answer for a while. A failure moves on at once. Silence leaves the attempt running and starts the next alongside it, after six round trips as measured by the attempt's own TCP handshake, at least 2 s and at most 5 s. The first to log in is kept and remembered for the network, so the next connection goes straight to it.
+- **Why not all three at once.** It would be faster where the cover name is silently dropped, but an observer would see three handshakes to one address under three names, and on a network that blocks nothing the weaker modes win as often as Own does. Tried in order, a network where Own works never sees a borrowed name or a nameless handshake, and the wait is paid once per network, only where a filter drops packets without answering.
 
 ### Domains for Own mode
 
@@ -318,7 +337,7 @@ The core (login, frames, scheduler and shaper) doesn't care how a lane reaches t
 | Carrier | What a lane is | When it's used |
 |---|---|---|
 | **Direct** | A TLS 1.3 connection to the node on port 443, using one of the [SNI modes](#9-sni-modes) | By default. This is the fastest route. |
-| **CDN** | A WebSocket over TLS to a CDN edge, which forwards it to the node. `HELLO` is sent in the first WebSocket message, and the node also checks a header signed by the CDN. | When direct lanes can't open, for example because the node's IP is null-routed |
+| **CDN** | A WebSocket over TLS to a CDN edge, which forwards it to the node. `HELLO` is sent in the first WebSocket message, which carries the lane's whole opening, and the node also checks a header signed by the CDN. | When direct lanes can't open, for example because the node's IP is null-routed |
 
 The client switches carriers within the same session, and direct and CDN lanes can briefly run side by side during the switch. The user sees one transport, Tectonic, that keeps working.
 
@@ -329,9 +348,9 @@ The client switches carriers within the same session, and direct and CDN lanes c
 | Attack | Tectonic's answer | What's left |
 |---|---|---|
 | Passive DPI on the handshake | Chrome's ClientHello via uTLS. In Own mode, SNI, IP and certificate all agree. | uTLS has to keep up with Chrome releases |
-| Active probing | A probe that fails login gets the cover website, with the same timing as a successful login | The cover site has to look real and maintained |
+| Active probing | Every connection is the cover website's web server until a valid login takes it, so a probe gets what a Go web server gives anyone: `SETTINGS` first on HTTP/2, the site, the same timeouts and the same close | The cover site has to look real and maintained. The node must be built with Go 1.27 or newer for an exact match. What a probe sees is a Go web server, which is itself a recognisable kind |
 | Replaying a captured login | The login is bound to its TLS session's exporter, and checked against a timestamp window | None known |
-| Long-connection and volume heuristics | Lane churn limits each connection's lifetime and byte count | Many connections from one client to one server is itself a pattern, though browsers make many connections too |
+| Long-connection heuristics | Lane churn limits each connection's lifetime to minutes | A fast tunnel puts gigabytes on one connection, as a browser's download does. Several connections from one client to one server is itself a pattern, though browsers make more than one too |
 | Per-connection throttling | Throttle detection adds lanes | A per-host throttle, which caps all connections to one server together, can't be beaten this way |
 | Injected TCP resets | The lane is replaced and traffic continues on the others | Resetting every lane at once forces a rejoin, which takes about 2 RTT |
 | Packet size and timing analysis | The shaping budget hides WireGuard's fixed sizes and keepalive timer | Machine-learning classifiers ([section 8](#8-traffic-shaping)) |
@@ -351,7 +370,7 @@ This is a broad comparison of public designs. Each of them solves a real problem
 | VLESS + REALITY | Borrows another site's TLS identity, and its server only accepts the names it's configured for | Uses our own identity by default. When it borrows a name, it accepts any name, or none. Traffic is spread across lanes rather than one connection. |
 | Trojan | Real TLS plus a password, with a fallback website, over one long-lived stream | The login is bound to the TLS session, so it can't be replayed. Lanes churn, and a datagram isn't tied to one connection's order. |
 | Cloak | Hides its login in ClientHello fields and multiplexes ordered streams over several connections | The ClientHello is untouched Chrome. Datagrams, not streams, are merged, with a bounded wait: a lane that dies without closing holds the others up for a second at most, and one that is reset for a round trip or two. |
-| AnyTLS | TLS with padding aimed at defeating TLS-in-TLS detection | There's no TLS inside the TLS, because the payload is WireGuard. Shaping targets WireGuard's own patterns and costs nothing during bulk transfer. |
+| AnyTLS | TLS with padding aimed at defeating TLS-in-TLS detection | There's no TLS inside the TLS, because the payload is WireGuard. Shaping targets WireGuard's own patterns and costs almost nothing during bulk transfer. |
 | NaiveProxy | Uses Chrome's real network stack and HTTP/2 CONNECT | Pure Go with no native library, so it runs on iOS too. Multiple lanes and datagram-native framing. |
 | Speed-first VPN protocols | Built for speed, with little or no disguise | Speed comes from the scheduler, while the traffic still looks like browsing |
 

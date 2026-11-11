@@ -25,8 +25,9 @@ targets in [§13](docs/design.md#13-measuring-speed); see
 exercises the path that lanes take without `TCP_NOTSENT_LOWAT`, which in
 production means Windows clients; the path other platforms take is measured
 on Linux with `bench -kernel` (see [`bench/recent.md`](bench/recent.md)). The
-default shaping profile uses placeholder numbers until profiles are recorded
-from real Chrome sessions (milestone M5).
+default shaping profile opens a lane with records measured from Chromium;
+its other numbers are placeholders until profiles are recorded from real
+Chrome sessions (milestone M5).
 
 - [**Design methodology**](docs/design.md): how Tectonic works and why.
 - Client: linked into the PangeaVPN daemon
@@ -74,6 +75,11 @@ must issue a new one.
 
 ## Running a node
 
+Build the node with Go 1.27 or newer. From that version Go's web server
+serves the node's connections exactly as it serves its own, which is what
+makes a node answer strangers the way any Go website does. An older Go builds
+a node that is close but not identical, and it logs a warning at start.
+
 ```sh
 go build ./cmd/tectonic-server
 head -c 32 /dev/urandom | xxd -p -c 32 > node_secret
@@ -97,7 +103,10 @@ sysctl -w net.core.rmem_max=7500000
 ```
 
 On first run the node creates its default certificate (`default.crt`) and
-logs its pin. Give that pin to the hub; clients in Borrowed and None mode
+logs its pin. The certificate is self-signed for `localhost`;
+`-default-cert-name` sets another name. An existing certificate is never
+rewritten, because clients pin it, and if it carries the machine's hostname
+the node says so at start. Give that pin to the hub; clients in Borrowed and None mode
 check it. `tectonic-server pin -cert default.crt` prints the pin again, and
 `tectonic-server issue -secret-file node_secret -node HOST:443 -pin PIN`
 mints a test profile the way the hub does. Send SIGHUP to reload the
