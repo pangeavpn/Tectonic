@@ -165,8 +165,7 @@ type laneState struct {
 	src         *Source // the lane's way into the resequencer
 	welcomed    bool
 	session     wire.SessionID
-	lifetime    time.Duration
-	budget      uint64
+	life        laneLife // when the lane is due to be replaced
 	retiring    bool
 	replacing   *laneState // the lane this one replaces, until it takes over
 	handoverAt  time.Time  // the earliest the lane it replaces may retire
@@ -521,8 +520,8 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	// nothing for the length of the overlap. One still carrying traffic
 	// stays, because the lanes left would have to grow to take its share,
 	// and TCP outside slow start grows too slowly for the tunnel not to
-	// stall meanwhile. It stays no longer than MaxOverlap, and carries no
-	// more than the most any lane's byte budget can be.
+	// stall meanwhile. It stays no longer than MaxOverlap, and not once it
+	// has carried the most any lane's byte budget can be.
 	for st := range p.lanes {
 		old := st.replacing
 		if old == nil || !st.welcomed || now.Before(st.handoverAt) {
@@ -544,15 +543,16 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		st.replacing = nil
 	}
 
-	// Lane churn: replace lanes nearing their lifetime or byte budget, but
-	// not while idle; an idle lane closes soon anyway.
+	// Lane churn: replace lanes nearing the end of their lifetime, or of
+	// their byte budget if they are old enough (see Churn), but not while
+	// idle; an idle lane closes soon anyway.
 	if active && p.dialing == 0 && !now.Before(p.nextDial) {
 		for st := range p.lanes {
 			if !st.welcomed || st.retiring || st.replacement || st.replacing != nil {
 				continue
 			}
 			s := st.l.Stats()
-			if now.Sub(st.upAt) >= st.lifetime-p.churn.Lead || s.BytesSent+s.BytesRecv >= st.budget/10*9 {
+			if p.churn.due(st.life, now.Sub(st.upAt), s.BytesSent+s.BytesRecv) {
 				st.replacement = true
 				p.dial(now, "churn", st)
 				break
@@ -743,10 +743,9 @@ func (p *Pool) dialed(ref *laneRef, req DialRequest, replaces *laneState, l Pool
 		seq: p.laneSeq,
 		// The server may send on the lane from the moment it reads HELLO,
 		// so from here on packets from other lanes wait for this one.
-		src:      p.source(ref),
-		lifetime: p.churn.Lifetime(p.rng),
-		budget:   p.churn.Budget(p.rng),
-		upAt:     now,
+		src:  p.source(ref),
+		life: p.churn.draw(p.rng),
+		upAt: now,
 		replacing: func() *laneState {
 			if replaces != nil {
 				if _, ok := p.lanes[replaces]; ok {

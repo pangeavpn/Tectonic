@@ -205,8 +205,8 @@ func TestChurnDistributions(t *testing.T) {
 	if m := lifes[n/2]; m < 80*time.Second || m > 100*time.Second {
 		t.Fatalf("median lifetime %v, want about 90s", m)
 	}
-	if m := budgets[n/2]; m < 36<<20 || m > 44<<20 {
-		t.Fatalf("median budget %d MB, want about 40", m>>20)
+	if m := budgets[n/2]; m < 1800<<20 || m > 2300<<20 {
+		t.Fatalf("median budget %d MiB, want about 2048", m>>20)
 	}
 	// The spread is real: plenty of short and long lanes.
 	if lifes[n/10] > 50*time.Second || lifes[n*9/10] < 150*time.Second {
