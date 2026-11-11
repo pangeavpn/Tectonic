@@ -108,6 +108,11 @@ func (m SNIMode) String() string {
 type Choice struct {
 	Mode SNIMode `json:"mode"`
 	Name string  `json:"name,omitempty"`
+	// Cover is the profile's cover domain when the choice was remembered.
+	// A weaker mode remembered without the cover domain the profile has now
+	// was chosen without Own on offer, so the client works the mode out
+	// again, Own first.
+	Cover string `json:"cover,omitempty"`
 }
 
 // ModeStore remembers which SNI mode works on each network, so the next

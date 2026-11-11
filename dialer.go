@@ -243,13 +243,21 @@ func (d *dialer) choice(network string) (Choice, bool) {
 	if d.cfg.SNIMode != SNIAuto {
 		return Choice{Mode: d.cfg.SNIMode, Name: d.nameFor(d.cfg.SNIMode)}, true
 	}
-	if c, ok := d.modes.Mode(network); ok && d.allowed(c.Mode) {
+	if c, ok := d.modes.Mode(network); ok && d.allowed(c.Mode) && !d.ownSinceChosen(c) {
 		if c.Mode == SNIBorrowed && d.cfg.SNI != "" {
 			c.Name = d.cfg.SNI // the user's own name wins
 		}
 		return c, true
 	}
 	return Choice{}, false
+}
+
+// ownSinceChosen reports whether c, a weaker mode than Own, was remembered
+// before the profile offered its current cover domain: Own was not tried
+// then, so the choice is worked out again rather than kept for good.
+func (d *dialer) ownSinceChosen(c Choice) bool {
+	cover := d.cfg.Profile.CoverDomain
+	return c.Mode != SNIOwn && cover != "" && c.Cover != cover && d.allowed(SNIOwn)
 }
 
 // dial is the pool's DialFunc.
@@ -367,6 +375,7 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 		}
 		d.directFails, d.onCDN, d.modeFails = 0, false, 0
 		if d.cfg.SNIMode == SNIAuto && c.Mode != SNIAuto {
+			c.Cover = d.cfg.Profile.CoverDomain
 			d.modes.SetMode(network, c)
 		}
 		return
