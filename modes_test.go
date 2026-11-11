@@ -179,6 +179,11 @@ type fakeNet struct {
 	delays       map[string]time.Duration // how long a name's ClientHello is held up
 	connectDelay time.Duration            // how long a TCP handshake takes
 	connectErr   error                    // if set, TCP never connects
+	// residual, if set, is how long the network resets every ClientHello
+	// to the node after resetting one by its name, as the GFW does; a
+	// name reset again starts the time over.
+	residual      time.Duration
+	residualUntil time.Time
 
 	mu     sync.Mutex
 	dials  []dialRecord
@@ -272,6 +277,13 @@ func (c *fakeConn) record(rec []byte) error {
 		c.net.mu.Lock()
 		c.net.hellos = append(c.net.hellos, name)
 		c.rule = c.net.rules[name]
+		if c.net.residual > 0 {
+			if c.rule == sniReset {
+				c.net.residualUntil = time.Now().Add(c.net.residual)
+			} else if time.Now().Before(c.net.residualUntil) {
+				c.rule = sniReset
+			}
+		}
 		to := c.addr
 		if r, ok := c.net.routes[name]; ok {
 			to = r
@@ -814,7 +826,9 @@ func TestModeSlowOwnIsKeptIfItLogsInFirst(t *testing.T) {
 }
 
 // A remembered mode is used directly. When it stops working it is
-// forgotten, and the next lane starts from Own again.
+// forgotten, and the mode is worked out again, from Own if Own has not been
+// blocked here lately: a cover domain this network reset is not sent again
+// until ownBlockedFor has passed, and then it is tried first.
 func TestModeRememberedThenForgotten(t *testing.T) {
 	r := newModeRig(t, nil)
 	r.net.rules[modeCover] = sniReset
@@ -837,7 +851,19 @@ func TestModeRememberedThenForgotten(t *testing.T) {
 		t.Fatalf("still remembers %+v after %d failures", c, modeFailLimit)
 	}
 	r.mustDial()
-	r.wantSent(modeCover, modeBorrowed, modeBorrowed, modeBorrowed, modeBorrowed, modeCover)
+	r.wantSent(modeCover, modeBorrowed, modeBorrowed, modeBorrowed, modeBorrowed, modeBorrowed, "")
+	r.wantRemembered(SNINone)
+
+	// Hours later, None stops working too, and Own is tried again first.
+	r.net.rules[""] = sniReset
+	r.d.mu.Lock()
+	r.d.ownBlocked[modeNetwork] = time.Now()
+	r.d.mu.Unlock()
+	for range modeFailLimit {
+		r.dial()
+	}
+	r.mustDial()
+	r.wantSent(modeCover, modeBorrowed, modeBorrowed, modeBorrowed, modeBorrowed, modeBorrowed, "", "", "", modeCover)
 	r.wantRemembered(SNIOwn)
 }
 
@@ -903,4 +929,68 @@ func TestModeOnlyTheChosenLaneReachesThePool(t *testing.T) {
 	if want := []string{"data", "lost", "retire", "close", "end"}; !slices.Equal(got, want) {
 		t.Fatalf("the pool got %v from the chosen lane, want %v", got, want)
 	}
+}
+
+// Where the GFW resets the cover domain and then every connection to the
+// node for a while, the client sends the cover domain once, waits the block
+// out without touching the node, and then logs in with the borrowed name,
+// which it remembers. It never sends the cover domain again: that would
+// start the block over, for good.
+func TestModeWaitsOutResidualCensorship(t *testing.T) {
+	r := newModeRig(t, nil)
+	r.net.rules[modeCover] = sniReset
+	r.net.residual = 300 * time.Millisecond
+	if _, err := r.dial(); err == nil {
+		t.Fatal("logged in through a block on the address")
+	}
+	r.wantSent(modeCover, modeBorrowed, "")
+	// While the block lasts, no lane is tried at all.
+	if _, err := r.dial(); !errors.Is(err, errResidualWait) {
+		t.Fatalf("dial while waiting: %v, want errResidualWait", err)
+	}
+	r.wantSent(modeCover, modeBorrowed, "")
+	// Once it has passed, Borrowed is tried first and works.
+	r.d.mu.Lock()
+	r.d.quiet[modeNetwork] = time.Now()
+	r.d.mu.Unlock()
+	time.Sleep(r.net.residual)
+	r.mustDial()
+	r.wantSent(modeCover, modeBorrowed, "", modeBorrowed)
+	r.wantRemembered(SNIBorrowed)
+}
+
+// A cover domain that was reset is not sent again on that network, even
+// once the mode is worked out again from the start.
+func TestModeDoesNotRetryABlockedCoverDomain(t *testing.T) {
+	r := newModeRig(t, nil)
+	r.net.rules[modeCover] = sniReset
+	r.mustDial()
+	r.wantSent(modeCover, modeBorrowed)
+	r.modes.ForgetMode(modeNetwork)
+	r.mustDial()
+	r.wantSent(modeCover, modeBorrowed, modeBorrowed)
+	// Another network is another matter.
+	r.d.setNetwork("home", false)
+	r.cfg.Network = "home"
+	r.d.mu.Lock()
+	r.d.network = "home"
+	r.d.mu.Unlock()
+	r.mustDial()
+	r.wantSent(modeCover, modeBorrowed, modeBorrowed, modeCover, modeBorrowed)
+}
+
+// A network that is simply down blocks nothing: Own stays on the list.
+func TestModeDownNetworkBlocksNothing(t *testing.T) {
+	r := newModeRig(t, nil)
+	r.net.connectErr = errors.New("network is unreachable")
+	if _, err := r.dial(); err == nil {
+		t.Fatal("dialled through a network that is down")
+	}
+	r.net.mu.Lock()
+	r.net.connectErr = nil
+	r.net.mu.Unlock()
+	if _, err := r.dial(); errors.Is(err, errResidualWait) {
+		t.Fatal("waiting out a block after the network was down")
+	}
+	r.wantSent(modeCover)
 }

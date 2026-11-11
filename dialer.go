@@ -32,6 +32,29 @@ const (
 	modeFailLimit = 2
 )
 
+// When a censor blocks the cover domain, its ClientHello is reset or goes
+// unanswered. Some censors then block everything between the client and
+// that address and port for a while: the GFW does this for 90 to 180 s
+// after a forbidden name ("residual censorship"), and a fresh match starts
+// the time again. Every mode connects to the same address, so a client that
+// moved on to a borrowed name at once, and then started over from Own,
+// would never get through: each search sends the forbidden name again.
+const (
+	// ownBlockedFor is how long the cover domain stays off the list of
+	// modes to try on a network where it was reset or went unanswered. A
+	// censor that blocks the name sees it once, not on every retry.
+	ownBlockedFor = 6 * time.Hour
+	// residualWait is how long the client keeps away from the node after
+	// two modes in one search failed as soon as their ClientHellos went
+	// out, the sign of a block on the address: longer than the GFW's
+	// longest. Lanes go by the CDN meanwhile if the profile has one.
+	residualWait = 200 * time.Second
+)
+
+// errResidualWait is returned while the client waits out a block on the
+// node's address.
+var errResidualWait = errors.New("tectonic: waiting out a block on the node's address")
+
 // How long an SNI mode may make no progress, on a network the client hasn't
 // seen, before the next mode is tried alongside it (see tryModes). The wait
 // starts when the mode's ClientHello goes out and starts again when its TLS
@@ -94,6 +117,11 @@ type dialer struct {
 	onCDN         bool
 	lastDirectTry time.Time
 	modeFails     int
+	// ownBlocked and quiet are, per network, until when the cover domain
+	// is not tried (see ownBlockedFor), and until when no direct lane is
+	// (see residualWait).
+	ownBlocked map[string]time.Time
+	quiet      map[string]time.Time
 }
 
 func newDialer(cfg Config) (*dialer, error) {
@@ -109,14 +137,16 @@ func newDialer(cfg Config) (*dialer, error) {
 		return nil, errors.New("tectonic: profile key_id must be 20 bytes and device_key 32")
 	}
 	d := &dialer{
-		cfg:      cfg,
-		node:     node,
-		sessions: utls.NewLRUClientSessionCache(64),
-		modes:    cfg.Modes,
-		stallMin: modeStallMin,
-		stallMax: modeStallMax,
-		network:  cfg.Network,
-		cellular: cfg.Cellular,
+		cfg:        cfg,
+		node:       node,
+		sessions:   utls.NewLRUClientSessionCache(64),
+		modes:      cfg.Modes,
+		stallMin:   modeStallMin,
+		stallMax:   modeStallMax,
+		ownBlocked: map[string]time.Time{},
+		quiet:      map[string]time.Time{},
+		network:    cfg.Network,
+		cellular:   cfg.Cellular,
 	}
 	copy(d.keyID[:], p.KeyID)
 	copy(d.deviceKey[:], p.DeviceKey)
@@ -195,6 +225,19 @@ func (d *dialer) candidates() []Choice {
 	return out
 }
 
+// candidatesOn are the modes to try on network: candidates, less Own while
+// the cover domain is blocked there, unless it is all there is.
+func (d *dialer) candidatesOn(network string) []Choice {
+	cands := d.candidates()
+	d.mu.Lock()
+	blocked := time.Now().Before(d.ownBlocked[network])
+	d.mu.Unlock()
+	if blocked && len(cands) > 1 && cands[0].Mode == SNIOwn {
+		return cands[1:]
+	}
+	return cands
+}
+
 func (d *dialer) nameFor(m SNIMode) string {
 	switch m {
 	case SNIOwn:
@@ -268,10 +311,18 @@ func (d *dialer) dial(ctx context.Context, req sched.DialRequest) (sched.PoolLan
 	d.mu.Lock()
 	network, cellular := d.network, d.cellular
 	useCDN := d.cfg.Profile.CDN != nil && d.onCDN && time.Since(d.lastDirectTry) < directRetry
-	if !useCDN {
+	quietUntil := d.quiet[network]
+	waiting := time.Now().Before(quietUntil)
+	if waiting && d.cfg.Profile.CDN != nil {
+		useCDN = true
+	}
+	if !useCDN && !waiting {
 		d.lastDirectTry = time.Now()
 	}
 	d.mu.Unlock()
+	if waiting && !useCDN {
+		return nil, fmt.Errorf("%w (%s more)", errResidualWait, time.Until(quietUntil).Round(time.Second))
+	}
 
 	if useCDN {
 		cfg := d.laneConfig(req, cellular)
@@ -395,6 +446,41 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 	}
 }
 
+// blocked learns from a search. An attempt whose ClientHello went out and
+// that then failed, other than by the server answering as a web server
+// does, or that never heard back, was blocked. If Own was, the cover domain
+// is not tried on this network for ownBlockedFor. If no mode logged in and
+// two were blocked, the block is on the address, and no direct lane is
+// tried for residualWait. An attempt that never got its ClientHello out
+// says nothing about either: the network may simply be down.
+func (d *dialer) blocked(network string, attempts []*attempt, won *attempt, hello, cut map[*attempt]bool) {
+	n := 0
+	own := false
+	for _, a := range attempts {
+		if a == won || !hello[a] {
+			continue
+		}
+		// An attempt still open when the search ended never heard back.
+		silent := !cut[a] && !a.login
+		if cut[a] || silent {
+			n++
+			own = own || a.c.Mode == SNIOwn
+		}
+	}
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if own {
+		d.ownBlocked[network] = now.Add(ownBlockedFor)
+		d.log.Info("the cover domain looks blocked here; not trying it for a while", "network", network, "for", ownBlockedFor)
+	}
+	if won == nil && n >= 2 {
+		wait := residualWait + time.Duration(d.rng.Int64N(int64(residualWait/5)))
+		d.quiet[network] = now.Add(wait)
+		d.log.Info("the node's address looks blocked here; waiting it out", "network", network, "for", wait.Round(time.Second))
+	}
+}
+
 // stallBound is how long a mode whose TCP handshake took connect may go
 // without progress before the next mode is tried alongside it.
 func (d *dialer) stallBound(connect time.Duration) time.Duration {
@@ -441,7 +527,7 @@ func (d *dialer) connect(ctx context.Context, network, addr string) (net.Conn, e
 // attempts are under way no further login carries it, and it goes out on
 // the chosen lane as soon as that lane is chosen. See modeSearch.take.
 func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network string, cellular bool) (sched.PoolLane, error) {
-	cands := d.candidates()
+	cands := d.candidatesOn(network)
 	if len(cands) == 0 {
 		return nil, errNoModes
 	}
@@ -463,6 +549,10 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 		errs     []error
 		open     int  // attempts that have neither failed nor logged in
 		halted   bool // a connection failed before its ClientHello: try no more modes
+		// The attempts whose ClientHello went out, and those that failed
+		// after it without the server answering as a web server would.
+		hello = map[*attempt]bool{}
+		cut   = map[*attempt]bool{}
 	)
 	// start begins the next mode's attempt, and says why in the log.
 	// stalled is the attempt whose wait ran out, if that is the reason.
@@ -484,6 +574,7 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 		for _, loser := range losers {
 			s.discard(loser)
 		}
+		d.blocked(network, attempts, won, hello, cut)
 		if won == nil {
 			d.outcome(false, lane.Direct, Choice{}, network)
 			return nil, fmt.Errorf("tectonic: no SNI mode logged in: %w", errors.Join(errs...))
@@ -506,6 +597,7 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 				// one as long.
 				if ev.kind == helloSent {
 					ev.a.wait = d.stallBound(ev.rtt)
+					hello[ev.a] = true
 				} else {
 					ev.a.login = true
 				}
@@ -517,6 +609,8 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 				errs = append(errs, fmt.Errorf("%v: %w", ev.a.c.Mode, ev.err))
 				if !ev.sent {
 					halted = true
+				} else if !errors.Is(ev.err, lane.ErrLoginFailed) {
+					cut[ev.a] = true
 				}
 				if newest {
 					stall.Stop()
