@@ -183,7 +183,7 @@ frame = type (1 byte) ‖ length (2 bytes, big-endian) ‖ body (length bytes)
 | `0x03` | `DATA` | both | Exactly one WireGuard datagram. No sequence number, because WireGuard's own counters handle ordering and duplicates. |
 | `0x04` | `PAD` | both | Zeros. Thrown away on receipt. |
 | `0x05` | `PING` / `PONG` | both | An 8-byte token, used to measure each lane's round-trip time |
-| `0x06` | `RETIRE` | both | "No new `DATA` on this lane." The lane finishes what it's sending, then closes with TLS `close_notify`. |
+| `0x06` | `RETIRE` | both | "No new `DATA` on this lane." The lane finishes what it's sending, then closes: the server with TLS `close_notify`, as a web server does, and the client with a TCP FIN alone, as Chrome does. |
 | `0x07` | `CLOSE` | both | Ends the whole session. 1-byte reason code. |
 | `0x08` | `LOST` | both | A WireGuard key index, a counter and a count: datagrams the sender dropped, or never received from WireGuard, and will not send. The receiver stops waiting for them. |
 
@@ -262,6 +262,7 @@ While any lane is retransmitting, packets of 128 bytes or less are also copied o
 - Each lane's lifetime is drawn from a browser-like distribution (median about 90 s, range 20 s to 6 min), and its replacement opens when that is up, whatever the lane has carried. Time decides how often lanes turn over, not throughput. A download that opened a fresh connection every few seconds for as long as it lasted would mark the client far more plainly than anything one connection carries.
 - Each lane also has a byte budget, drawn the same way around 2 GiB (455 MiB to 8 GiB). A lane that has carried its budget is replaced early, but never younger than a second lifetime drawn for it. So at any speed a lane lives for one lifetime or for the shorter of two, a median of about 60 s at worst. Below about 190 Mbit/s the budget rarely comes into it.
 - Shortly before a lane expires, a replacement opens with TLS resumption. As the newest lane it takes the traffic, as fast as its connection can grow, while the old lane carries the rest. Once the traffic has moved off the old lane, it is sent `RETIRE`, finishes sending, and closes. The number of working lanes never drops during the switch.
+- A client lane closes the way Chrome closes a connection: with a TCP FIN, never a TLS `close_notify`. Chrome doesn't send one, and its record (19 bytes) is a length no padded Tectonic record has, so as the last record from a client it would say the client is not Chrome. The node answers the FIN with its own `close_notify` and FIN, as Go's web server answers Chrome's.
 - A new TCP connection next to a busy one grows slowly, so on a saturated link the old lane can stay for many seconds. It is retired regardless after 30 s, or once it has carried the most any lane's byte budget can be (8 GiB).
 - If the network kills a lane, for example with a forged reset or a middlebox timeout, traffic moves to the remaining lanes at once and a replacement opens.
 

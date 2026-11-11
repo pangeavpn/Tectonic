@@ -106,6 +106,8 @@ type testNode struct {
 	refuse bool
 	// ws serves the CDN carrier: TLS + HTTP/1.1 + WebSocket.
 	ws bool
+	// wrap, if set, wraps each accepted TCP connection before TLS.
+	wrap func(net.Conn) net.Conn
 	// One config for every connection: each tls.Config has its own session
 	// ticket keys, so sharing it is what makes resumption work.
 	cfgOnce sync.Once
@@ -164,6 +166,9 @@ func (n *testNode) serve() {
 		c, err := n.ln.Accept()
 		if err != nil {
 			return
+		}
+		if n.wrap != nil {
+			c = n.wrap(c)
 		}
 		go n.handle(c)
 	}

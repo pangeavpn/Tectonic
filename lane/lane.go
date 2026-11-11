@@ -260,8 +260,11 @@ var laneIDs atomic.Uint64
 
 // Lane is one TLS connection carrying Tectonic frames.
 type Lane struct {
-	id      uint64
-	conn    net.Conn
+	id   uint64
+	conn net.Conn
+	// raw is the TCP connection under a client's TLS, when it can shut down
+	// its sending half itself (see closeWrite).
+	raw     net.Conn
 	rc      syscall.RawConn
 	br      *bufio.Reader // what rd reads from
 	rd      *wire.Reader
@@ -435,6 +438,11 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 		pingInterval: cmp.Or(opts.PingInterval, DefaultPingInterval),
 		pingTimeout:  cmp.Or(opts.PingTimeout, DefaultPingTimeout),
 		linger:       cmp.Or(opts.Linger, DefaultLinger),
+	}
+	if _, ws := conn.(*wsConn); !ws && opts.Role == Client {
+		if _, ok := opts.Raw.(interface{ CloseWrite() error }); ok {
+			l.raw = opts.Raw
+		}
 	}
 	l.log = log.With("lane", l.id, "role", opts.Role.String())
 	pl := opts.Planner
@@ -959,6 +967,10 @@ func (l *Lane) finish(err error) {
 	l.doneOnce.Do(func() {
 		l.err = err
 		close(l.done)
+		if l.raw != nil {
+			// Closed first, so that TLS has nowhere to send close_notify.
+			l.raw.Close()
+		}
 		l.conn.Close()
 		l.mu.Lock()
 		l.data, l.dataAt, l.small, l.ctrl = nil, nil, nil, nil
@@ -1934,8 +1946,17 @@ func (l *Lane) applyTCPInfo(ti tcpInfo, now time.Time) {
 	}
 }
 
-// closeWrite sends TLS close_notify (or the carrier's equivalent).
+// closeWrite ends what the lane sends. A server sends TLS close_notify, as
+// a web server does, and a CDN lane a WebSocket close frame. A direct client
+// lane only shuts down its side of the TCP connection: Chrome never sends
+// close_notify, so a client record the size of an alert, last on a
+// connection, would say the client is not Chrome. Reading at a record
+// boundary, the server takes the FIN for the end, and answers it with its
+// own close_notify and FIN, as Go's web server answers Chrome's.
 func (l *Lane) closeWrite() error {
+	if l.raw != nil {
+		return l.raw.(interface{ CloseWrite() error }).CloseWrite()
+	}
 	if cw, ok := l.conn.(interface{ CloseWrite() error }); ok {
 		return cw.CloseWrite()
 	}
