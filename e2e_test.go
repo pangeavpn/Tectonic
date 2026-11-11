@@ -331,10 +331,11 @@ func TestWireGuardThroughTectonic(t *testing.T) {
 	}
 }
 
-func TestAutoModeRacesAndRemembers(t *testing.T) {
+func TestAutoModeFallsBackAndRemembers(t *testing.T) {
 	modes := tectonic.NewMemoryModeStore()
 	// No trusted roots: Own mode's certificate check fails, as it would on
-	// a network that blocks the cover domain. Borrowed or None must win.
+	// a network that intercepts the cover domain. Borrowed is next in
+	// line, and works.
 	_, _, c, _ := tunnel(t, func(cfg *tectonic.Config) {
 		cfg.RootCAs = x509.NewCertPool()
 		cfg.Modes = modes
@@ -346,11 +347,8 @@ func TestAutoModeRacesAndRemembers(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok := modes.Mode("cafe-wifi")
-	if !ok || (got.Mode != tectonic.SNIBorrowed && got.Mode != tectonic.SNINone) {
+	if !ok || got.Mode != tectonic.SNIBorrowed || got.Name != "allowed.example" {
 		t.Fatalf("remembered %+v %v", got, ok)
-	}
-	if got.Mode == tectonic.SNIBorrowed && got.Name != "allowed.example" {
-		t.Fatalf("borrowed name %q", got.Name)
 	}
 	if st := c.Stats(); st.Mode != got || st.Carrier != "direct" {
 		t.Fatalf("stats %+v", st)

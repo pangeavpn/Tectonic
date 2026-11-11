@@ -78,9 +78,10 @@ func ParseProfile(data []byte) (Profile, error) {
 type SNIMode int
 
 const (
-	// SNIAuto uses the mode remembered for the current network, or, on a
-	// network not seen before, races all three for the first lane and
-	// remembers the first that logs in.
+	// SNIAuto uses the mode remembered for the current network. On a
+	// network not seen before it tries Own for the first lane, then
+	// Borrowed, then None, moving on only when the mode before has failed
+	// or got no answer, and remembers the one that logs in.
 	SNIAuto SNIMode = iota
 	// SNIOwn names the node's cover domain.
 	SNIOwn
