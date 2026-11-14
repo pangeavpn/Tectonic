@@ -159,6 +159,13 @@ func (tap *recordTap) openings() []opening {
 // DATA, grouped as it happens to group them): together they hold what a
 // browser loading the page is sent, give or take a byte of the Date header.
 func TestLanesOpenLikeChromeOnTheWire(t *testing.T) {
+	// The node learns its opening from its own web server, which needs a
+	// Go that lets the web server own a handed connection. Built with an
+	// older one it opens with the profile's records instead, which these
+	// record lengths are not about.
+	if !nodeOwnsConnection {
+		t.Skip("built with Go before 1.27: lanes open with the profile's records")
+	}
 	wg, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
 		t.Fatal(err)

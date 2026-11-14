@@ -27,6 +27,12 @@ import (
 // or the way it has to be before Go 1.27.
 func newServerAs(t *testing.T, direct bool, mod func(*Config)) *testServer {
 	t.Helper()
+	// Asking for the web server to own the connection needs a Go that
+	// serves one it is handed (see cover.direct). Built with an older one,
+	// there is nothing to test rather than something to fail.
+	if direct && !httpServesTLSConns {
+		t.Skip("built with Go before 1.27: the web server cannot own a handed connection")
+	}
 	p := certs(t)
 	wg := newFakeWG(t)
 	secret := []byte("0123456789abcdef0123456789abcdef")
