@@ -995,6 +995,42 @@ func TestModeDownNetworkBlocksNothing(t *testing.T) {
 	r.wantSent(modeCover)
 }
 
+// While the client is waiting out a block on the node's address it opens
+// CDN lanes without having given up on direct ones, and Stats must say so:
+// it used to report "direct" for a session running over the CDN.
+func TestModeStatsReportTheCarrierInUse(t *testing.T) {
+	const edge = "edge.cdn.test"
+	r := newModeRig(t, func(cfg *Config) {
+		cfg.Profile.CDN = &CDNRoute{Host: edge, Path: "/socket", Edge: "127.0.0.1:9"}
+	})
+	if got, _ := r.d.state(); got != lane.Direct.String() {
+		t.Fatalf("carrier %q before anything was blocked", got)
+	}
+	// A block on the address: every mode is reset as its ClientHello goes.
+	for _, name := range []string{modeCover, modeBorrowed, ""} {
+		r.net.rules[name] = sniReset
+	}
+	if _, err := r.dial(); err == nil {
+		t.Fatal("logged in through a block on the address")
+	}
+	r.d.mu.Lock()
+	quiet := r.d.quiet[modeNetwork]
+	r.d.mu.Unlock()
+	if quiet.IsZero() {
+		t.Fatal("no wait on the address was started")
+	}
+	if got, _ := r.d.state(); got != lane.CDN.String() {
+		t.Fatalf("carrier %q while waiting out a block with a CDN route, want cdn", got)
+	}
+	// Once the wait is over, direct lanes are the ones to report again.
+	r.d.mu.Lock()
+	r.d.quiet[modeNetwork] = time.Now()
+	r.d.mu.Unlock()
+	if got, _ := r.d.state(); got != lane.Direct.String() {
+		t.Fatalf("carrier %q once the wait was over", got)
+	}
+}
+
 // startImpostor runs a TLS server that is not the node: its certificate is
 // self-signed for the cover domain, so it passes neither the check by name
 // nor a pin, as an interceptor the device doesn't trust, or the wrong

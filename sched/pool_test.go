@@ -323,6 +323,43 @@ func TestPoolGivesEveryLaneTheSessionsSendLimit(t *testing.T) {
 	}
 }
 
+// A node that is hostile or wrong can put anything in WELCOME. The wire
+// format allows 255 lanes and an 18-hour resume window, and the client
+// takes neither at face value.
+func TestPoolClampsWhatWelcomeAsks(t *testing.T) {
+	for _, tc := range []struct {
+		in, want wire.Welcome
+	}{
+		{wire.Welcome{MaxLanes: 255, ResumeWindow: 18 * time.Hour},
+			wire.Welcome{MaxLanes: maxLanes, ResumeWindow: maxResumeWindow}},
+		{wire.Welcome{MaxLanes: 0, ResumeWindow: -time.Second},
+			wire.Welcome{MaxLanes: 1, ResumeWindow: 0}},
+		// What a node really sends is kept as it is.
+		{wire.Welcome{MaxLanes: 6, ResumeWindow: time.Minute},
+			wire.Welcome{MaxLanes: 6, ResumeWindow: time.Minute}},
+		{wire.Welcome{MaxLanes: 3, ResumeWindow: 60 * time.Second},
+			wire.Welcome{MaxLanes: 3, ResumeWindow: 60 * time.Second}},
+	} {
+		if got := clampWelcome(tc.in); got.MaxLanes != tc.want.MaxLanes || got.ResumeWindow != tc.want.ResumeWindow {
+			t.Errorf("clampWelcome(max %d, window %v) = max %d, window %v; want max %d, window %v",
+				tc.in.MaxLanes, tc.in.ResumeWindow, got.MaxLanes, got.ResumeWindow, tc.want.MaxLanes, tc.want.ResumeWindow)
+		}
+	}
+	// And the pool opens no more lanes than the clamp allows.
+	d := newFakeDialer()
+	p := newTestPool(t, d, PoolConfig{})
+	l := d.next(t)
+	l.mu.Lock()
+	l.welcome = wire.Welcome{MaxLanes: 255, ResumeWindow: 18 * time.Hour}
+	l.welcome.SessionID[0] = 1
+	l.mu.Unlock()
+	l.welcomedOnce.Do(func() { close(l.welcomed) })
+	time.Sleep(100 * time.Millisecond)
+	if n := p.Stats().Lanes + p.Stats().Dialing; n > maxLanes {
+		t.Fatalf("%d lanes for a node that asked for 255", n)
+	}
+}
+
 func TestPoolChurnReplacesBeforeRetiring(t *testing.T) {
 	d := newFakeDialer()
 	d.welcome = 1

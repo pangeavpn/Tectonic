@@ -115,7 +115,18 @@ type Choice struct {
 	// was chosen without Own on offer, so the client works the mode out
 	// again, Own first.
 	Cover string `json:"cover,omitempty"`
+	// At is when this mode was first chosen on the network, not when it was
+	// last used. A mode weaker than Own is worked out again once it is
+	// WeakerModeFor old, so one reset doesn't settle a network on a
+	// borrowed name for as long as the client runs. Zero counts as old.
+	At time.Time `json:"at,omitzero"`
 }
+
+// WeakerModeFor is how long a remembered mode weaker than Own is kept
+// before the client works the mode out again, Own first. It matches how
+// long a cover domain that was cut stays off the list, so when the weaker
+// mode runs out the cover domain is on offer again.
+const WeakerModeFor = ownBlockedFor
 
 // ModeStore remembers which SNI mode works on each network, so the next
 // connection goes straight to it. Implementations must be safe for

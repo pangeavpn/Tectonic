@@ -99,6 +99,11 @@ const (
 	overlapRTTs = 16
 	backoffMin  = 500 * time.Millisecond
 	backoffMax  = 30 * time.Second
+	// maxResumeWindow is the longest resume window the client takes from a
+	// WELCOME. The server's default is a minute; the wire format allows 18
+	// hours, and a client that honoured one would keep asking to rejoin a
+	// session nothing remembers.
+	maxResumeWindow = 10 * time.Minute
 )
 
 // activeTick is how often the pool re-plans while it has lanes. A variable
@@ -827,12 +832,24 @@ func (p *Pool) dialFailed(now time.Time, err error, reason string, taken []byte)
 	}
 }
 
+// clampWelcome holds what a WELCOME asks for to what the client will do.
+// The login authenticates the node, but a node that is hostile or wrong
+// says what it likes, and the wire format allows 255 lanes and an 18-hour
+// resume window. The scheduler tracks maxLanes lanes, and a session the
+// node has forgotten is worth rejoining for a minute or two, not a night.
+func clampWelcome(w wire.Welcome) wire.Welcome {
+	w.MaxLanes = uint8(min(max(1, int(w.MaxLanes)), maxLanes))
+	w.ResumeWindow = min(max(w.ResumeWindow, 0), maxResumeWindow)
+	return w
+}
+
 // welcomed records a lane's WELCOME.
 func (p *Pool) welcomed(st *laneState) {
 	if _, ok := p.lanes[st]; !ok {
 		return
 	}
 	w, _ := st.l.Welcome()
+	w = clampWelcome(w)
 	st.welcomed = true
 	st.session = w.SessionID
 	st.upAt = time.Now()
@@ -853,7 +870,7 @@ func (p *Pool) welcomed(st *laneState) {
 		p.session = w.SessionID
 		p.welcome = w
 		p.planner = shape.NewPlanner(p.cfg.Profiles.Get(w.Profile))
-		p.maxLanes = max(1, int(w.MaxLanes))
+		p.maxLanes = int(w.MaxLanes)
 		p.sessionOnce.Do(func() { close(p.sessionUp) })
 	}
 	if st.replacing != nil {

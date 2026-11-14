@@ -351,14 +351,38 @@ type recordConn struct {
 	mu     sync.Mutex
 	writes []int
 	times  []time.Time
+	// stall, while set, holds every write, as a connection whose peer has
+	// stopped reading does.
+	stall chan struct{}
 }
 
 func (c *recordConn) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	hold := c.stall
+	c.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
 	c.mu.Lock()
 	c.writes = append(c.writes, len(p))
 	c.times = append(c.times, time.Now())
 	c.mu.Unlock()
 	return c.Conn.Write(p)
+}
+
+// holdWrites stops the connection taking writes, and returns the function
+// that lets them through again.
+func (c *recordConn) holdWrites() func() {
+	hold := make(chan struct{})
+	c.mu.Lock()
+	c.stall = hold
+	c.mu.Unlock()
+	return func() {
+		c.mu.Lock()
+		c.stall = nil
+		c.mu.Unlock()
+		close(hold)
+	}
 }
 
 func (c *recordConn) sizes() []int {

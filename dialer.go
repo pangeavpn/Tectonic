@@ -291,13 +291,30 @@ func (d *dialer) setNetwork(network string, cellular bool) {
 
 func (d *dialer) state() (string, Choice) {
 	d.mu.Lock()
-	network, onCDN := d.network, d.onCDN
+	network := d.network
+	useCDN, _ := d.carrierLocked(network)
 	d.mu.Unlock()
 	c, _ := d.choice(network)
-	if onCDN {
+	if useCDN {
 		return lane.CDN.String(), c
 	}
 	return lane.Direct.String(), c
+}
+
+// carrierLocked reports whether a lane opened now would go by the CDN, and
+// whether the client is waiting out a block on the node's address. It is
+// what dial acts on and what Stats reports, so the two agree: during the
+// wait lanes go by the CDN without the dialer having given up on direct
+// ones, and a report of "direct" then would be wrong. d.mu must be held.
+func (d *dialer) carrierLocked(network string) (useCDN, waiting bool) {
+	now := time.Now()
+	cdnOK := d.cfg.Profile.CDN != nil && !now.Before(d.intercepted[network])
+	useCDN = cdnOK && d.onCDN && now.Sub(d.lastDirectTry) < directRetry
+	waiting = now.Before(d.quiet[network])
+	if waiting && cdnOK {
+		useCDN = true
+	}
+	return useCDN, waiting
 }
 
 // choice returns the SNI mode to use on network, and whether it is settled
@@ -306,13 +323,24 @@ func (d *dialer) choice(network string) (Choice, bool) {
 	if d.cfg.SNIMode != SNIAuto {
 		return Choice{Mode: d.cfg.SNIMode, Name: d.nameFor(d.cfg.SNIMode)}, true
 	}
-	if c, ok := d.modes.Mode(network); ok && d.allowed(c.Mode) && !d.ownSinceChosen(c) {
+	if c, ok := d.modes.Mode(network); ok && d.allowed(c.Mode) && !d.ownSinceChosen(c) && !d.stale(c) {
 		if c.Mode == SNIBorrowed && d.cfg.SNI != "" {
 			c.Name = d.cfg.SNI // the user's own name wins
 		}
 		return c, true
 	}
 	return Choice{}, false
+}
+
+// stale reports whether c, a mode weaker than Own, has been settled long
+// enough that the client works the mode out again. A network that reset the
+// cover domain once would otherwise keep its borrowed name for good, even
+// after the censor had gone.
+func (d *dialer) stale(c Choice) bool {
+	if c.Mode == SNIOwn || !d.allowed(SNIOwn) {
+		return false
+	}
+	return c.At.IsZero() || time.Since(c.At) >= WeakerModeFor
 }
 
 // ownSinceChosen reports whether c, a weaker mode than Own, was remembered
@@ -330,13 +358,8 @@ func (d *dialer) dial(ctx context.Context, req sched.DialRequest) (sched.PoolLan
 	}
 	d.mu.Lock()
 	network, cellular := d.network, d.cellular
-	cdnOK := d.cfg.Profile.CDN != nil && !time.Now().Before(d.intercepted[network])
-	useCDN := cdnOK && d.onCDN && time.Since(d.lastDirectTry) < directRetry
+	useCDN, waiting := d.carrierLocked(network)
 	quietUntil := d.quiet[network]
-	waiting := time.Now().Before(quietUntil)
-	if waiting && cdnOK {
-		useCDN = true
-	}
 	if !useCDN && !waiting {
 		d.lastDirectTry = time.Now()
 	}
@@ -449,6 +472,13 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 		d.directFails, d.onCDN, d.modeFails = 0, false, 0
 		if d.cfg.SNIMode == SNIAuto && c.Mode != SNIAuto {
 			c.Cover = d.cfg.Profile.CoverDomain
+			// At says when the mode was first chosen here, so that a mode
+			// that keeps working still runs out (see Choice.At). A lane
+			// that confirms the mode already remembered keeps its time.
+			c.At = time.Now()
+			if old, ok := d.modes.Mode(network); ok && old.Mode == c.Mode && old.Name == c.Name && !old.At.IsZero() {
+				c.At = old.At
+			}
 			d.modes.SetMode(network, c)
 		}
 		return

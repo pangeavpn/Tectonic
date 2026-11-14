@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/pangeavpn/tectonic/shape"
+	"github.com/pangeavpn/tectonic/wire"
 )
 
 // fakeLimiter holds DATA back while hold is set and notes what it is told.
@@ -154,5 +155,46 @@ func TestEstimateCountsAQueueTheLimitIsHolding(t *testing.T) {
 	l.drain.Store(math.Float64bits(100e3))
 	if eta := l.ETA(50_000); !near(eta, half+500*time.Millisecond, 5*time.Millisecond) {
 		t.Fatalf("ETA for 50 KB in a queue leaving at 100 KB/s = %v, want about %v", eta, half+500*time.Millisecond)
+	}
+}
+
+// A peer that sends PINGs faster than the lane writes, or that has stopped
+// reading, cannot grow the queue of control frames without bound: past
+// maxCtrl its PINGs go unanswered.
+func TestPingFloodDoesNotGrowTheControlQueue(t *testing.T) {
+	l, rc, far := recordLane(t, nil)
+	release := rc.holdWrites() // the lane sends no PINGs of its own now
+	defer release()
+
+	// A PONG is 11 bytes, so maxCtrl holds about 1500 of them. Every PING
+	// goes in one write, which returns once the lane has read them all.
+	const pings = 6000
+	var b []byte
+	for range pings {
+		b = wire.AppendHeader(b, wire.TypePing, wire.PingLen)
+		b = wire.AppendPing(b, wire.NewPingToken())
+	}
+	if err := far.write(b); err != nil {
+		t.Fatal(err)
+	}
+	// The lane has taken the bytes; give its reader a moment to work
+	// through them, and watch the queue while it does.
+	worst := 0
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); {
+		l.mu.Lock()
+		n := len(l.ctrl)
+		l.mu.Unlock()
+		worst = max(worst, n)
+		time.Sleep(time.Millisecond)
+	}
+	if worst == 0 {
+		t.Fatal("the control queue never grew; the test no longer drives the path it guards")
+	}
+	t.Logf("the control queue peaked at %d bytes, against a cap of %d and %d bytes of PONGs asked for",
+		worst, maxCtrl, pings*(wire.HeaderLen+wire.PingLen))
+	// The cap is checked before a PONG goes on, so the queue can end a
+	// frame or two past it, not more. Uncapped it reached 49544 bytes here.
+	if slack := 2 * (wire.HeaderLen + wire.PingLen); worst > maxCtrl+slack {
+		t.Fatalf("the control queue reached %d bytes, past the %d cap", worst, maxCtrl)
 	}
 }

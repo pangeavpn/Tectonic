@@ -67,6 +67,11 @@ const (
 	// DefaultLinger is how long a retiring lane waits for the peer's
 	// close_notify.
 	DefaultLinger = 10 * time.Second
+	// maxCtrl is how many bytes of control frames may wait to be written.
+	// The frames this end makes are bounded by what makes them, so this is
+	// for the PONGs the peer asks for: one record's worth, about 1500
+	// PONGs, which is far more than a lane whose peer is reading ever has.
+	maxCtrl = shape.MaxRecord
 )
 
 const (
@@ -1108,7 +1113,12 @@ func (l *Lane) readLoop() error {
 				l.onPong(tok, now)
 			} else {
 				l.mu.Lock()
-				if !l.closing {
+				// A PONG answers a PING, so the peer sets the pace. One
+				// that sends PINGs faster than this end writes, or that
+				// has stopped reading, would grow the queue without
+				// bound; past maxCtrl its PINGs go unanswered, which
+				// costs it nothing but its own round-trip estimate.
+				if !l.closing && len(l.ctrl) <= maxCtrl {
 					l.ctrl = wire.AppendHeader(l.ctrl, wire.TypePing, wire.PingLen)
 					l.ctrl = wire.AppendPong(l.ctrl, tok)
 				}
