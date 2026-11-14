@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"testing"
@@ -167,6 +168,27 @@ func TestReadSecret(t *testing.T) {
 	}
 	if _, err := readSecret(""); err == nil {
 		t.Error("empty path accepted")
+	}
+}
+
+// A secret anyone but its owner can read or write is refused.
+func TestReadSecretRefusesAnOpenFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("no Unix permissions")
+	}
+	f := filepath.Join(t.TempDir(), "node_secret")
+	os.WriteFile(f, []byte("00112233445566778899aabbccddeeff\n"), 0o600)
+	for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o620} {
+		os.Chmod(f, mode)
+		if _, err := readSecret(f); err == nil || !strings.Contains(err.Error(), "chmod 600") {
+			t.Errorf("mode %04o: %v", mode, err)
+		}
+	}
+	for _, mode := range []os.FileMode{0o600, 0o400} {
+		os.Chmod(f, mode)
+		if _, err := readSecret(f); err != nil {
+			t.Errorf("mode %04o: %v", mode, err)
+		}
 	}
 }
 

@@ -7,8 +7,10 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -30,6 +32,10 @@ const (
 	DefaultResumeWindow     = 60 * time.Second
 	DefaultHandshakeTimeout = 10 * time.Second
 	DefaultLaneIdleTimeout  = 5 * time.Minute
+	// Measured, a session costs about 250 KB and three file descriptors
+	// before it carries anything.
+	DefaultMaxSessionsPerKey = 4
+	DefaultMaxSessions       = 4096
 )
 
 // Config configures a Server.
@@ -68,6 +74,15 @@ type Config struct {
 	MaxLanesCellular int
 	// ResumeWindow is how long a session outlives its last lane (60 s).
 	ResumeWindow time.Duration
+	// MaxSessionsPerKey is how many sessions one key_id holds at once (4).
+	// A login that starts one more ends that key_id's oldest, so a device
+	// that restarts always gets in, and a key_id that leaked costs the node
+	// no more than this.
+	MaxSessionsPerKey int
+	// MaxSessions is how many sessions the node holds at once (4096). Past
+	// it a login that would start a session is refused; joining one still
+	// works.
+	MaxSessions int
 	// Shaping is the profile announced in WELCOME. Nil means the default.
 	Shaping *shape.Profile
 
@@ -120,9 +135,13 @@ type Server struct {
 
 	mu        sync.Mutex
 	sessions  map[wire.SessionID]*session
+	seq       uint64 // orders sessions by when they started
 	listeners map[net.Listener]struct{}
 	conns     map[net.Conn]struct{} // connections not yet logged in or handed off
 	closed    bool
+	// fullAt is when the node last said it was refusing sessions, so that
+	// it says so once a minute and not on every login.
+	fullAt time.Time
 
 	cover *cover
 	lanes atomic.Int64
@@ -164,6 +183,12 @@ func newServer(cfg Config, direct bool) (*Server, error) {
 	cfg.MaxLanesCellular = min(cfg.MaxLanesCellular, cfg.MaxLanes)
 	if cfg.ResumeWindow <= 0 {
 		cfg.ResumeWindow = DefaultResumeWindow
+	}
+	if cfg.MaxSessionsPerKey <= 0 {
+		cfg.MaxSessionsPerKey = DefaultMaxSessionsPerKey
+	}
+	if cfg.MaxSessions <= 0 {
+		cfg.MaxSessions = DefaultMaxSessions
 	}
 	if cfg.HandshakeTimeout <= 0 {
 		cfg.HandshakeTimeout = DefaultHandshakeTimeout
@@ -357,6 +382,14 @@ func (s *Server) checkHello(body, exporter []byte) (wire.Hello, bool) {
 	return h, ok == 1
 }
 
+// keyTag names a key_id in the log without the key_id: the first bytes of
+// its SHA-256, which tell one device's sessions apart from another's in a
+// log and match a key_id only for whoever already has it.
+func keyTag(id wire.KeyID) string {
+	h := sha256.Sum256(id[:])
+	return hex.EncodeToString(h[:6])
+}
+
 func b2i(b bool) int {
 	if b {
 		return 1
@@ -441,7 +474,7 @@ func (s *Server) EnforceRevocation() {
 	}
 	s.mu.Unlock()
 	for _, ss := range bad {
-		s.log.Info("ending session: credential no longer valid", "key_id", ss.keyID.String())
+		s.log.Info("ending session: credential no longer valid", "key", keyTag(ss.keyID))
 		ss.close(wire.CloseCredential)
 	}
 }

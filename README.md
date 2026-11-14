@@ -82,7 +82,7 @@ a node that is close but not identical, and it logs a warning at start.
 
 ```sh
 go build ./cmd/tectonic-server
-head -c 32 /dev/urandom | xxd -p -c 32 > node_secret
+(umask 077; head -c 32 /dev/urandom | xxd -p -c 32 > node_secret)
 
 ./tectonic-server serve \
   -secret-file node_secret \
@@ -111,6 +111,15 @@ check it. `tectonic-server pin -cert default.crt` prints the pin again, and
 `tectonic-server issue -secret-file node_secret -node HOST:443 -pin PIN`
 mints a test profile the way the hub does. Send SIGHUP to reload the
 certificates and the `-revoked` list.
+
+The node secret derives every device key the node accepts, so the node
+refuses a secret file that anyone but its owner can read. Keep it at mode
+600, as the `umask` above does.
+
+A credential holds `-max-sessions-per-key` sessions at once (4) and each new
+one ends its oldest, and a node holds `-max-sessions` in all (4096), past
+which a login that would start a session is refused while rejoining one
+still works.
 
 ## Testing and benchmarks
 

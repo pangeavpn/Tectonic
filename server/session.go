@@ -1,7 +1,9 @@
 package server
 
 import (
+	"cmp"
 	"crypto/rand"
+	"errors"
 	"io"
 	"net"
 	"slices"
@@ -28,6 +30,7 @@ const (
 type session struct {
 	s        *Server
 	id       wire.SessionID
+	seq      uint64 // when it started, in the order of the node's sessions
 	keyID    wire.KeyID
 	cellular bool
 	udp      *net.UDPConn
@@ -55,7 +58,9 @@ type laneInfo struct {
 func (s *Server) startLane(conn, raw net.Conn, r io.Reader, h wire.Hello) bool {
 	ss, err := s.attach(h)
 	if err != nil {
-		s.log.Warn("cannot open session", "err", err)
+		if !errors.Is(err, errFull) { // said once a minute already
+			s.log.Warn("cannot open session", "err", err)
+		}
 		return false
 	}
 	maxLanes := s.cfg.MaxLanes
@@ -124,7 +129,12 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 			return ss, nil
 		}
 	}
+	// Refuse before anything is allocated for the session.
+	_, full := s.admitLocked(h.KeyID)
 	s.mu.Unlock()
+	if full {
+		return nil, s.refuseFull()
+	}
 
 	udp, err := net.DialUDP("udp", nil, s.wgAddr)
 	if err != nil {
@@ -140,10 +150,19 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
 	ss.limit.Log = s.log.Debug
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.closed {
+		s.mu.Unlock()
 		udp.Close()
 		return nil, ErrServerClosed
+	}
+	victims, full := s.admitLocked(h.KeyID)
+	if full {
+		s.mu.Unlock()
+		udp.Close()
+		return nil, s.refuseFull()
+	}
+	for _, v := range victims {
+		delete(s.sessions, v.id)
 	}
 	for {
 		rand.Read(ss.id[:])
@@ -151,10 +170,54 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 			break
 		}
 	}
+	s.seq++
+	ss.seq = s.seq
 	s.sessions[ss.id] = ss
+	s.mu.Unlock()
+	for _, v := range victims {
+		s.log.Debug("ending a session: its key_id started a newer one", "key", keyTag(v.keyID), "limit", s.cfg.MaxSessionsPerKey)
+		v.abort()
+	}
 	go ss.readWireGuard()
-	s.log.Debug("session opened", "key_id", h.KeyID.String())
+	s.log.Debug("session opened", "key", keyTag(h.KeyID))
 	return ss, nil
+}
+
+// errFull is returned when the node holds as many sessions as it may.
+var errFull = errors.New("server: the node holds as many sessions as it may")
+
+// admitLocked decides on a new session for key. It returns the sessions of
+// key's that must end to make room, the oldest first, or reports that the
+// node is full: it holds MaxSessions and none of them would end. s.mu must
+// be held.
+func (s *Server) admitLocked(key wire.KeyID) (victims []*session, full bool) {
+	for _, ss := range s.sessions {
+		if ss.keyID == key {
+			victims = append(victims, ss)
+		}
+	}
+	if n := len(victims) - (s.cfg.MaxSessionsPerKey - 1); n > 0 {
+		slices.SortFunc(victims, func(a, b *session) int { return cmp.Compare(a.seq, b.seq) })
+		victims = victims[:n]
+	} else {
+		victims = nil
+	}
+	return victims, len(s.sessions)-len(victims) >= s.cfg.MaxSessions
+}
+
+// refuseFull says, once a minute at most, that the node is refusing new
+// sessions, and returns errFull.
+func (s *Server) refuseFull() error {
+	s.mu.Lock()
+	say := time.Since(s.fullAt) >= time.Minute
+	if say {
+		s.fullAt = time.Now()
+	}
+	s.mu.Unlock()
+	if say {
+		s.log.Warn("refusing new sessions: the node holds as many as it may", "limit", s.cfg.MaxSessions)
+	}
+	return errFull
 }
 
 func (ss *session) alive() bool {
@@ -240,7 +303,7 @@ func (ss *session) expireNow() {
 	idle := len(ss.lanes) == 0
 	ss.mu.Unlock()
 	if idle {
-		ss.s.log.Debug("session expired", "key_id", ss.keyID.String())
+		ss.s.log.Debug("session expired", "key", keyTag(ss.keyID))
 		ss.abort()
 	}
 }

@@ -304,6 +304,84 @@ func TestJoinNeedsTheSameKeyID(t *testing.T) {
 	}
 }
 
+// One key_id holds at most MaxSessionsPerKey sessions: each one past it
+// ends that key_id's oldest, and other key_ids' sessions are left alone.
+func TestSessionsPerKeyAreCapped(t *testing.T) {
+	ts := newTestServer(t, func(c *Config) { c.MaxSessionsPerKey = 3 })
+	bystander := dial(t, ts.dialCfg(t))
+	bystander.welcome(t)
+	cfg := ts.dialCfg(t) // one credential for every session below
+	var cs []*client
+	for i := range 8 {
+		c := dial(t, cfg)
+		c.welcome(t)
+		cs = append(cs, c)
+		if got, want := ts.Stats().Sessions, 1+min(i+1, 3); got != want {
+			t.Fatalf("after %d sessions of one key_id: %d sessions, want %d", i+1, got, want)
+		}
+	}
+	// The oldest five ended, the newest three and the bystander did not.
+	for i, c := range cs {
+		ended := false
+		select {
+		case <-c.l.Done():
+			ended = true
+		case <-time.After(time.Second * time.Duration(b2i(i < 5))):
+		}
+		if ended != (i < 5) {
+			t.Fatalf("session %d ended: %v", i, ended)
+		}
+	}
+	select {
+	case <-bystander.l.Done():
+		t.Fatal("another key_id's session ended")
+	default:
+	}
+	// A rejoin of a session that is still there still works.
+	w := cs[7].welcome(t)
+	cfg.Join, cfg.SessionID = true, w.SessionID
+	if dial(t, cfg).welcome(t).SessionID != w.SessionID {
+		t.Fatal("a join got a new session")
+	}
+}
+
+// Past MaxSessions a login that would start a session is refused, joining
+// one still works, and the sessions there are left alone.
+func TestFullNodeRefusesNewSessions(t *testing.T) {
+	ts := newTestServer(t, func(c *Config) { c.MaxSessions = 3 })
+	var ws []wire.Welcome
+	cfgs := make([]lane.DialConfig, 3)
+	for i := range cfgs {
+		cfgs[i] = ts.dialCfg(t)
+		ws = append(ws, dial(t, cfgs[i]).welcome(t))
+	}
+	c := dial(t, ts.dialCfg(t))
+	select {
+	case <-c.l.Welcomed():
+		t.Fatal("a fourth session started on a node that holds three")
+	case <-c.l.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refused lane was left open")
+	}
+	if n := ts.Stats().Sessions; n != 3 {
+		t.Fatalf("sessions = %d", n)
+	}
+	cfgs[0].Join, cfgs[0].SessionID = true, ws[0].SessionID
+	if dial(t, cfgs[0]).welcome(t).SessionID != ws[0].SessionID {
+		t.Fatal("a join was refused on a full node")
+	}
+	// A key_id at its own limit still gets in: its oldest session ends.
+	full := ts.dialCfg(t)
+	ts2 := newTestServer(t, func(c *Config) { c.MaxSessions, c.MaxSessionsPerKey = 2, 2 })
+	full.Addr = ts2.addr
+	for range 3 {
+		dial(t, full).welcome(t)
+	}
+	if n := ts2.Stats().Sessions; n != 2 {
+		t.Fatalf("sessions = %d, want 2", n)
+	}
+}
+
 func TestSessionOutlivesLanesForTheResumeWindow(t *testing.T) {
 	ts := newTestServer(t, func(c *Config) { c.ResumeWindow = 300 * time.Millisecond })
 	cfg := ts.dialCfg(t)

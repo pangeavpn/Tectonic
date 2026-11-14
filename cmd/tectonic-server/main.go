@@ -37,6 +37,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -101,6 +102,8 @@ func serve(args []string) error {
 	maxLanes := fs.Int("max-lanes", server.DefaultMaxLanes, "most lanes per client")
 	maxCell := fs.Int("max-lanes-cellular", server.DefaultMaxLanesCellular, "most lanes per client on cellular")
 	resume := fs.Duration("resume-window", server.DefaultResumeWindow, "how long a session outlives its last lane")
+	maxSessions := fs.Int("max-sessions", server.DefaultMaxSessions, "most sessions the node holds; past it new sessions are refused")
+	maxPerKey := fs.Int("max-sessions-per-key", server.DefaultMaxSessionsPerKey, "most sessions one key_id holds; past it its oldest ends")
 	shaping := fs.String("shaping", "", "shaping profile (JSON) to announce; default is built in")
 	revoked := fs.String("revoked", "", "file of revoked key_ids, one hex key_id per line")
 	cdnPath := fs.String("cdn-path", "", "WebSocket path for the CDN carrier (empty disables it)")
@@ -202,6 +205,8 @@ func serve(args []string) error {
 		MaxLanes:           *maxLanes,
 		MaxLanesCellular:   *maxCell,
 		ResumeWindow:       *resume,
+		MaxSessions:        *maxSessions,
+		MaxSessionsPerKey:  *maxPerKey,
 		Shaping:            profile,
 		Revoked:            rev,
 		Logger:             log,
@@ -255,9 +260,18 @@ func serve(args []string) error {
 
 // readSecret reads a secret file: hex if it decodes as hex, the raw bytes
 // otherwise. Surrounding whitespace is ignored.
+//
+// A file anyone but its owner may read or write is refused, as ssh refuses
+// a private key like that. The node secret derives every device key the
+// node accepts, so whoever reads it can log in as anyone.
 func readSecret(path string) ([]byte, error) {
 	if path == "" {
 		return nil, errors.New("no file given")
+	}
+	if fi, err := os.Stat(path); err != nil {
+		return nil, err
+	} else if m := fi.Mode().Perm(); m&0o077 != 0 && runtime.GOOS != "windows" {
+		return nil, fmt.Errorf("%s is open to others (mode %04o); make it the owner's alone: chmod 600 %s", path, m, path)
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
