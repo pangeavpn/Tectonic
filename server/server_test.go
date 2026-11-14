@@ -345,6 +345,44 @@ func TestSessionsPerKeyAreCapped(t *testing.T) {
 	}
 }
 
+// The per-key cap ends the session its key_id has gone longest without
+// using, not the one that started first. Whoever copies a credential can
+// always open sessions with it; what they must not be able to do is pick
+// off the device's own, which is the oldest of them and the busiest.
+func TestThePerKeyCapEndsTheSessionNothingIsUsing(t *testing.T) {
+	ts := newTestServer(t, func(c *Config) { c.MaxSessionsPerKey = 2 })
+	cfg := ts.dialCfg(t) // one credential for all of them
+	first := dial(t, cfg)
+	w := first.welcome(t)
+	idle := dial(t, cfg)
+	idle.welcome(t)
+
+	// A second lane logs in to the first session, so that is the one in
+	// use; the other has had nothing since it started.
+	join := cfg
+	join.Join, join.SessionID = true, w.SessionID
+	again := dial(t, join)
+	if again.welcome(t).SessionID != w.SessionID {
+		t.Fatal("the join got a new session")
+	}
+
+	third := dial(t, cfg)
+	third.welcome(t)
+	select {
+	case <-idle.l.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the session nothing had used was kept")
+	}
+	select {
+	case <-first.l.Done():
+		t.Fatal("the session in use was ended for a third one")
+	default:
+	}
+	if got := ts.Stats().Sessions; got != 2 {
+		t.Fatalf("%d sessions, want 2", got)
+	}
+}
+
 // Past MaxSessions a login that would start a session is refused, joining
 // one still works, and the sessions there are left alone.
 func TestFullNodeRefusesNewSessions(t *testing.T) {
@@ -783,23 +821,50 @@ func TestCDNLoginCannotBeReplayed(t *testing.T) {
 
 func TestReplayGuardForgetsAfterTheWindow(t *testing.T) {
 	var g replayGuard
+	var id wire.KeyID
 	t0 := time.Unix(1_800_000_000, 0)
-	if !g.fresh("k1", t0) || g.fresh("k1", t0) || g.fresh("k1", t0.Add(replayFor-time.Second)) {
+	fresh := func(key string, at time.Time) bool { return g.check(key, id, at) == keyFresh }
+	if !fresh("k1", t0) || fresh("k1", t0) || fresh("k1", t0.Add(replayFor-time.Second)) {
 		t.Fatal("a key was accepted twice inside the window")
 	}
-	if !g.fresh("k2", t0) {
+	if !fresh("k2", t0) {
 		t.Fatal("another key was refused")
 	}
 	// Kept for between one and two windows, then forgotten.
-	if g.fresh("k1", t0.Add(replayFor)) {
+	if fresh("k1", t0.Add(replayFor)) {
 		t.Fatal("a key one window old was forgotten")
 	}
-	if !g.fresh("k1", t0.Add(3*replayFor)) {
+	if !fresh("k1", t0.Add(3*replayFor)) {
 		t.Fatal("a key three windows old was still remembered")
 	}
 	// A clock that jumps back rotates rather than trusting the old set.
-	if g.fresh("k1", t0) {
+	if fresh("k1", t0) {
 		t.Fatal("a key just seen was accepted after the clock went back")
+	}
+}
+
+// One credential cannot fill the set and so refuse every other client's
+// CDN logins. It fills its own share of it and no more, and a second
+// credential is still let in.
+func TestReplayGuardHoldsOneKeyIDToItsShare(t *testing.T) {
+	var g replayGuard
+	now := time.Unix(1_800_000_000, 0)
+	var hog, other wire.KeyID
+	hog[0], other[0] = 1, 2
+	for i := range maxReplayPerKey {
+		if got := g.check(fmt.Sprintf("hog-%d", i), hog, now); got != keyFresh {
+			t.Fatalf("the %dth of a key_id's share was refused: %v", i, got)
+		}
+	}
+	if got := g.check("hog-over", hog, now); got != keyIDFull {
+		t.Fatalf("past its share the verdict was %v, want keyIDFull", got)
+	}
+	if got := g.check("other", other, now); got != keyFresh {
+		t.Fatalf("another key_id's login was refused: %v", got)
+	}
+	// The share comes back with the window, like the rest of the set.
+	if got := g.check("hog-again", hog, now.Add(replayFor)); got != keyFresh {
+		t.Fatalf("a window later the share was still full: %v", got)
 	}
 }
 

@@ -282,11 +282,20 @@ func (s *Server) serveCDN(w http.ResponseWriter, r *http.Request, raw net.Conn) 
 	// A login is bound to this key, and each key opens one lane: see
 	// replayGuard. The check runs only on a login that is otherwise valid,
 	// so what a probe sees is unchanged.
-	if !s.replay.fresh(key, s.now()) {
-		if s.replay.sayFull(s.now()) {
-			s.log.Warn("refusing CDN logins: too many keys to remember", "limit", maxReplaySeen)
-		} else {
-			s.log.Warn("refusing a CDN login whose WebSocket key was used already", "key", keyTag(h.KeyID))
+	switch v := s.replay.check(key, h.KeyID, s.now()); v {
+	case keyFresh:
+	case keyUsed:
+		s.log.Warn("refusing a CDN login whose WebSocket key was used already", "key", keyTag(h.KeyID))
+		conn.Close()
+		return
+	default:
+		if s.replay.saySo(s.now()) {
+			if v == keyIDFull {
+				s.log.Warn("refusing a key_id's CDN logins: it has more keys to remember than its share of the node",
+					"key", keyTag(h.KeyID), "limit", maxReplayPerKey)
+			} else {
+				s.log.Warn("refusing CDN logins: too many keys to remember", "limit", maxReplaySeen)
+			}
 		}
 		conn.Close()
 		return

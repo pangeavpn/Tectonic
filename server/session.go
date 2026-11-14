@@ -8,6 +8,7 @@ import (
 	"net"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pangeavpn/tectonic/lane"
@@ -28,9 +29,15 @@ const (
 // and the session lives on for the resume window after the last one goes
 // (design §4, step 7).
 type session struct {
-	s        *Server
-	id       wire.SessionID
-	seq      uint64 // when it started, in the order of the node's sessions
+	s   *Server
+	id  wire.SessionID
+	seq uint64 // when it started, in the order of the node's sessions
+	// joined is when a lane last logged in to the session, in unix nanos.
+	// Lanes are short-lived, so a session in use takes a new one every
+	// minute or two and a session nothing is using does not. It is what
+	// the per-key limit ends the oldest of (see admitLocked), and it is
+	// read without the session's lock.
+	joined   atomic.Int64
 	keyID    wire.KeyID
 	cellular bool
 	udp      *net.UDPConn
@@ -147,6 +154,7 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 		})
 	}
 	ss := &session{s: s, keyID: h.KeyID, cellular: h.Cellular(), udp: udp, done: make(chan struct{})}
+	ss.joined.Store(time.Now().UnixNano())
 	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
 	ss.limit.Log = s.log.Debug
 	s.mu.Lock()
@@ -175,7 +183,7 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 	s.sessions[ss.id] = ss
 	s.mu.Unlock()
 	for _, v := range victims {
-		s.log.Debug("ending a session: its key_id started a newer one", "key", keyTag(v.keyID), "limit", s.cfg.MaxSessionsPerKey)
+		s.log.Debug("ending the session its key_id has used least recently", "key", keyTag(v.keyID), "limit", s.cfg.MaxSessionsPerKey)
 		v.abort()
 	}
 	go ss.readWireGuard()
@@ -187,9 +195,16 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 var errFull = errors.New("server: the node holds as many sessions as it may")
 
 // admitLocked decides on a new session for key. It returns the sessions of
-// key's that must end to make room, the oldest first, or reports that the
-// node is full: it holds MaxSessions and none of them would end. s.mu must
-// be held.
+// key's that must end to make room, or reports that the node is full: it
+// holds MaxSessions and none of them would end. s.mu must be held.
+//
+// What ends is whatever has gone longest without a lane logging in, and
+// not whatever started first. A device in use takes a new lane every
+// minute or two, where a session left behind by a device that is asleep,
+// or opened by whoever copied the credential, takes none: by the time the
+// copy is costing the node its four sessions, the device's own is the one
+// of the four that is still being used. Ending the first to start instead
+// would always end the device's, however busy it was.
 func (s *Server) admitLocked(key wire.KeyID) (victims []*session, full bool) {
 	for _, ss := range s.sessions {
 		if ss.keyID == key {
@@ -197,7 +212,12 @@ func (s *Server) admitLocked(key wire.KeyID) (victims []*session, full bool) {
 		}
 	}
 	if n := len(victims) - (s.cfg.MaxSessionsPerKey - 1); n > 0 {
-		slices.SortFunc(victims, func(a, b *session) int { return cmp.Compare(a.seq, b.seq) })
+		slices.SortFunc(victims, func(a, b *session) int {
+			if c := cmp.Compare(a.joined.Load(), b.joined.Load()); c != 0 {
+				return c
+			}
+			return cmp.Compare(a.seq, b.seq)
+		})
 		victims = victims[:n]
 	} else {
 		victims = nil
@@ -238,7 +258,9 @@ func (ss *session) add(l *lane.Lane, maxLanes int) bool {
 		ss.expire.Stop()
 		ss.expire = nil
 	}
-	ss.lanes = append(ss.lanes, &laneInfo{l: l, quietAt: time.Now()})
+	now := time.Now()
+	ss.joined.Store(now.UnixNano())
+	ss.lanes = append(ss.lanes, &laneInfo{l: l, quietAt: now})
 	var victim *lane.Lane
 	if n := ss.liveLocked(); n > maxLanes+laneSlack {
 		for _, li := range ss.lanes {
