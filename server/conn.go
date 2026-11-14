@@ -74,8 +74,9 @@ type conn struct {
 	exporter []byte // what a HELLO on this connection is bound to
 
 	// Reading is the web server's, one read at a time.
-	read bool   // the first read has been made
-	held []byte // read from the client and not yet given to the web server
+	read   bool   // the first read has been made
+	held   []byte // read from the client and not yet given to the web server
+	peeked []byte // the first record, read by the peek and not looked at yet
 
 	// mu orders the web server's writes and the hand-over to a lane.
 	mu     sync.Mutex
@@ -123,6 +124,12 @@ func (c *conn) HandshakeContext(ctx context.Context) error {
 // buffered and never waits for the network. Whether the record is there
 // depends on when it arrives and not on what it holds, and the check itself
 // runs on whatever is there, as it does in the web server's first read.
+//
+// Nothing here waits. The web server has not written its SETTINGS frame
+// yet, so a wait would hold it up, and no web server's does. A record that
+// ends inside a tag that is right so far is the one case that would wait,
+// and it is left to the web server's own first read, which waits while the
+// frame goes out from a goroutine of its own.
 func (c *conn) peekLogin() bool {
 	if err := c.Conn.SetReadDeadline(time.Unix(1, 0)); err != nil {
 		return false
@@ -138,8 +145,13 @@ func (c *conn) peekLogin() bool {
 		_ = err
 		return false
 	}
+	taken, more := c.checkFirst(buf, n, false)
+	if more {
+		c.peeked = buf[:n]
+		return false
+	}
 	c.read = true
-	return c.checkFirst(buf, n)
+	return taken
 }
 
 func (c *conn) prepare() {
@@ -180,13 +192,22 @@ func (c *conn) Read(p []byte) (int, error) {
 }
 
 // firstRead makes the web server's first read and looks at what it brings.
+// The peek may have taken the record already, in which case this read is
+// of those bytes and waits only for what they are short of.
 func (c *conn) firstRead(p []byte) (int, error) {
-	buf := make([]byte, max(len(p), helloLen))
-	n, err := c.Conn.Read(buf)
-	if n == 0 {
-		return 0, err
+	n := len(c.peeked)
+	buf := make([]byte, max(len(p), helloLen, n))
+	if n > 0 {
+		copy(buf, c.peeked)
+		c.peeked = nil
+	} else {
+		m, err := c.Conn.Read(buf)
+		if m == 0 {
+			return 0, err
+		}
+		n = m
 	}
-	if c.checkFirst(buf, n) {
+	if taken, _ := c.checkFirst(buf, n, true); taken {
 		return 0, net.ErrClosed
 	}
 	// An error that came with data comes again on the next read.
@@ -198,26 +219,38 @@ func (c *conn) firstRead(p []byte) (int, error) {
 // checkFirst looks for a login in buf[:n], the client's first record. It
 // reports whether a lane took the connection; otherwise the record is the
 // web server's, whole, and waits in c.held.
-func (c *conn) checkFirst(buf []byte, n int) bool {
-	if h, ok := c.login(buf, &n); ok {
+//
+// wait says whether a record that ends inside a tag that is right so far
+// may be waited on. Where it may not, checkFirst reports more instead, and
+// the record is neither handed over nor held.
+func (c *conn) checkFirst(buf []byte, n int, wait bool) (taken, more bool) {
+	h, ok, more := c.login(buf, &n, wait)
+	if more {
+		return false, true
+	}
+	if ok {
 		c.handOver(h, buf[helloLen:n])
-		return true
+		return true, false
 	}
 	c.held = buf[:n]
-	return false
+	return false, false
 }
 
 // login reports whether buf[:n], the client's first record, starts with a
 // valid HELLO. If the record ends inside a tag that is right so far, login
-// reads on for the rest and moves n along.
-func (c *conn) login(buf []byte, n *int) (wire.Hello, bool) {
+// reads on for the rest and moves n along when it may wait, and otherwise
+// reports more: the record is a login's beginning and nothing else.
+func (c *conn) login(buf []byte, n *int, wait bool) (wire.Hello, bool, bool) {
 	got := buf[:min(*n, helloLen)]
 	h, ok := c.s.checkHello(got[min(len(got), wire.HeaderLen):], c.exporter)
 	if !ok || !c.tls13 || len(got) < helloMin || !startsHello(got) {
-		return h, false
+		return h, false, false
 	}
 	if len(got) == helloLen {
-		return h, true
+		return h, true, false
+	}
+	if !wait {
+		return h, false, true
 	}
 	// Only the holder of the device key reaches here, so the wait is
 	// bounded rather than left to the web server's own (see restOfTag).
@@ -228,10 +261,11 @@ func (c *conn) login(buf []byte, n *int) (wire.Hello, bool) {
 		// The web server has the record, and reads on with the time it
 		// gives any client that has sent it nothing yet.
 		c.Conn.SetReadDeadline(time.Now().Add(c.s.cfg.HandshakeTimeout))
-		return h, false
+		return h, false, false
 	}
 	c.Conn.SetReadDeadline(time.Time{})
-	return c.s.checkHello(buf[wire.HeaderLen:helloLen], c.exporter)
+	h, ok = c.s.checkHello(buf[wire.HeaderLen:helloLen], c.exporter)
+	return h, ok, false
 }
 
 // handOver takes the connection from the web server and starts it as a
