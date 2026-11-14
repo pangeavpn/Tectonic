@@ -30,8 +30,8 @@ const (
 	// default certificate against a pin.
 	SNIBorrowed
 	// SNINone sends no server name, as Chrome does for https://<IP>, and
-	// checks the default certificate against a pin, or accepts a trusted IP
-	// certificate.
+	// checks the default certificate against a pin. Only with no pins does
+	// it accept a trusted certificate for the node's IP address instead.
 	SNINone
 )
 
@@ -87,6 +87,8 @@ type DialConfig struct {
 	// the CDN edge's host name (CDN). It is ignored in None mode.
 	ServerName string
 	// Pins are the node's default-certificate pins, for Borrowed and None.
+	// In None mode a certificate for the node's IP address from a trusted
+	// root is accepted only when there are none.
 	Pins []Pin
 	// OwnPins, if set, are the keys the node's own certificate may hold. Own
 	// mode then requires a match as well as a valid certificate for the
@@ -352,6 +354,10 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 		return nil, err
 	}
 	if err := uconn.HandshakeContext(ctx); err != nil {
+		var bad *utls.CertificateVerificationError
+		if errors.As(err, &bad) {
+			err = fmt.Errorf("%w: %w", ErrCertificate, err)
+		}
 		return nil, err
 	}
 	if uconn.ConnectionState().Version != utls.VersionTLS13 {

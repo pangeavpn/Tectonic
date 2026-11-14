@@ -36,30 +36,44 @@ func ParsePin(s string) (Pin, error) {
 // String returns the pin in base64.
 func (p Pin) String() string { return base64.StdEncoding.EncodeToString(p[:]) }
 
-// errPinMismatch is returned when no certificate matches a pin.
-var errPinMismatch = errors.New("lane: server certificate matches no pin")
+// ErrCertificate means the server's certificate failed the lane's check: it
+// was not valid for the name, or its key matched no pin. Something other
+// than the node finished the TLS handshake, such as a TLS interceptor, a
+// captive portal or the wrong server, and the lane sent it nothing.
+var ErrCertificate = errors.New("lane: the server's certificate failed the check")
 
-// verifyPinned accepts the chain if its leaf matches a pin. Otherwise, if
-// ipHost is set, it accepts a certificate issued for that IP address by a
-// trusted root (None mode with a Let's Encrypt IP certificate).
+// errPinMismatch is returned when no certificate matches a pin.
+var errPinMismatch = fmt.Errorf("%w: it matches no pin", ErrCertificate)
+
+// verifyPinned accepts the chain if its leaf matches a pin. With no pins
+// and ipHost set, it accepts a certificate issued for that IP address by a
+// trusted root instead (None mode with a Let's Encrypt IP certificate).
+//
+// Pins rule the IP certificate out. A TLS interceptor whose CA the device
+// trusts can issue a certificate for any address, so accepting one beside
+// the pins would hand it the login the pins are there to keep from it. A
+// node with pins that serves an IP certificate has its key pinned too.
 func verifyPinned(rawCerts [][]byte, pins []Pin, roots *x509.CertPool, ipHost string) error {
 	if len(rawCerts) == 0 {
-		return errors.New("lane: server sent no certificate")
+		return fmt.Errorf("%w: the server sent none", ErrCertificate)
 	}
 	leaf, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %w", ErrCertificate, err)
 	}
-	got := PinOf(leaf)
-	match := 0
-	for _, p := range pins {
-		match |= subtle.ConstantTimeCompare(got[:], p[:])
-	}
-	if match == 1 {
-		return nil
+	if len(pins) > 0 {
+		got := PinOf(leaf)
+		match := 0
+		for _, p := range pins {
+			match |= subtle.ConstantTimeCompare(got[:], p[:])
+		}
+		if match == 1 {
+			return nil
+		}
+		return errPinMismatch
 	}
 	if ipHost == "" {
-		return errPinMismatch
+		return fmt.Errorf("%w: no pins, and no IP address to check it for", ErrCertificate)
 	}
 	inter := x509.NewCertPool()
 	for _, raw := range rawCerts[1:] {
@@ -68,7 +82,7 @@ func verifyPinned(rawCerts [][]byte, pins []Pin, roots *x509.CertPool, ipHost st
 		}
 	}
 	if _, err := leaf.Verify(x509.VerifyOptions{DNSName: ipHost, Roots: roots, Intermediates: inter}); err != nil {
-		return fmt.Errorf("%w, and no valid IP certificate: %v", errPinMismatch, err)
+		return fmt.Errorf("%w: no pins, and no valid IP certificate: %w", ErrCertificate, err)
 	}
 	return nil
 }

@@ -55,6 +55,21 @@ const (
 // node's address.
 var errResidualWait = errors.New("tectonic: waiting out a block on the node's address")
 
+// A certificate that fails a lane's check (lane.ErrCertificate) means
+// something other than the node finished the TLS handshake: a TLS
+// interceptor, such as a corporate proxy, a captive portal or a state
+// certificate the device was made to trust, or the wrong server. The lane
+// sent it nothing. That is not a censor's reset, so it marks neither the
+// cover domain nor the node's address as blocked, and the search goes on to
+// the next mode, whose pin refuses an interceptor in the same way.
+//
+// The CDN carrier is different: it checks the edge by name alone, which an
+// interceptor the device trusts passes, and the first thing a CDN lane
+// sends after the WebSocket upgrade is its login. So once a lane on a
+// network has met such a certificate, new lanes there don't go by the CDN
+// for interceptedFor, and each new such certificate starts the time again.
+const interceptedFor = 6 * time.Hour
+
 // How long an SNI mode may make no progress, on a network the client hasn't
 // seen, before the next mode is tried alongside it (see tryModes). The wait
 // starts when the mode's ClientHello goes out and starts again when its TLS
@@ -119,9 +134,11 @@ type dialer struct {
 	modeFails     int
 	// ownBlocked and quiet are, per network, until when the cover domain
 	// is not tried (see ownBlockedFor), and until when no direct lane is
-	// (see residualWait).
-	ownBlocked map[string]time.Time
-	quiet      map[string]time.Time
+	// (see residualWait). intercepted is until when no CDN lane is (see
+	// interceptedFor).
+	ownBlocked  map[string]time.Time
+	quiet       map[string]time.Time
+	intercepted map[string]time.Time
 }
 
 func newDialer(cfg Config) (*dialer, error) {
@@ -137,16 +154,17 @@ func newDialer(cfg Config) (*dialer, error) {
 		return nil, errors.New("tectonic: profile key_id must be 20 bytes and device_key 32")
 	}
 	d := &dialer{
-		cfg:        cfg,
-		node:       node,
-		sessions:   utls.NewLRUClientSessionCache(64),
-		modes:      cfg.Modes,
-		stallMin:   modeStallMin,
-		stallMax:   modeStallMax,
-		ownBlocked: map[string]time.Time{},
-		quiet:      map[string]time.Time{},
-		network:    cfg.Network,
-		cellular:   cfg.Cellular,
+		cfg:         cfg,
+		node:        node,
+		sessions:    utls.NewLRUClientSessionCache(64),
+		modes:       cfg.Modes,
+		stallMin:    modeStallMin,
+		stallMax:    modeStallMax,
+		ownBlocked:  map[string]time.Time{},
+		quiet:       map[string]time.Time{},
+		intercepted: map[string]time.Time{},
+		network:     cfg.Network,
+		cellular:    cfg.Cellular,
 	}
 	copy(d.keyID[:], p.KeyID)
 	copy(d.deviceKey[:], p.DeviceKey)
@@ -207,8 +225,10 @@ func (d *dialer) allowed(m SNIMode) bool {
 	case SNIBorrowed:
 		return len(d.pins) > 0 && (d.cfg.SNI != "" || len(d.cfg.Profile.BorrowedSNI) > 0)
 	case SNINone:
-		// Pinned, or a trusted IP certificate.
-		return true
+		// Pinned, or, with no pins, a trusted certificate for the node's
+		// IP address.
+		host, _, _ := net.SplitHostPort(d.node)
+		return len(d.pins) > 0 || net.ParseIP(host) != nil
 	}
 	return false
 }
@@ -310,10 +330,11 @@ func (d *dialer) dial(ctx context.Context, req sched.DialRequest) (sched.PoolLan
 	}
 	d.mu.Lock()
 	network, cellular := d.network, d.cellular
-	useCDN := d.cfg.Profile.CDN != nil && d.onCDN && time.Since(d.lastDirectTry) < directRetry
+	cdnOK := d.cfg.Profile.CDN != nil && !time.Now().Before(d.intercepted[network])
+	useCDN := cdnOK && d.onCDN && time.Since(d.lastDirectTry) < directRetry
 	quietUntil := d.quiet[network]
 	waiting := time.Now().Before(quietUntil)
-	if waiting && d.cfg.Profile.CDN != nil {
+	if waiting && cdnOK {
 		useCDN = true
 	}
 	if !useCDN && !waiting {
@@ -390,6 +411,7 @@ func (d *dialer) laneConfig(req sched.DialRequest, cellular bool) lane.DialConfi
 // carrier and whether a remembered SNI mode still works.
 func (d *dialer) watch(l *lane.Lane, err error, carrier lane.Carrier, c Choice, network string) {
 	if err != nil {
+		d.refused(network, err)
 		d.outcome(false, carrier, c, network)
 		return
 	}
@@ -432,7 +454,8 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 		return
 	}
 	d.directFails++
-	if d.cfg.Profile.CDN != nil && d.directFails >= directFailLimit && !d.onCDN {
+	if d.cfg.Profile.CDN != nil && d.directFails >= directFailLimit && !d.onCDN &&
+		!time.Now().Before(d.intercepted[network]) {
 		d.onCDN = true
 		d.log.Info("direct lanes failing; switching to the CDN carrier")
 	}
@@ -446,18 +469,40 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 	}
 }
 
+// refused learns from a lane that failed with err: if its certificate
+// failed the check, something on network intercepts TLS, and no lane goes
+// by the CDN there for interceptedFor.
+func (d *dialer) refused(network string, err error) {
+	if !errors.Is(err, lane.ErrCertificate) {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	if !now.Before(d.intercepted[network]) {
+		d.log.Warn("a lane met a certificate that failed its check; not using the CDN on this network",
+			"network", network, "for", interceptedFor, "err", err)
+	}
+	d.intercepted[network] = now.Add(interceptedFor)
+	if network == d.network && d.onCDN {
+		d.onCDN = false
+		d.directFails = 0
+	}
+}
+
 // blocked learns from a search. An attempt whose ClientHello went out and
 // that then failed, other than by the server answering as a web server
-// does, or that never heard back, was blocked. If Own was, the cover domain
-// is not tried on this network for ownBlockedFor. If no mode logged in and
-// two were blocked, the block is on the address, and no direct lane is
-// tried for residualWait. An attempt that never got its ClientHello out
-// says nothing about either: the network may simply be down.
+// does or by a certificate that failed the check, or that never heard back,
+// was blocked. If Own was, the cover domain is not tried on this network
+// for ownBlockedFor. If no mode logged in and two were blocked, the block
+// is on the address, and no direct lane is tried for residualWait. An
+// attempt that never got its ClientHello out says nothing about either:
+// the network may simply be down.
 func (d *dialer) blocked(network string, attempts []*attempt, won *attempt, hello, cut map[*attempt]bool) {
 	n := 0
 	own := false
 	for _, a := range attempts {
-		if a == won || !hello[a] {
+		if a == won || !hello[a] || a.refused {
 			continue
 		}
 		// An attempt still open when the search ended never heard back.
@@ -607,9 +652,14 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 			case failed:
 				open--
 				errs = append(errs, fmt.Errorf("%v: %w", ev.a.c.Mode, ev.err))
-				if !ev.sent {
+				switch {
+				case !ev.sent:
 					halted = true
-				} else if !errors.Is(ev.err, lane.ErrLoginFailed) {
+				case errors.Is(ev.err, lane.ErrCertificate):
+					// Not a block: an interceptor, or the wrong server.
+					ev.a.refused = true
+					d.refused(network, ev.err)
+				case !errors.Is(ev.err, lane.ErrLoginFailed):
 					cut[ev.a] = true
 				}
 				if newest {
@@ -657,11 +707,12 @@ type modeSearch struct {
 // attempt is one SNI mode's try at logging in.
 type attempt struct {
 	c Choice
-	// wait is the attempt's stallBound, and login whether its login has
-	// been sent, as far as tryModes's loop has heard. Only the loop's
-	// goroutine uses them.
-	wait  time.Duration
-	login bool
+	// wait is the attempt's stallBound, login whether its login has been
+	// sent, and refused whether it failed on the server's certificate, as
+	// far as tryModes's loop has heard. Only the loop's goroutine uses them.
+	wait    time.Duration
+	login   bool
+	refused bool
 
 	// Guarded by modeSearch.mu.
 	l    *lane.Lane // from when its login has been written

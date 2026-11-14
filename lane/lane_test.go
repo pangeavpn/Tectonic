@@ -94,16 +94,22 @@ func TestPinMismatchFails(t *testing.T) {
 		cfg := n.dialConfig(t, mode)
 		cfg.Pins = []Pin{{1, 2, 3}}
 		cfg.RootCAs = nil
-		if _, err := Dial(context.Background(), cfg); err == nil {
-			t.Fatalf("%v: dial succeeded with the wrong pin", mode)
+		if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrCertificate) {
+			t.Fatalf("%v: dial with the wrong pin: %v, want ErrCertificate", mode, err)
 		}
 	}
 	// Own mode checks the name: a server with a certificate for another
 	// name must fail.
 	cfg := n.dialConfig(t, SNIOwn)
 	cfg.ServerName = "other.test"
-	if _, err := Dial(context.Background(), cfg); err == nil {
-		t.Fatal("own mode accepted a certificate for the wrong name")
+	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrCertificate) {
+		t.Fatalf("own mode with a certificate for the wrong name: %v, want ErrCertificate", err)
+	}
+	// And with own_pins, a valid certificate whose key isn't pinned.
+	cfg = n.dialConfig(t, SNIOwn)
+	cfg.OwnPins = []Pin{{1, 2, 3}}
+	if _, err := Dial(context.Background(), cfg); !errors.Is(err, ErrCertificate) {
+		t.Fatalf("own mode with an unpinned key: %v, want ErrCertificate", err)
 	}
 }
 

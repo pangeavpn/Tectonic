@@ -18,8 +18,10 @@ import (
 )
 
 // interceptor is a TLS-intercepting middlebox: it answers every connection
-// with a certificate for the cover domain from its own CA, and reports how
-// many plaintext bytes each client sent it after the handshake.
+// with a certificate from its own CA for the cover domain and for its own
+// IP address, as an interceptor mints one for whatever the client asked,
+// and reports how many plaintext bytes each client sent it after the
+// handshake.
 func interceptor(t *testing.T) (addr string, roots *x509.CertPool, read <-chan int) {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -33,7 +35,8 @@ func interceptor(t *testing.T) (addr string, roots *x509.CertPool, read <-chan i
 	leafKey, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	leafDER, _ := x509.CreateCertificate(rand.Reader, &x509.Certificate{
 		SerialNumber: big.NewInt(3), DNSNames: []string{coverDomain},
-		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+		IPAddresses: []net.IP{net.IPv4(127, 0, 0, 1)},
+		NotBefore:   time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
 	}, ca, &leafKey.PublicKey, key)
 	cert := tls.Certificate{Certificate: [][]byte{leafDER}, PrivateKey: leafKey}
 
@@ -54,7 +57,7 @@ func interceptor(t *testing.T) (addr string, roots *x509.CertPool, read <-chan i
 			}
 			go func() {
 				defer c.Close()
-				s := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2"}})
+				s := tls.Server(c, &tls.Config{Certificates: []tls.Certificate{cert}, NextProtos: []string{"h2", "http/1.1"}})
 				if s.Handshake() != nil {
 					ch <- 0
 					return
@@ -89,6 +92,36 @@ func TestOwnPinsRefuseTrustedInterceptor(t *testing.T) {
 			p.OwnPins = []string{ownPin(t)}
 		}
 		c, err := tectonic.Dial(context.Background(), tectonic.Config{Profile: p, RootCAs: roots, SNIMode: tectonic.SNIOwn})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := c.WaitForSession(context.Background(), 1500*time.Millisecond); err == nil {
+			t.Fatalf("pinned=%v: a session came up through the interceptor", pinned)
+		}
+		c.Close()
+		got := <-read
+		if pinned && got != 0 {
+			t.Fatalf("pinned: the interceptor read %d plaintext bytes", got)
+		}
+		if !pinned && got == 0 {
+			t.Fatal("unpinned: the interceptor read nothing; the test no longer shows the leak it guards against")
+		}
+	}
+}
+
+// None mode with pins refuses a certificate for the node's IP address from
+// a CA the device trusts, which an interceptor can mint for any address.
+// Without pins it accepts one, as a Let's Encrypt IP certificate.
+func TestNoneModePinsRefuseTrustedIPCertificate(t *testing.T) {
+	n := startNode(t, "127.0.0.1:9", nil)
+	for _, pinned := range []bool{true, false} {
+		addr, roots, read := interceptor(t)
+		p := n.profile(t)
+		p.Node = addr
+		if !pinned {
+			p.Pins = nil
+		}
+		c, err := tectonic.Dial(context.Background(), tectonic.Config{Profile: p, RootCAs: roots, SNIMode: tectonic.SNINone})
 		if err != nil {
 			t.Fatal(err)
 		}

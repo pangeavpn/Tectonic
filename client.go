@@ -44,7 +44,9 @@ type Profile struct {
 	KeyID     []byte `json:"key_id"`
 	DeviceKey []byte `json:"device_key"`
 	// Pins are base64 SHA-256 hashes of the node's default certificate's
-	// public key, checked in Borrowed and None mode.
+	// public key, checked in Borrowed and None mode. Without them, None
+	// mode accepts a certificate for the node's IP address from a trusted
+	// root instead; with them, it accepts nothing else.
 	Pins []string `json:"pins,omitempty"`
 	// OwnPins are base64 SHA-256 hashes of the public keys the node's own
 	// certificate may hold. When set, Own mode accepts the certificate only

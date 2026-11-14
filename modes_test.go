@@ -994,3 +994,78 @@ func TestModeDownNetworkBlocksNothing(t *testing.T) {
 	}
 	r.wantSent(modeCover)
 }
+
+// startImpostor runs a TLS server that is not the node: its certificate is
+// self-signed for the cover domain, so it passes neither the check by name
+// nor a pin, as an interceptor the device doesn't trust, or the wrong
+// server, would.
+func startImpostor(t *testing.T) string {
+	t.Helper()
+	k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(9), Subject: pkix.Name{CommonName: modeCover}, DNSNames: []string{modeCover},
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(24 * time.Hour),
+	}
+	der, _ := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &k.PublicKey, k)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: k}},
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				c.SetReadDeadline(time.Now().Add(2 * time.Second))
+				io.Copy(io.Discard, c)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// A certificate that fails the check is an interceptor or the wrong
+// server, not a censor. The search moves on as it does after a reset, but
+// the cover domain is not marked blocked and no wait on the address starts.
+// And since the CDN carrier checks its edge by name alone, which an
+// interceptor the device trusts passes, new lanes stay off the CDN on that
+// network however many direct lanes fail.
+func TestModeRefusedCertificateIsNotABlock(t *testing.T) {
+	const edge = "edge.cdn.test"
+	r := newModeRig(t, func(cfg *Config) {
+		cfg.Profile.CDN = &CDNRoute{Host: edge, Path: "/socket", Edge: "127.0.0.1:9"}
+	})
+	imp := startImpostor(t)
+	for _, name := range []string{modeCover, modeBorrowed, ""} {
+		r.net.routes[name] = imp
+	}
+	var want []string
+	for i := range directFailLimit + 1 {
+		if _, err := r.dial(); !errors.Is(err, lane.ErrCertificate) {
+			t.Fatalf("dial %d: %v, want lane.ErrCertificate", i, err)
+		}
+		// Each search tries every mode, Own first, and none goes by the CDN.
+		want = append(want, modeCover, modeBorrowed, "")
+		r.wantSent(want...)
+	}
+	r.d.mu.Lock()
+	ownBlocked, quiet, onCDN := r.d.ownBlocked[modeNetwork], r.d.quiet[modeNetwork], r.d.onCDN
+	r.d.mu.Unlock()
+	if !ownBlocked.IsZero() || !quiet.IsZero() || onCDN {
+		t.Fatalf("own blocked until %v, quiet until %v, on the CDN %v; want none of them", ownBlocked, quiet, onCDN)
+	}
+	// Once the connections reach the node, Own works at once.
+	r.net.mu.Lock()
+	clear(r.net.routes)
+	r.net.mu.Unlock()
+	r.mustDial()
+	r.wantSent(append(want, modeCover)...)
+	r.wantRemembered(SNIOwn)
+}
