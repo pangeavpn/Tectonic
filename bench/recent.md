@@ -376,6 +376,39 @@ new frame type. And a slow lane that paces now sends records smaller than
   was run. The Darwin code that reads the connection's window compiles and
   is untested.
 
+## The first packet, since the lane opening became the cover site's
+
+Measured 2026-11-14 on the same machine, six runs of `-run ttfp -kernel`
+per build, after a full pass read 2.15 RTT against this file's 2.03–2.08.
+The move is real and it is not this round's: `853c24a` reads 2.08–2.10 and
+the tree now reads 2.15–2.21. Four runs at each commit in between put all
+of it on one:
+
+| At | Time to first packet |
+|---|---|
+| `853c24a` (this file's build) | 2.05–2.10 |
+| `73bd53f` own_pins in Own mode | 2.08–2.11 |
+| `e925d0a` try Own again once offered | 2.09–2.11 |
+| `f000e11` close a client lane with a FIN | 2.08–2.11 |
+| **`aec00ad` open lanes with the records the cover web server sends** | **2.19–2.21** |
+| `4204b68`, `1329afc`, `af53851`, `22899fe` | 2.19–2.25 |
+
+So opening a lane with the cover web server's own records, rather than a
+SETTINGS frame of our own, costs about 0.1 RTT — 5 ms on this 50 ms link —
+to the first WireGuard packet, once per session. The client reads past the
+whole opening before it reaches `WELCOME` (`337a1b6`), and the opening is
+now a page's first flight rather than a frame. That is the point of it: a
+lane's first flight is what a browser gets, byte for byte, which is what
+[section 9](../docs/design.md#9-what-an-observer-sees) asks for. The 2 RTT
+target is kept here as a record of the cost, not as something to win back
+by opening lanes unlike the cover site.
+
+The clean-link figure belongs in the "varies" list with cap, latency and
+the lossy paths. Six runs per build: `853c24a` 86–97% (median 95.5%), the
+tree now 91–97% (median 94%), with this round's fixes 89–96% (median
+95.5%). Seventeen of eighteen runs meet the 90% target, so a single pass
+below it means nothing.
+
 ## Reproducing
 
 Load the modules once per boot, as root, in a real terminal:
