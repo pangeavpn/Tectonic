@@ -590,13 +590,31 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 			d.log.Info("direct lanes work again; leaving the CDN")
 		}
 		d.directFails, d.onCDN, d.modeFails = 0, false, 0
+		// A direct lane that logged in says nothing on this network
+		// intercepts TLS: its login is bound to the TLS it ran over, and
+		// only the node can answer one bound to a session of its own. So
+		// whatever made an earlier lane's certificate fail its check here
+		// — a captive portal, most often — is gone, and the CDN is on
+		// offer again rather than written off for the rest of the day
+		// (see refused).
+		if _, locked := d.intercepted[network]; locked {
+			delete(d.intercepted, network)
+			d.log.Info("a direct lane logged in, so TLS is not intercepted here after all; the CDN is on offer again", "network", network)
+		}
 		if d.cfg.SNIMode == SNIAuto && c.Mode != SNIAuto {
 			c.Cover = d.cfg.Profile.CoverDomain
 			// At says when the mode was first chosen here, so that a mode
 			// that keeps working still runs out (see Choice.At). A lane
-			// that confirms the mode already remembered keeps its time.
+			// that confirms the mode already remembered keeps its time,
+			// unless that time has run out: the mode was just worked out
+			// again, and a mode settled now is settled from now. Keeping
+			// the old time would leave the choice stale for good, and
+			// every lane would search the modes again, sending the cover
+			// domain to a network that reset it and taking every lane to
+			// one address (see tryModes).
 			c.At = time.Now()
-			if old, ok := d.modes.Mode(network); ok && old.Mode == c.Mode && old.Name == c.Name && !old.At.IsZero() {
+			if old, ok := d.modes.Mode(network); ok && old.Mode == c.Mode && old.Name == c.Name &&
+				old.Cover == c.Cover && !old.At.IsZero() && !d.stale(old) {
 				c.At = old.At
 			}
 			d.modes.SetMode(network, c)
@@ -619,18 +637,26 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 	}
 }
 
-// refused learns from a lane that failed with err: if its certificate
-// failed the check, something on network intercepts TLS, and no lane goes
-// by the CDN there for interceptedFor.
+// refused learns from a lane that failed with err: if what the server
+// served is a certificate the device itself trusts, something on network
+// intercepts TLS, and no lane goes by the CDN there for interceptedFor.
+//
+// Only that says anything about the CDN. Its edge is checked by name
+// alone, which an interceptor the device trusts passes and a captive
+// portal's certificate or a censor's self-signed one does not, so a
+// certificate that merely failed the check leaves the CDN on offer: it is
+// the route the client is left with where the node's address is blocked
+// (design §9), and a censor that could take it away by serving one
+// certificate could take the client off the network altogether.
 func (d *dialer) refused(network string, err error) {
-	if !errors.Is(err, lane.ErrCertificate) {
+	if !errors.Is(err, lane.ErrIntercepted) {
 		return
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	now := time.Now()
 	if !now.Before(d.intercepted[network]) {
-		d.log.Warn("a lane met a certificate that failed its check; not using the CDN on this network",
+		d.log.Warn("a lane was served a certificate the device trusts in the node's place; not using the CDN on this network",
 			"network", network, "for", interceptedFor, "err", err)
 	}
 	d.intercepted[network] = now.Add(interceptedFor)

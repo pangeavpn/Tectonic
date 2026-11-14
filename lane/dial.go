@@ -311,9 +311,11 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 	case cfg.SNIMode == SNIOwn:
 		tc.ServerName = cfg.ServerName
 		if pins := cfg.OwnPins; len(pins) > 0 {
-			// Runs after the usual check by name, which stays on.
+			// Runs after the usual check by name, which stays on: a chain
+			// that reaches here is one the device trusts for the name.
+			name := cfg.ServerName
 			tc.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
-				return verifyPinned(raw, pins, nil, "")
+				return verifyPinned(raw, check{pins: pins, name: name, verified: true})
 			}
 		}
 	case cfg.SNIMode == SNIBorrowed:
@@ -325,9 +327,9 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 		}
 		tc.ServerName = cfg.ServerName
 		tc.InsecureSkipVerify = true // replaced by the pin check below
-		pins := cfg.Pins
+		pins, roots, name := cfg.Pins, cfg.RootCAs, cfg.ServerName
 		tc.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
-			return verifyPinned(raw, pins, nil, "")
+			return verifyPinned(raw, check{pins: pins, roots: roots, name: name})
 		}
 	case cfg.SNIMode == SNINone:
 		host, _, err := net.SplitHostPort(cfg.Addr)
@@ -341,7 +343,7 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 			ipHost = host
 		}
 		tc.VerifyPeerCertificate = func(raw [][]byte, _ [][]*x509.Certificate) error {
-			return verifyPinned(raw, pins, roots, ipHost)
+			return verifyPinned(raw, check{pins: pins, roots: roots, name: ipHost, ipHost: ipHost})
 		}
 	}
 

@@ -608,11 +608,59 @@ func TestPins(t *testing.T) {
 	if _, err := ParsePin("bm90IGEgcGlu"); err == nil {
 		t.Fatal("short pin accepted")
 	}
-	if err := verifyPinned(p.defaultCert.Certificate, []Pin{p.defaultPin}, nil, ""); err != nil {
+	if err := verifyPinned(p.defaultCert.Certificate, check{pins: []Pin{p.defaultPin}}); err != nil {
 		t.Fatal(err)
 	}
-	if err := verifyPinned(p.cover.Certificate, []Pin{p.defaultPin}, p.roots, ""); err == nil {
+	if err := verifyPinned(p.cover.Certificate, check{pins: []Pin{p.defaultPin}, roots: p.roots}); err == nil {
 		t.Fatal("cover cert matched the default pin")
+	}
+}
+
+// Only a certificate the device itself trusts for the name the lane asked
+// for is an interceptor's. Anything else that fails the check — a captive
+// portal's, a censor's self-signed one, a valid certificate for some other
+// name — says nothing about the CDN, whose edge is checked by name alone,
+// so it must not come back as ErrIntercepted.
+func TestInterceptionIsOnlyACertificateTheDeviceTrusts(t *testing.T) {
+	p := getPKI(t)
+	var noPin Pin // matches nothing
+	for _, tc := range []struct {
+		name  string
+		chain [][]byte
+		c     check
+		want  error
+	}{
+		{"the node's own certificate", p.defaultCert.Certificate,
+			check{pins: []Pin{p.defaultPin}, roots: p.roots, name: coverDomain}, nil},
+		{"a trusted certificate for the name asked for", p.cover.Certificate,
+			check{pins: []Pin{p.defaultPin}, roots: p.roots, name: coverDomain}, ErrIntercepted},
+		{"the handshake trusted it already", p.cover.Certificate,
+			check{pins: []Pin{p.defaultPin}, name: coverDomain, verified: true}, ErrIntercepted},
+		{"a trusted certificate for another name", p.cover.Certificate,
+			check{pins: []Pin{noPin}, roots: p.roots, name: "other.example"}, errPinMismatch},
+		{"one nothing trusts", p.defaultCert.Certificate,
+			check{pins: []Pin{noPin}, roots: p.roots, name: coverDomain}, errPinMismatch},
+		{"no name to check it for", p.cover.Certificate,
+			check{pins: []Pin{noPin}, roots: p.roots}, errPinMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := verifyPinned(tc.chain, tc.c)
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("refused the node's own certificate: %v", err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+			if !errors.Is(err, ErrCertificate) {
+				t.Fatalf("got %v, which is not an ErrCertificate", err)
+			}
+			if tc.want != ErrIntercepted && errors.Is(err, ErrIntercepted) {
+				t.Fatalf("got %v, which would write the CDN off", err)
+			}
+		})
 	}
 }
 

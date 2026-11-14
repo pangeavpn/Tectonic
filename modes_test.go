@@ -11,6 +11,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"net"
@@ -1176,20 +1177,47 @@ func TestModeRefusedCertificateIsNotABlock(t *testing.T) {
 		r.net.routes[name] = imp
 	}
 	var want []string
-	for i := range directFailLimit + 1 {
+	for range directFailLimit {
 		if _, err := r.dial(); !errors.Is(err, lane.ErrCertificate) {
-			t.Fatalf("dial %d: %v, want lane.ErrCertificate", i, err)
+			t.Fatalf("%v, want lane.ErrCertificate", err)
 		}
 		// Each search tries every mode, Own first, and none goes by the CDN.
 		want = append(want, modeCover, modeBorrowed, "")
 		r.wantSent(want...)
 	}
 	r.d.mu.Lock()
-	ownBlocked, quiet, onCDN := r.d.ownBlocked[modeNetwork], r.d.quiet[modeNetwork], r.d.onCDN
+	ownBlocked, quiet := r.d.ownBlocked[modeNetwork], r.d.quiet[modeNetwork]
+	locked, onCDN := r.d.intercepted[modeNetwork], r.d.onCDN
 	r.d.mu.Unlock()
-	if !ownBlocked.IsZero() || !quiet.IsZero() || onCDN {
-		t.Fatalf("own blocked until %v, quiet until %v, on the CDN %v; want none of them", ownBlocked, quiet, onCDN)
+	if !ownBlocked.IsZero() || !quiet.IsZero() {
+		t.Fatalf("own blocked until %v, quiet until %v; want neither", ownBlocked, quiet)
 	}
+	// A certificate nothing trusts says nothing about the CDN either: the
+	// edge is somewhere else, and whatever served this one cannot pass the
+	// check by name a CDN lane makes. So the CDN is still on offer, and
+	// once this many direct lanes have failed the client goes by it.
+	if !locked.IsZero() {
+		t.Fatalf("a certificate nothing trusts wrote the CDN off until %v", locked)
+	}
+	if !onCDN {
+		t.Fatal("direct lanes kept failing on a certificate and the client never tried the CDN")
+	}
+	if _, err := r.dial(); err == nil {
+		t.Fatal("the CDN lane reached a dead edge and succeeded")
+	}
+	want = append(want, edge)
+	r.wantSent(want...)
+
+	// A certificate the device itself trusts is another matter: only that
+	// can sit in front of the CDN's edge too, so the CDN is written off.
+	r.d.refused(modeNetwork, fmt.Errorf("a lane: %w", lane.ErrIntercepted))
+	r.d.mu.Lock()
+	locked = r.d.intercepted[modeNetwork]
+	r.d.mu.Unlock()
+	if locked.IsZero() {
+		t.Fatal("a certificate the device trusts left the CDN on offer")
+	}
+
 	// Once the connections reach the node, Own works at once.
 	r.net.mu.Lock()
 	clear(r.net.routes)
@@ -1197,4 +1225,64 @@ func TestModeRefusedCertificateIsNotABlock(t *testing.T) {
 	r.mustDial()
 	r.wantSent(append(want, modeCover)...)
 	r.wantRemembered(SNIOwn)
+
+	// And a lane that logged in proves nothing is holding the TLS after
+	// all, so the CDN comes back without waiting out the rest of the day.
+	r.d.mu.Lock()
+	locked = r.d.intercepted[modeNetwork]
+	r.d.mu.Unlock()
+	if !locked.IsZero() {
+		t.Fatalf("the CDN is still written off until %v, after a lane logged in", locked)
+	}
+}
+
+// A weaker mode that has run out is worked out again, and the mode the
+// search settles on is settled from then. Keeping the time it ran out at
+// would leave the choice stale for good: every later lane would search the
+// modes again, which sends the cover domain to a network that resets it and
+// takes every lane to the node's first address.
+func TestModeThatRanOutSettlesAgain(t *testing.T) {
+	// Own fails on its certificate, which says nothing about the network:
+	// the cover domain is not written off, so the client does look at the
+	// modes again once the weaker one it settled on has run out.
+	r := newModeRig(t, func(cfg *Config) { cfg.RootCAs = x509.NewCertPool() })
+	second := "alias." + r.node.addr
+	// The fake network sends a ClientHello where its name routes, so an
+	// alias stands in for the node's second IP.
+	r.net.routes[modeBorrowed] = r.node.addr
+	r.cfg.Profile.Nodes = []string{second}
+	d, err := newDialer(r.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.d = d
+
+	l := r.mustDial()
+	t.Cleanup(func() { l.Close() })
+	r.wantSent(modeCover, modeBorrowed)
+	r.wantRemembered(SNIBorrowed)
+
+	// Hours pass, so the client looks at the modes again.
+	c, _ := r.modes.Mode(modeNetwork)
+	c.At = time.Now().Add(-WeakerModeFor - time.Minute)
+	r.modes.SetMode(modeNetwork, c)
+
+	l2 := r.mustDial()
+	t.Cleanup(func() { l2.Close() })
+	r.wantSent(modeCover, modeBorrowed, modeCover, modeBorrowed)
+	got, _ := r.modes.Mode(modeNetwork)
+	if age := time.Since(got.At); age > time.Minute {
+		t.Fatalf("the mode it settled on was settled %v ago: every lane from here searches again", age)
+	}
+
+	// So the lanes after it take the mode as it stands: one ClientHello
+	// each, and none of them the cover domain's. Without that the search
+	// runs again for every lane, which both tells the network the cover
+	// domain is wanted here and keeps every lane on one address, since a
+	// search dials the node's first address alone.
+	for range 2 {
+		l := r.mustDial()
+		t.Cleanup(func() { l.Close() })
+	}
+	r.wantSent(modeCover, modeBorrowed, modeCover, modeBorrowed, modeBorrowed, modeBorrowed)
 }
