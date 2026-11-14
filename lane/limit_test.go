@@ -192,9 +192,16 @@ func TestPingFloodDoesNotGrowTheControlQueue(t *testing.T) {
 	}
 	t.Logf("the control queue peaked at %d bytes, against a cap of %d and %d bytes of PONGs asked for",
 		worst, maxCtrl, pings*(wire.HeaderLen+wire.PingLen))
-	// The cap is checked before a PONG goes on, so the queue can end a
-	// frame or two past it, not more. Uncapped it reached 49544 bytes here.
-	if slack := 2 * (wire.HeaderLen + wire.PingLen); worst > maxCtrl+slack {
+	// The cap leaves room for the PONG that is checked against it and for
+	// this end's own PING, so the queue and a PING still make one record.
+	// A byte more and the write would go out as a full record and a few
+	// bytes after it, which nothing else on the wire does. Uncapped the
+	// queue reached 49544 bytes here.
+	if worst > maxCtrl {
 		t.Fatalf("the control queue reached %d bytes, past the %d cap", worst, maxCtrl)
+	}
+	if worst+pongLen > shape.MaxRecord {
+		t.Fatalf("a queue of %d bytes and a PING make %d, more than the %d a record holds",
+			worst, worst+pongLen, shape.MaxRecord)
 	}
 }

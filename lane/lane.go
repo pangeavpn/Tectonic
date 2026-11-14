@@ -67,11 +67,17 @@ const (
 	// DefaultLinger is how long a retiring lane waits for the peer's
 	// close_notify.
 	DefaultLinger = 10 * time.Second
+	// pongLen is the size of a PONG frame.
+	pongLen = wire.HeaderLen + wire.PingLen
 	// maxCtrl is how many bytes of control frames may wait to be written.
 	// The frames this end makes are bounded by what makes them, so this is
 	// for the PONGs the peer asks for: one record's worth, about 1500
 	// PONGs, which is far more than a lane whose peer is reading ever has.
-	maxCtrl = shape.MaxRecord
+	// The record holds this end's own PING as well, so the queue stops a
+	// PING short of a full one: a queue that filled a record and then some
+	// would go out as a full record and a few bytes after it, and nothing
+	// else on the wire is a record of a few bytes.
+	maxCtrl = shape.MaxRecord - pongLen
 )
 
 const (
@@ -1186,7 +1192,7 @@ func (l *Lane) readLoop() error {
 				// has stopped reading, would grow the queue without
 				// bound; past maxCtrl its PINGs go unanswered, which
 				// costs it nothing but its own round-trip estimate.
-				if !l.closing && len(l.ctrl) <= maxCtrl {
+				if !l.closing && len(l.ctrl)+pongLen <= maxCtrl {
 					l.ctrl = wire.AppendHeader(l.ctrl, wire.TypePing, wire.PingLen)
 					l.ctrl = wire.AppendPong(l.ctrl, tok)
 				}
