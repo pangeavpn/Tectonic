@@ -52,6 +52,17 @@ const (
 	residualWait = 200 * time.Second
 )
 
+// How long an address of the node is left alone after a lane on it failed
+// to log in. A profile may name several addresses, and one of them can be
+// unreachable from where the client is: an IPv6 address on a network with
+// no IPv6, or one a censor has null-routed. Without this the address with
+// the fewest live lanes is always the broken one, so every lane would go
+// there and fail.
+const (
+	addrBadMin = 30 * time.Second
+	addrBadMax = 10 * time.Minute
+)
+
 // errResidualWait is returned while the client waits out a block on the
 // node's address.
 var errResidualWait = errors.New("tectonic: waiting out a block on the node's address")
@@ -144,6 +155,10 @@ type dialer struct {
 	// laneAddrs counts the live direct lanes on each of the node's
 	// addresses, so the next lane goes to the one carrying the fewest.
 	laneAddrs map[string]int
+	// addrBad is, per address, until when it is left alone because a lane
+	// on it did not log in, and addrFails how many have failed in a row.
+	addrBad   map[string]time.Time
+	addrFails map[string]int
 }
 
 func newDialer(cfg Config) (*dialer, error) {
@@ -172,6 +187,8 @@ func newDialer(cfg Config) (*dialer, error) {
 		node:        node,
 		nodes:       nodes,
 		laneAddrs:   map[string]int{},
+		addrBad:     map[string]time.Time{},
+		addrFails:   map[string]int{},
 		sessions:    utls.NewLRUClientSessionCache(64),
 		modes:       cfg.Modes,
 		stallMin:    modeStallMin,
@@ -415,15 +432,17 @@ func (d *dialer) dial(ctx context.Context, req sched.DialRequest) (sched.PoolLan
 }
 
 // release gives a lane's address back once the lane has ended, or at once
-// if it never opened.
-func (d *dialer) release(l *lane.Lane, err error, release func()) {
+// if it never opened, and says whether the lane ever logged in: an address
+// whose lanes never do is left alone for a while.
+func (d *dialer) release(l *lane.Lane, err error, done func(ok bool)) {
 	if err != nil || l == nil {
-		release()
+		done(false)
 		return
 	}
 	go func() {
 		<-l.Done()
-		release()
+		_, ok := l.Welcome()
+		done(ok)
 	}()
 }
 
@@ -440,36 +459,68 @@ func poolLane(l *lane.Lane, err error) (sched.PoolLane, error) {
 // function that gives it back when that lane has ended. With one address
 // nothing changes; with more, the lanes spread so that each address carries
 // one at a time, which is what a browser shows per address.
-func (d *dialer) takeAddr() (string, func()) { return d.takeThisAddr("") }
+func (d *dialer) takeAddr() (string, func(ok bool)) { return d.takeThisAddr("") }
 
 // takeThisAddr is takeAddr for a given address; empty means the least used.
 // A mode search puts every attempt on one address, because a censor that
 // blocks an address blocks it for every name, so what the search learns is
 // about that address (see blocked).
-func (d *dialer) takeThisAddr(want string) (string, func()) {
+func (d *dialer) takeThisAddr(want string) (string, func(ok bool)) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	best := d.nodes[0]
-	if want != "" {
+	now := time.Now()
+	best := ""
+	switch {
+	case want != "":
 		best = want
-	} else {
+	default:
+		// The address carrying the fewest lanes, among those not being
+		// left alone. An address that never works carries none, so without
+		// that check it would be chosen every time.
 		for _, a := range d.nodes {
-			if d.laneAddrs[a] < d.laneAddrs[best] {
+			if now.Before(d.addrBad[a]) {
+				continue
+			}
+			if best == "" || d.laneAddrs[a] < d.laneAddrs[best] {
 				best = a
+			}
+		}
+		if best == "" {
+			// Every address is being left alone: take the one whose turn
+			// comes soonest, so the session still has somewhere to go.
+			best = d.nodes[0]
+			for _, a := range d.nodes {
+				if d.addrBad[a].Before(d.addrBad[best]) {
+					best = a
+				}
 			}
 		}
 	}
 	d.laneAddrs[best]++
-	done := false
-	return best, func() {
+	spent := false
+	return best, func(ok bool) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
-		if !done {
-			done = true
-			if d.laneAddrs[best]--; d.laneAddrs[best] <= 0 {
-				delete(d.laneAddrs, best)
-			}
+		if spent {
+			return
 		}
+		spent = true
+		if d.laneAddrs[best]--; d.laneAddrs[best] <= 0 {
+			delete(d.laneAddrs, best)
+		}
+		if len(d.nodes) == 1 {
+			return // nowhere else to go; blocked() handles the address
+		}
+		if ok {
+			delete(d.addrFails, best)
+			delete(d.addrBad, best)
+			return
+		}
+		d.addrFails[best]++
+		wait := addrBadMin << min(d.addrFails[best]-1, 16)
+		d.addrBad[best] = time.Now().Add(min(wait, addrBadMax))
+		d.log.Debug("leaving a node address alone for a while", "addr", best,
+			"for", min(wait, addrBadMax), "fails", d.addrFails[best])
 	}
 }
 
@@ -724,7 +775,7 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 		d.blocked(network, attempts, won, hello, cut)
 		d.release(l, nil, release)
 		if won == nil {
-			release() // nothing opened; release is idempotent
+			release(false) // nothing opened; release is spent once
 			d.outcome(false, lane.Direct, Choice{}, network)
 			return nil, fmt.Errorf("tectonic: no SNI mode logged in: %w", errors.Join(errs...))
 		}

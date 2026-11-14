@@ -1026,7 +1026,7 @@ func TestLanesSpreadAcrossTheNodesAddresses(t *testing.T) {
 	}
 
 	// Four lanes, each taking the least used address: two per address.
-	var released []func()
+	var released []func(ok bool)
 	seen := map[string]int{}
 	for range 4 {
 		addr, release := d.takeAddr()
@@ -1038,15 +1038,44 @@ func TestLanesSpreadAcrossTheNodesAddresses(t *testing.T) {
 	}
 	// As lanes end their addresses come free again, and the next lane
 	// takes the one carrying the fewest.
-	released[0]()
-	released[1]() // both of the first address's
+	released[0](true)
+	released[1](true) // both of the first address's, and both worked
 	addr, _ := d.takeAddr()
 	if addr != r.node.addr {
 		t.Fatalf("after two lanes on %s ended, the next went to %s", r.node.addr, addr)
 	}
 
+	// An address whose lanes never log in is left alone, so it is not
+	// picked again at once: it carries no lanes, and without this the
+	// address with the fewest would always be the broken one.
+	d.laneAddrs, d.addrBad, d.addrFails = map[string]int{}, map[string]time.Time{}, map[string]int{}
+	for range 4 {
+		a, done := d.takeAddr()
+		done(a == second) // the first address is the broken one
+	}
+	for range 4 {
+		if a, done := d.takeAddr(); a != second {
+			done(false)
+			t.Fatalf("a lane went to %s, the address whose lanes never logged in", a)
+		} else {
+			done(true)
+		}
+	}
+	// Once every address is being left alone, the session still has
+	// somewhere to go rather than refusing to dial.
+	d.laneAddrs, d.addrBad, d.addrFails = map[string]int{}, map[string]time.Time{}, map[string]int{}
+	for range 6 {
+		_, done := d.takeAddr()
+		done(false)
+	}
+	if a, done := d.takeAddr(); a == "" {
+		t.Fatal("no address at all once they had all failed")
+	} else {
+		done(false)
+	}
+
 	// And a real pair of lanes reaches the node on different addresses.
-	d.laneAddrs = map[string]int{}
+	d.laneAddrs, d.addrBad, d.addrFails = map[string]int{}, map[string]time.Time{}, map[string]int{}
 	r.modes.SetMode(modeNetwork, Choice{Mode: SNINone, Cover: modeCover, At: time.Now()})
 	var addrs []string
 	for range 2 {
