@@ -626,10 +626,16 @@ func TestTooManyLanesRetiresTheOldest(t *testing.T) {
 	}
 }
 
+// writerFunc lets a function stand in for an io.Writer.
+type writerFunc func([]byte)
+
+func (f writerFunc) Write(p []byte) (int, error) { f(p); return len(p), nil }
+
 // edge stands in for a CDN: it terminates the client's TLS, adds the
 // signed header to the WebSocket upgrade, and forwards to the node over a
-// TLS connection of its own.
-func startEdge(t *testing.T, node string, secret []byte) string {
+// TLS connection of its own. tee, if given, is called with everything the
+// edge sends the node.
+func startEdge(t *testing.T, node string, secret []byte, tee ...func([]byte)) string {
 	t.Helper()
 	p := certs(t)
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{p.own}, NextProtos: []string{"http/1.1"}})
@@ -656,10 +662,14 @@ func startEdge(t *testing.T, node string, secret []byte) string {
 					return
 				}
 				defer up.Close()
-				if err := req.Write(up); err != nil {
+				var w io.Writer = up
+				if len(tee) > 0 && tee[0] != nil {
+					w = io.MultiWriter(up, writerFunc(tee[0]))
+				}
+				if err := req.Write(w); err != nil {
 					return
 				}
-				go io.Copy(up, br)
+				go io.Copy(w, br)
 				io.Copy(c, up)
 			}()
 		}
@@ -704,6 +714,92 @@ func TestCDNCarrier(t *testing.T) {
 	resp.Body.Close()
 	if !strings.HasPrefix(string(body), "cover page") {
 		t.Fatalf("unsigned request got %q", body)
+	}
+}
+
+// A CDN lane's login is bound to the client's Sec-WebSocket-Key, which
+// travels in the clear between the CDN and the node, so a recorded upgrade
+// and first message would open a lane again. Each key opens one.
+func TestCDNLoginCannotBeReplayed(t *testing.T) {
+	edgeSecret := []byte("edge secret")
+	ts := newTestServer(t, func(c *Config) {
+		c.CDN = &CDNConfig{Path: "/assets/ws", Verify: EdgeHeader("Tectonic-Edge", edgeSecret, nil)}
+	})
+	var mu sync.Mutex
+	var upstream []byte // what the edge sent the node, verbatim
+	edge := startEdge(t, ts.addr, edgeSecret, func(b []byte) {
+		mu.Lock()
+		upstream = append(upstream, b...)
+		mu.Unlock()
+	})
+	cfg := ts.dialCfg(t)
+	cfg.Carrier, cfg.Addr, cfg.ServerName, cfg.Path = lane.CDN, edge, "edge.cdn.test", "/assets/ws"
+	cfg.FirstPacket = []byte("via the cdn")
+	c := dial(t, cfg)
+	c.welcome(t)
+	if got := c.recv(t); string(got) != "echo:via the cdn" {
+		t.Fatalf("got %q", got)
+	}
+	if n := ts.Stats().Sessions; n != 1 {
+		t.Fatalf("sessions = %d", n)
+	}
+	mu.Lock()
+	recorded := append([]byte(nil), upstream...)
+	mu.Unlock()
+	// Go canonicalises the header name as it forwards it.
+	if !bytes.Contains(bytes.ToLower(recorded), []byte("sec-websocket-key")) || len(recorded) < 200 {
+		t.Fatalf("recorded %d bytes of the lane's opening, not an upgrade and its first message", len(recorded))
+	}
+
+	// The same bytes again, on a connection of their own, as the CDN or
+	// anyone between it and the node could send them.
+	p := certs(t)
+	for i := range 3 {
+		up, err := tls.Dial("tcp", ts.addr, &tls.Config{RootCAs: p.roots, ServerName: coverDomain, NextProtos: []string{"http/1.1"}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := up.Write(recorded); err != nil {
+			t.Fatal(err)
+		}
+		up.SetReadDeadline(time.Now().Add(2 * time.Second))
+		io.Copy(io.Discard, up)
+		up.Close()
+		if n := ts.Stats().Sessions; n != 1 {
+			t.Fatalf("replay %d opened a lane: %d sessions", i, n)
+		}
+	}
+	// The live lane was left alone.
+	select {
+	case <-c.l.Done():
+		t.Fatalf("the lane ended: %v", c.l.Err())
+	default:
+	}
+	c.l.Send([]byte("still here"))
+	if got := c.recv(t); string(got) != "echo:still here" {
+		t.Fatalf("got %q", got)
+	}
+}
+
+func TestReplayGuardForgetsAfterTheWindow(t *testing.T) {
+	var g replayGuard
+	t0 := time.Unix(1_800_000_000, 0)
+	if !g.fresh("k1", t0) || g.fresh("k1", t0) || g.fresh("k1", t0.Add(replayFor-time.Second)) {
+		t.Fatal("a key was accepted twice inside the window")
+	}
+	if !g.fresh("k2", t0) {
+		t.Fatal("another key was refused")
+	}
+	// Kept for between one and two windows, then forgotten.
+	if g.fresh("k1", t0.Add(replayFor)) {
+		t.Fatal("a key one window old was forgotten")
+	}
+	if !g.fresh("k1", t0.Add(3*replayFor)) {
+		t.Fatal("a key three windows old was still remembered")
+	}
+	// A clock that jumps back rotates rather than trusting the old set.
+	if g.fresh("k1", t0) {
+		t.Fatal("a key just seen was accepted after the clock went back")
 	}
 }
 

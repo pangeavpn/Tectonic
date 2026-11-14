@@ -143,8 +143,9 @@ type Server struct {
 	// it says so once a minute and not on every login.
 	fullAt time.Time
 
-	cover *cover
-	lanes atomic.Int64
+	cover  *cover
+	replay replayGuard
+	lanes  atomic.Int64
 	// bufWarn limits the warning about a small socket buffer to one.
 	bufWarn sync.Once
 }
