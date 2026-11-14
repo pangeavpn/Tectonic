@@ -581,3 +581,70 @@ func TestOpeningAckWaitsForThePacketARecordEndedIn(t *testing.T) {
 		t.Fatalf("records %v: the transfer did not go back to full records", sizes)
 	}
 }
+
+// A download's acknowledgements wait together in one record. They are the
+// small packets a lane sends while a transfer comes the other way, and one
+// or two to a record is what makes a download's upstream a stream of small
+// records to anyone counting. Measured over a clean 100 Mbit/s transfer,
+// 53.5 records per MB became 17.8 with them held, against Brave's 0.5 to
+// 1.5, for no throughput (88.4 to 88.8 Mbit/s) and 3 ms of loaded latency.
+func TestRecordHold(t *testing.T) {
+	const rtt = 50 * time.Millisecond
+	for _, tc := range []struct {
+		name                   string
+		rtt                    time.Duration
+		busy, small, receiving bool
+		want                   time.Duration
+	}{
+		// A transfer fills records as fast as it can.
+		{"bulk", rtt, true, false, false, coalesceDelay},
+		// A download's acknowledgements wait, bounded by the round trip.
+		{"acks while receiving", rtt, false, true, true, ackHold},
+		{"acks on a short path", 8 * time.Millisecond, false, true, true, 2 * time.Millisecond},
+		{"acks on an instant path", 64 * time.Microsecond, false, true, true, flushDelay},
+		// Small packets with nothing coming the other way are interactive
+		// traffic: a reply must not wait on the next one.
+		{"interactive", rtt, false, true, false, flushDelay},
+		{"interactive on a short path", 8 * time.Millisecond, false, true, false, 500 * time.Microsecond},
+		// A transfer both ways: the acknowledgements ride with the data.
+		{"bulk with small", rtt, true, true, true, ackHold},
+		{"idle", rtt, false, false, false, flushDelay},
+	} {
+		if got := recordHold(tc.rtt, tc.busy, tc.small, tc.receiving); got != tc.want {
+			t.Errorf("%s: recordHold(%v, busy=%v, small=%v, receiving=%v) = %v, want %v",
+				tc.name, tc.rtt, tc.busy, tc.small, tc.receiving, got, tc.want)
+		}
+	}
+}
+
+// receiving follows the bytes arriving, in its own window, so the writer
+// can tell a download's acknowledgements from interactive traffic.
+func TestReceivingFollowsWhatArrives(t *testing.T) {
+	l, _, _ := recordLane(t, fastSock())
+	now := time.Now()
+	if l.receiving(now) {
+		t.Fatal("a lane that has taken nothing counts as receiving")
+	}
+	// A window's worth of bytes, then the window closes.
+	l.noteRecv(busyBytes, now)
+	l.noteRecv(busyBytes, now.Add(busyWindow))
+	if !l.receiving(now.Add(busyWindow)) {
+		t.Fatal("a lane taking a transfer does not count as receiving")
+	}
+	// A trickle. The window that was full has to close first, so it takes
+	// one more for the lane to stop counting as receiving.
+	l.noteRecv(100, now.Add(2*busyWindow))
+	l.noteRecv(100, now.Add(3*busyWindow))
+	if l.receiving(now.Add(3 * busyWindow)) {
+		t.Fatal("a lane taking a trickle counts as receiving")
+	}
+	// And it comes back, then goes stale rather than sticking.
+	l.noteRecv(busyBytes, now.Add(4*busyWindow))
+	l.noteRecv(busyBytes, now.Add(5*busyWindow))
+	if !l.receiving(now.Add(5 * busyWindow)) {
+		t.Fatal("receiving did not come back")
+	}
+	if l.receiving(now.Add(10 * busyWindow)) {
+		t.Fatal("receiving stuck on after the bytes stopped")
+	}
+}

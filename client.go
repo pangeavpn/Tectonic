@@ -414,6 +414,10 @@ type Stats struct {
 	// waited for. Reported is the same count in the other direction: what
 	// this end told the node not to wait for.
 	Lost, Reported uint64
+	// Records is how many TLS records the session's lanes have written,
+	// the ones that have ended included: what a passive observer counts,
+	// where Sent counts the datagrams the tunnel carried.
+	Records uint64
 }
 
 // Stats returns a snapshot of the client.
@@ -425,6 +429,7 @@ func (c *Conn) Stats() Stats {
 		Sent: ps.Scheduler.Sent, Dropped: ps.Scheduler.Dropped, Dupes: ps.Scheduler.Duplicated,
 		Held: ps.Resequencer.Held, Skipped: ps.Resequencer.Skipped, Late: ps.Resequencer.Late,
 		Lost: ps.Resequencer.Lost, Reported: ps.Scheduler.Reported,
+		Records: ps.RecordsSent,
 	}
 }
 

@@ -185,6 +185,17 @@ const (
 	// with them, two TCP headers. A millisecond turns a train into one
 	// record.
 	flushDelay = time.Millisecond
+	// ackHold is how long a record holds small packets alone while the lane
+	// is receiving a transfer. Those packets are the acknowledgements of
+	// the TCP inside the tunnel, and one or two to a record is what makes a
+	// download's upstream a stream of small records: measured over a
+	// 150 MB transfer, a lane sent 40 to 61 records per MB where Brave sent
+	// 0.5 to 1.5, which one volumetric rule separates. Holding them longer
+	// packs more into each record, and costs the inner TCP some of its
+	// acknowledgement clock, so it is bounded by a share of the round trip
+	// as well.
+	ackHold    = 10 * time.Millisecond
+	ackHoldRTT = 4 // at most a quarter of the round trip
 	// limitNap is the longest the writer sleeps at once while the
 	// session's send limit holds its DATA, so that a small packet or a
 	// control frame that arrives meanwhile goes within that.
@@ -327,6 +338,12 @@ type Lane struct {
 	stalled     atomic.Bool  // TCP_INFO reports an unrecovered timeout
 	hasTCPInfo  atomic.Bool
 	bytesSent   atomic.Uint64
+	recsSent    atomic.Uint64
+	rxBusy      atomic.Bool
+	rxSeen      atomic.Int64
+	rxMu        sync.Mutex
+	rxStart     time.Time
+	rxBytes     int
 	bytesRecv   atomic.Uint64
 	dataSent    atomic.Uint64
 	dataRecv    atomic.Uint64
@@ -897,17 +914,20 @@ func (l *Lane) Retransmitting() bool {
 
 // Stats is a snapshot of a lane's counters and estimates.
 type Stats struct {
-	Created        time.Time
-	SRTT           time.Duration
-	MinRTT         time.Duration
-	Rate           float64 // bytes/s
-	Queued         int
-	BytesSent      uint64 // everything written, padding included
-	BytesRecv      uint64
-	DataSent       uint64 // WireGuard payload bytes
-	DataRecv       uint64
-	PacketsSent    uint64
-	PacketsRecv    uint64
+	Created     time.Time
+	SRTT        time.Duration
+	MinRTT      time.Duration
+	Rate        float64 // bytes/s
+	Queued      int
+	BytesSent   uint64 // everything written, padding included
+	BytesRecv   uint64
+	DataSent    uint64 // WireGuard payload bytes
+	DataRecv    uint64
+	PacketsSent uint64
+	PacketsRecv uint64
+	// RecordsSent counts the TLS records written: what a passive observer
+	// counts, where PacketsSent counts what the tunnel carried.
+	RecordsSent    uint64
 	Retransmitting bool
 	TCPInfo        bool // estimates come from TCP_INFO rather than PING/PONG
 	NotSentLowat   bool // TCP_NOTSENT_LOWAT is in effect; otherwise the lane paces on PONGs
@@ -938,12 +958,59 @@ func (l *Lane) Stats() Stats {
 		DataRecv:       l.dataRecv.Load(),
 		PacketsSent:    l.pktsSent.Load(),
 		PacketsRecv:    l.pktsRecv.Load(),
+		RecordsSent:    l.recsSent.Load(),
 		Retransmitting: l.Retransmitting(),
 		TCPInfo:        l.hasTCPInfo.Load(),
 	}
 }
 
+// recordHold is how long a record waits for more to go with it.
+//
+// Packets inside the tunnel come in trains, and a record that waits a
+// moment carries the train instead of one carriage. How long depends on
+// what the lane is doing:
+//
+//   - Carrying a transfer with nothing small waiting: coalesceDelay, long
+//     enough to fill 16 KB.
+//   - Sending only small packets while a transfer comes the other way:
+//     those are the acknowledgements of the TCP inside the tunnel, and
+//     ackHold packs many into one record (see ackHold). Never more than a
+//     share of the round trip, since that TCP is clocked by them.
+//   - Anything else, interactive traffic included: flushDelay at most, and
+//     no more than a sixteenth of the round trip, so a reply never waits on
+//     the next one.
+func recordHold(rtt time.Duration, busy, small, receiving bool) time.Duration {
+	switch {
+	case busy && !small:
+		return coalesceDelay
+	case small && receiving:
+		return max(min(ackHold, rtt/ackHoldRTT), flushDelay)
+	default:
+		return min(flushDelay, rtt/16)
+	}
+}
+
 func (l *Lane) String() string { return fmt.Sprintf("lane %d (%s)", l.id, l.role) }
+
+// noteRecv keeps the receive side's own busy window: whether the lane has
+// taken at least busyBytes in the last busyWindow. The writer uses it to
+// tell a download's acknowledgements, which may wait together in one
+// record, from the small packets of interactive traffic, which may not.
+func (l *Lane) noteRecv(n int, now time.Time) {
+	l.rxMu.Lock()
+	defer l.rxMu.Unlock()
+	if now.Sub(l.rxStart) >= busyWindow {
+		l.rxBusy.Store(l.rxBytes >= busyBytes)
+		l.rxStart, l.rxBytes = now, 0
+		l.rxSeen.Store(now.UnixNano())
+	}
+	l.rxBytes += n
+}
+
+// receiving reports whether the lane is taking a transfer now.
+func (l *Lane) receiving(now time.Time) bool {
+	return l.rxBusy.Load() && now.Sub(time.Unix(0, l.rxSeen.Load())) < 4*busyWindow
+}
 
 func (l *Lane) isDone() bool {
 	select {
@@ -1095,6 +1162,7 @@ func (l *Lane) readLoop() error {
 		case wire.TypeData:
 			l.dataRecv.Add(uint64(len(body)))
 			l.pktsRecv.Add(1)
+			l.noteRecv(len(body), now)
 			if !shape.IsKeepalive(body) {
 				l.mu.Lock()
 				l.lastActive = now
@@ -1293,11 +1361,8 @@ func (l *Lane) writeLoop() error {
 		if !more && !gated && !held && !paced && !idle && !l.retiring && !l.closing &&
 			l.queued+len(l.ctrl) < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
-				hold := min(flushDelay, l.RTT()/16)
-				if busy && len(l.small) == 0 {
-					hold = coalesceDelay
-				}
-				coalesceUntil = now.Add(hold)
+				coalesceUntil = now.Add(recordHold(l.RTT(), busy,
+					len(l.small) > 0, len(l.data) == 0 && l.receiving(now)))
 			}
 			if wait := coalesceUntil.Sub(now); wait > 0 {
 				l.mu.Unlock()
@@ -1549,6 +1614,7 @@ func (l *Lane) writeLoop() error {
 			return err
 		}
 		l.bytesSent.Store(total)
+		l.recsSent.Add(1)
 		l.tracked.Store(tracked)
 		l.dataSent.Add(uint64(dataBytes))
 		l.pktsSent.Add(uint64(pkts))

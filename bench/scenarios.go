@@ -158,13 +158,20 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 	time.Sleep(o.warm)
 	b0, l0 := t.bytes.Load(), linkBytes(e.P)
 	u0, d0 := e.P.stats()
+	var r0 struct{ records uint64 }
+	if e.conn != nil {
+		r0.records = e.conn.Stats().Records
+	}
 	bps := t.rate(ctx, o.dur)
 	db, dl := t.bytes.Load()-b0, linkBytes(e.P)-l0
 	u1, d1 := e.P.stats()
 	if db > 0 {
-		o.logf("%s: per payload byte: down %.4f (%d pkts), up %.4f (%d pkts)", tr,
+		// Upstream packets per MB is what a volumetric rule counts: a
+		// download's acknowledgements, one or two to a record.
+		o.logf("%s: per payload byte: down %.4f (%d pkts), up %.4f (%d pkts); payload %d B, up %.1f pkts/MB", tr,
 			float64(d1.Bytes-d0.Bytes)/float64(db), d1.Packets-d0.Packets,
-			float64(u1.Bytes-u0.Bytes)/float64(db), u1.Packets-u0.Packets)
+			float64(u1.Bytes-u0.Bytes)/float64(db), u1.Packets-u0.Packets,
+			db, float64(u1.Packets-u0.Packets)/(float64(db)/(1<<20)))
 	}
 	if t.err != nil {
 		return bulkResult{tr: tr, err: fmt.Errorf("transfer failed: %w", t.err)}
@@ -177,6 +184,14 @@ func measureBulk(ctx context.Context, o opts, tr transport, lc link.Config) bulk
 	if e.conn != nil {
 		st := e.conn.Stats()
 		up, down := e.P.stats()
+		// Records per MB is what a volumetric rule counts upstream during
+		// a download: the acknowledgements of the TCP inside the tunnel,
+		// however many share a record. Brave sent 0.5 to 1.5 per MB.
+		if db > 0 {
+			o.logf("%s: %.1f records/MB (%d records, %d payload MB)", tr,
+				float64(st.Records-r0.records)/(float64(db)/(1<<20)),
+				st.Records-r0.records, db>>20)
+		}
 		o.logf("%s: lanes %d, sent %d, dropped %d, dupes %d; received: held %d, skipped %d, late %d, lost %d; link up %d pkts, down %d pkts, queue drops %d/%d",
 			tr, st.Lanes, st.Sent, st.Dropped, st.Dupes, st.Held, st.Skipped, st.Late, st.Lost,
 			up.Packets, down.Packets, up.DroppedQueue, down.DroppedQueue)

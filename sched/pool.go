@@ -173,8 +173,11 @@ type Pool struct {
 	reopenAfter time.Duration
 	thr         *throttle
 	lastSample  time.Time
-	rng         *rand.Rand
-	laneSeq     uint64
+	// recsGone is the records written by lanes that have ended, so the
+	// total survives churn.
+	recsGone uint64
+	rng      *rand.Rand
+	laneSeq  uint64
 }
 
 // laneState is the pool's view of one lane.
@@ -350,15 +353,23 @@ type PoolStats struct {
 	Resequencer ResequencerStats
 	// Limit is the session's send limit.
 	Limit LimiterStats
+	// RecordsSent counts the TLS records the session's lanes have written,
+	// the ones that ended included. It is what a passive observer counts,
+	// where Scheduler.Sent counts what the tunnel carried.
+	RecordsSent uint64
 }
 
 // Stats returns a snapshot of the pool.
 func (p *Pool) Stats() PoolStats {
 	ch := make(chan PoolStats, 1)
 	if !p.post(func() {
+		recs := p.recsGone
+		for st := range p.lanes {
+			recs += st.l.Stats().RecordsSent
+		}
 		ch <- PoolStats{
 			Lanes: len(p.lanes), Dialing: p.dialing, Session: p.session,
-			Throttled: p.thr.throttled, Extra: p.thr.extra,
+			Throttled: p.thr.throttled, Extra: p.thr.extra, RecordsSent: recs,
 			Scheduler: p.sched.Stats(), Resequencer: p.reseq.Stats(), Limit: p.limit.Stats(),
 		}
 	}) {
@@ -925,6 +936,7 @@ func (p *Pool) laneDone(st *laneState) {
 		return
 	}
 	delete(p.lanes, st)
+	p.recsGone += st.l.Stats().RecordsSent
 	st.src.Close()
 	err := st.l.Err()
 	if !st.welcomed {
