@@ -289,6 +289,9 @@ func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*
 		},
 		SNIMode: tectonic.SNIOwn,
 		RootCAs: p.roots,
+		// BENCH_BASE_LANES compares lane counts: one lane is the best
+		// cover and the slowest where lanes earn their keep.
+		Lanes: baseLanes(),
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			ap, err := netip.ParseAddrPort(addr)
 			if err != nil {
@@ -506,4 +509,16 @@ func percentile(ds []time.Duration, p float64) time.Duration {
 func linkBytes(L path) uint64 {
 	up, down := L.stats()
 	return up.Bytes + down.Bytes
+}
+
+// baseLanes is how many lanes a busy tunnel runs, from BENCH_BASE_LANES.
+// Zero, or unset, leaves the client's own default. One lane is what a
+// passive observer expects of a browser, and the lanes beyond the first are
+// what carry a lossy path; this is how that trade is measured.
+func baseLanes() int {
+	n, err := strconv.Atoi(os.Getenv("BENCH_BASE_LANES"))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
 }

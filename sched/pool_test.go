@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -320,6 +321,46 @@ func TestPoolGivesEveryLaneTheSessionsSendLimit(t *testing.T) {
 	}
 	if st := p.Stats().Limit; st.Rate != 0 || st.On != 0 {
 		t.Fatalf("a new session has a send limit: %+v", st)
+	}
+}
+
+// How many lanes a busy tunnel runs is configurable, because it is the
+// strongest thing a passive observer has: a browser holds one connection
+// open to an origin. Throttle detection still grows the pool from whatever
+// the base is.
+func TestPoolRunsTheBaseLaneCountItIsGiven(t *testing.T) {
+	for _, base := range []int{1, 2, 3} {
+		t.Run(fmt.Sprint(base), func(t *testing.T) {
+			d := newFakeDialer()
+			d.welcome = 1
+			p := newTestPool(t, d, PoolConfig{BaseLanes: base})
+			for range base {
+				d.next(t) // the pool dials exactly this many
+			}
+			// Give it long enough to dial another if it wanted to.
+			time.Sleep(100 * time.Millisecond)
+			if n := p.Stats().Lanes + p.Stats().Dialing; n != base {
+				t.Fatalf("%d lanes for a base of %d", n, base)
+			}
+			select {
+			case l := <-d.lanes:
+				t.Fatalf("the pool dialed another lane: %v", l)
+			default:
+			}
+		})
+	}
+}
+
+func TestPoolBaseLaneCountDefaults(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 1
+	p := newTestPool(t, d, PoolConfig{})
+	for range DefaultBaseLanes {
+		d.next(t)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := p.Stats().Lanes + p.Stats().Dialing; n != DefaultBaseLanes {
+		t.Fatalf("%d lanes by default, want %d", n, DefaultBaseLanes)
 	}
 }
 

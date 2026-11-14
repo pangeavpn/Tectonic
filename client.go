@@ -182,7 +182,12 @@ type Config struct {
 	RootCAs *x509.CertPool
 	// Churn overrides lane lifetimes and byte budgets; zero means the
 	// design's.
-	Churn  sched.Churn
+	Churn sched.Churn
+	// Lanes is how many lanes a busy tunnel runs before throttle detection
+	// adds any; zero means sched.DefaultBaseLanes. One lane is the best
+	// cover, since a browser holds one connection open to an origin, and
+	// the slowest on a path that loses packets.
+	Lanes  int
 	Logger *slog.Logger
 }
 
@@ -251,11 +256,12 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		bufs:   sync.Pool{New: func() any { return make([]byte, 0, 2048) }},
 	}
 	c.pool = sched.NewPool(sched.PoolConfig{
-		Dial:     d.dial,
-		Receive:  c.receive,
-		Profiles: d.profiles,
-		Churn:    cfg.Churn,
-		Logger:   log,
+		Dial:      d.dial,
+		Receive:   c.receive,
+		Profiles:  d.profiles,
+		Churn:     cfg.Churn,
+		BaseLanes: cfg.Lanes,
+		Logger:    log,
 	})
 	return c, nil
 }

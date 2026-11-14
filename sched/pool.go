@@ -72,8 +72,17 @@ type PoolConfig struct {
 	// Profiles resolves the shaping profile WELCOME names.
 	Profiles *shape.Set
 	// Churn sets lane lifetimes and byte budgets; zero means the design's.
-	Churn  Churn
-	Logger *slog.Logger
+	Churn Churn
+	// BaseLanes is how many lanes the pool runs while the tunnel is busy,
+	// before throttle detection adds any. Zero means DefaultBaseLanes.
+	//
+	// It is the strongest thing a passive observer has to go on: a browser
+	// holds one connection open to an origin, and lanes beyond the first
+	// are what a count of connections per address sees. One lane is the
+	// best cover and the slowest on a path that loses packets, where
+	// separate congestion windows are what lanes are for.
+	BaseLanes int
+	Logger    *slog.Logger
 	// DialTimeout bounds one lane dial. Zero means 20 s.
 	DialTimeout time.Duration
 }
@@ -87,8 +96,11 @@ var (
 	ErrPoolClosed = errors.New("sched: pool closed")
 )
 
+// DefaultBaseLanes is how many lanes a busy tunnel runs when nothing says
+// otherwise.
+const DefaultBaseLanes = 2
+
 const (
-	baseLanes       = 2  // the pool starts with 2 lanes
 	defaultMaxLanes = 6  // until WELCOME says otherwise
 	pendingMax      = 64 // datagrams held while no lane is up
 	pendingBytesMax = 256 << 10
@@ -149,6 +161,7 @@ type Pool struct {
 	welcome     wire.Welcome
 	planner     *shape.Planner
 	maxLanes    int
+	baseLanes   int
 	lastLaneAt  time.Time
 	backoff     time.Duration
 	nextDial    time.Time
@@ -203,6 +216,9 @@ func NewPool(cfg PoolConfig) *Pool {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 20 * time.Second
 	}
+	if cfg.BaseLanes <= 0 {
+		cfg.BaseLanes = DefaultBaseLanes
+	}
 	var seed [32]byte
 	crand.Read(seed[:])
 	ctx, cancel := context.WithCancel(context.Background())
@@ -219,6 +235,7 @@ func NewPool(cfg PoolConfig) *Pool {
 		lanes:     map[*laneState]struct{}{},
 		planner:   shape.NewPlanner(cfg.Profiles.Get(shape.DefaultID)),
 		maxLanes:  defaultMaxLanes,
+		baseLanes: max(cfg.BaseLanes, 1),
 		thr:       newThrottle(),
 		rng:       rand.New(rand.NewChaCha8(seed)),
 	}
@@ -483,12 +500,12 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		} else {
 			extra = p.thr.extra
 		}
-		target = min(baseLanes+extra, p.maxLanes)
+		target = min(p.baseLanes+extra, p.maxLanes)
 	case now.Sub(lastActive) < p.idleShrink:
 		// Idle, but not yet for as long as was drawn for this idle period:
 		// the pool keeps the lanes it has. It opens none, short of having
 		// no lane at all, and nothing else treats the tunnel as active.
-		target = max(1, min(live, baseLanes+p.thr.extra, p.maxLanes))
+		target = max(1, min(live, p.baseLanes+p.thr.extra, p.maxLanes))
 	case now.Sub(idleRef) < p.idleClose:
 		target = 1 // idle: shrink to a single lane
 	default:
@@ -520,7 +537,7 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 			reason = "reopen"
 		case live == 0:
 			reason = "reconnect"
-		case target > baseLanes && live >= baseLanes:
+		case target > p.baseLanes && live >= p.baseLanes:
 			reason = "probe"
 		}
 		p.dial(now, reason, nil)
@@ -639,8 +656,8 @@ func (p *Pool) sampleThrottle(now time.Time, live int) int {
 	if sumUp > sumDown {
 		rates = up
 	}
-	ready := live+p.dialing >= min(baseLanes+p.thr.extra, p.maxLanes) && p.dialing == 0
-	return p.thr.update(now, rates, baseLanes, p.maxLanes, ready)
+	ready := live+p.dialing >= min(p.baseLanes+p.thr.extra, p.maxLanes) && p.dialing == 0
+	return p.thr.update(now, rates, p.baseLanes, p.maxLanes, ready)
 }
 
 // dial opens a lane in the background. replaces is the lane it will take
