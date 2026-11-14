@@ -193,6 +193,7 @@ type fakeNet struct {
 
 type dialRecord struct {
 	began, done time.Time
+	addr        string // the address the client asked for
 }
 
 func (n *fakeNet) dial(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -206,7 +207,7 @@ func (n *fakeNet) dial(ctx context.Context, network, addr string) (net.Conn, err
 	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	n.dials = append(n.dials, dialRecord{began, time.Now()})
+	n.dials = append(n.dials, dialRecord{began, time.Now(), addr})
 	if n.connectErr != nil {
 		return nil, n.connectErr
 	}
@@ -220,6 +221,16 @@ func (n *fakeNet) sent() []string {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	return slices.Clone(n.hellos)
+}
+
+// lastDialed is the address of the most recent connection.
+func (n *fakeNet) lastDialed() string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.dials) == 0 {
+		return ""
+	}
+	return n.dials[len(n.dials)-1].addr
 }
 
 func (n *fakeNet) dialed() []dialRecord {
@@ -993,6 +1004,59 @@ func TestModeDownNetworkBlocksNothing(t *testing.T) {
 		t.Fatal("waiting out a block after the network was down")
 	}
 	r.wantSent(modeCover)
+}
+
+// Lanes spread across the node's addresses, one each, because a browser
+// holds one connection open per address. The node needs no change: these
+// are addresses it already answers on.
+func TestLanesSpreadAcrossTheNodesAddresses(t *testing.T) {
+	r := newModeRig(t, nil)
+	// The same node, reached by a second address. The fake network dials
+	// whatever it is given, so an alias stands in for a second IP.
+	second := "alias." + r.node.addr
+	r.net.routes[""] = r.node.addr // no SNI reaches the node either way
+	r.cfg.Profile.Nodes = []string{second}
+	d, err := newDialer(r.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.d = d
+	if got := d.nodes; len(got) != 2 || got[0] != r.node.addr || got[1] != second {
+		t.Fatalf("addresses %q", got)
+	}
+
+	// Four lanes, each taking the least used address: two per address.
+	var released []func()
+	seen := map[string]int{}
+	for range 4 {
+		addr, release := d.takeAddr()
+		seen[addr]++
+		released = append(released, release)
+	}
+	if seen[r.node.addr] != 2 || seen[second] != 2 {
+		t.Fatalf("four lanes landed %v, want two on each address", seen)
+	}
+	// As lanes end their addresses come free again, and the next lane
+	// takes the one carrying the fewest.
+	released[0]()
+	released[1]() // both of the first address's
+	addr, _ := d.takeAddr()
+	if addr != r.node.addr {
+		t.Fatalf("after two lanes on %s ended, the next went to %s", r.node.addr, addr)
+	}
+
+	// And a real pair of lanes reaches the node on different addresses.
+	d.laneAddrs = map[string]int{}
+	r.modes.SetMode(modeNetwork, Choice{Mode: SNINone, Cover: modeCover, At: time.Now()})
+	var addrs []string
+	for range 2 {
+		l := r.mustDial()
+		t.Cleanup(func() { l.Close() })
+		addrs = append(addrs, r.net.lastDialed())
+	}
+	if addrs[0] == addrs[1] {
+		t.Fatalf("both lanes dialled %s", addrs[0])
+	}
 }
 
 // While the client is waiting out a block on the node's address it opens

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -112,6 +113,7 @@ type dialer struct {
 	cfg       Config
 	log       *slog.Logger
 	node      string
+	nodes     []string // node first, then Profile.Nodes
 	keyID     wire.KeyID
 	deviceKey [wire.KeyLen]byte
 	pins      []lane.Pin
@@ -139,6 +141,9 @@ type dialer struct {
 	ownBlocked  map[string]time.Time
 	quiet       map[string]time.Time
 	intercepted map[string]time.Time
+	// laneAddrs counts the live direct lanes on each of the node's
+	// addresses, so the next lane goes to the one carrying the fewest.
+	laneAddrs map[string]int
 }
 
 func newDialer(cfg Config) (*dialer, error) {
@@ -146,9 +151,18 @@ func newDialer(cfg Config) (*dialer, error) {
 	if p.Node == "" {
 		return nil, errors.New("tectonic: profile has no node address")
 	}
-	node := p.Node
-	if _, _, err := net.SplitHostPort(node); err != nil {
-		node = net.JoinHostPort(node, "443")
+	withPort := func(a string) string {
+		if _, _, err := net.SplitHostPort(a); err != nil {
+			return net.JoinHostPort(a, "443")
+		}
+		return a
+	}
+	node := withPort(p.Node)
+	nodes := []string{node}
+	for _, a := range p.Nodes {
+		if a = withPort(a); a != "" && !slices.Contains(nodes, a) {
+			nodes = append(nodes, a)
+		}
 	}
 	if len(p.KeyID) != wire.KeyIDLen || len(p.DeviceKey) != wire.KeyLen {
 		return nil, errors.New("tectonic: profile key_id must be 20 bytes and device_key 32")
@@ -156,6 +170,8 @@ func newDialer(cfg Config) (*dialer, error) {
 	d := &dialer{
 		cfg:         cfg,
 		node:        node,
+		nodes:       nodes,
+		laneAddrs:   map[string]int{},
 		sessions:    utls.NewLRUClientSessionCache(64),
 		modes:       cfg.Modes,
 		stallMin:    modeStallMin,
@@ -390,9 +406,25 @@ func (d *dialer) dial(ctx context.Context, req sched.DialRequest) (sched.PoolLan
 	cfg := d.laneConfig(req, cellular)
 	cfg.SNIMode = lane.SNIMode(c.Mode)
 	cfg.ServerName = c.Name
+	addr, release := d.takeAddr()
+	cfg.Addr = addr
 	l, err := lane.Dial(ctx, cfg)
+	d.release(l, err, release)
 	d.watch(l, err, lane.Direct, c, network)
 	return poolLane(l, err)
+}
+
+// release gives a lane's address back once the lane has ended, or at once
+// if it never opened.
+func (d *dialer) release(l *lane.Lane, err error, release func()) {
+	if err != nil || l == nil {
+		release()
+		return
+	}
+	go func() {
+		<-l.Done()
+		release()
+	}()
 }
 
 // poolLane converts without wrapping a nil *lane.Lane in a non-nil
@@ -402,6 +434,43 @@ func poolLane(l *lane.Lane, err error) (sched.PoolLane, error) {
 		return nil, err
 	}
 	return l, nil
+}
+
+// takeAddr returns the node address a new direct lane should use, and the
+// function that gives it back when that lane has ended. With one address
+// nothing changes; with more, the lanes spread so that each address carries
+// one at a time, which is what a browser shows per address.
+func (d *dialer) takeAddr() (string, func()) { return d.takeThisAddr("") }
+
+// takeThisAddr is takeAddr for a given address; empty means the least used.
+// A mode search puts every attempt on one address, because a censor that
+// blocks an address blocks it for every name, so what the search learns is
+// about that address (see blocked).
+func (d *dialer) takeThisAddr(want string) (string, func()) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	best := d.nodes[0]
+	if want != "" {
+		best = want
+	} else {
+		for _, a := range d.nodes {
+			if d.laneAddrs[a] < d.laneAddrs[best] {
+				best = a
+			}
+		}
+	}
+	d.laneAddrs[best]++
+	done := false
+	return best, func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if !done {
+			done = true
+			if d.laneAddrs[best]--; d.laneAddrs[best] <= 0 {
+				delete(d.laneAddrs, best)
+			}
+		}
+	}
 }
 
 func (d *dialer) laneConfig(req sched.DialRequest, cellular bool) lane.DialConfig {
@@ -608,8 +677,11 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel() // stops the attempts that are still connecting
+	// Every attempt goes to the same address, and it counts as one lane on
+	// it while the search runs, so the next lane prefers another.
+	addr, release := d.takeThisAddr(d.node)
 	s := &modeSearch{
-		d: d, ctx: ctx, req: req, cellular: cellular,
+		d: d, ctx: ctx, req: req, cellular: cellular, addr: addr,
 		// Each attempt sends at most one event of each kind, so no send
 		// blocks, even after the search has returned.
 		events: make(chan attemptEvent, attemptEventKinds*len(cands)),
@@ -650,7 +722,9 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 			s.discard(loser)
 		}
 		d.blocked(network, attempts, won, hello, cut)
+		d.release(l, nil, release)
 		if won == nil {
+			release() // nothing opened; release is idempotent
 			d.outcome(false, lane.Direct, Choice{}, network)
 			return nil, fmt.Errorf("tectonic: no SNI mode logged in: %w", errors.Join(errs...))
 		}
@@ -720,6 +794,7 @@ type modeSearch struct {
 	ctx      context.Context
 	req      sched.DialRequest
 	cellular bool
+	addr     string // the one address every attempt goes to
 	events   chan attemptEvent
 	over     chan struct{} // closed when the search returns
 	// won is the attempt that was chosen. Only its lane's events reach the
@@ -769,6 +844,7 @@ type attemptEvent struct {
 // run makes one attempt and reports how it goes.
 func (s *modeSearch) run(a *attempt) {
 	cfg := s.d.laneConfig(s.req, s.cellular)
+	cfg.Addr = s.addr
 	cfg.SNIMode = lane.SNIMode(a.c.Mode)
 	cfg.ServerName = a.c.Name
 	sent := false

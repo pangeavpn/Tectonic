@@ -37,6 +37,17 @@ type Profile struct {
 	// Node is the node's address, "203.0.113.7:443". The port defaults
 	// to 443.
 	Node string `json:"node"`
+	// Nodes are more addresses of the same node, which lanes are spread
+	// across so that each address carries one at a time. A browser
+	// coalesces onto one connection per address, so two lanes to one
+	// address are what a count of connections per address sees; two
+	// addresses of one node look like a name with two A records, which is
+	// what any CDN looks like. The node needs no change: it already
+	// answers on every address it listens on.
+	//
+	// They are the same node, so the cover domain, the pins and the
+	// credential are the same. The port defaults to 443 as Node's does.
+	Nodes []string `json:"nodes,omitempty"`
 	// CoverDomain is the node's own domain, used in Own mode.
 	CoverDomain string `json:"cover_domain"`
 	// KeyID and DeviceKey are the credential the hub issued for this node:
