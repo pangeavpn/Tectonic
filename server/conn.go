@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -24,7 +25,24 @@ const (
 	// whose record ends inside the tag is checked as far as it goes, and
 	// the rest is waited for only if that much is right.
 	helloMin = helloLen - wire.TagLen + 16
+	// restOfTag is how long the node waits for the rest of a tag whose
+	// first 16 bytes are right. The client writes HELLO's records in one
+	// flight, so the rest is already on its way: this is for a path that
+	// lost the segment carrying it, where a connection this young sends it
+	// again after a second (RFC 6298), and the round trip on top. Waiting
+	// as a web server does for a request that never comes, which is what
+	// the node did, holds the connection ten times as long.
+	restOfTag = 2 * time.Second
+	// peekFirst is the buffer the node offers the first record. Chrome's
+	// is about 500 bytes and a lane's about 460; a larger one is read in
+	// two parts, which the web server reads as the stream it is.
+	peekFirst = 4 << 10
 )
+
+// errTakenByLane stops the web server serving a connection a lane has
+// taken. net/http logs it to a discarded error log and closes, and the
+// close is a no-op once the lane owns the connection.
+var errTakenByLane = errors.New("server: the connection logged in as a lane")
 
 // startsHello reports whether b starts with a HELLO frame's header.
 func startsHello(b []byte) bool {
@@ -72,12 +90,56 @@ type conn struct {
 // first read will need that doesn't depend on what the client sends, so
 // that none of it is done between the web server's first read and its first
 // write.
+//
+// It also looks for a login in the client's first record if that record has
+// already arrived, which it usually has: the client sends it in the flight
+// after its Finished, and TLS reads what is on the wire. Checking it here
+// costs the web server nothing, where checking it in the web server's first
+// read puts a few microseconds between that read and the web server's
+// answer. Those microseconds decide a race inside net/http's HTTP/2 server
+// between the SETTINGS frame it writes and the close that follows a first
+// record it doesn't like, and the node closed with a TLS alert after a bad
+// preface in 70% of probes where a Go web server does in 50%.
 func (c *conn) HandshakeContext(ctx context.Context) error {
 	err := c.Conn.HandshakeContext(ctx)
-	if err == nil {
-		c.prepare()
+	if err != nil {
+		return err
 	}
-	return err
+	c.prepare()
+	// Only where the web server serves the connection itself. Where the
+	// node runs the handshake instead (see cover.direct) it also writes the
+	// SETTINGS frame, at a point of its own choosing, and the race this
+	// avoids is net/http's.
+	if c.h2 && c.s.cover.direct && c.peekLogin() {
+		return errTakenByLane
+	}
+	return nil
+}
+
+// peekLogin reads the client's first record if it has arrived already and
+// looks for a login in it. It reports whether a lane took the connection.
+//
+// The read is made with a deadline in the past, so it brings what TLS has
+// buffered and never waits for the network. Whether the record is there
+// depends on when it arrives and not on what it holds, and the check itself
+// runs on whatever is there, as it does in the web server's first read.
+func (c *conn) peekLogin() bool {
+	if err := c.Conn.SetReadDeadline(time.Unix(1, 0)); err != nil {
+		return false
+	}
+	buf := make([]byte, peekFirst)
+	n, err := c.Conn.Read(buf)
+	if derr := c.Conn.SetReadDeadline(time.Time{}); derr != nil {
+		return false
+	}
+	if n == 0 {
+		// Nothing buffered (a timeout), or the connection is gone: either
+		// way the web server's first read does the looking.
+		_ = err
+		return false
+	}
+	c.read = true
+	return c.checkFirst(buf, n)
 }
 
 func (c *conn) prepare() {
@@ -124,14 +186,25 @@ func (c *conn) firstRead(p []byte) (int, error) {
 	if n == 0 {
 		return 0, err
 	}
-	if h, ok := c.login(buf, &n); ok {
-		c.handOver(h, buf[helloLen:n])
+	if c.checkFirst(buf, n) {
 		return 0, net.ErrClosed
 	}
 	// An error that came with data comes again on the next read.
-	m := copy(p, buf[:n])
-	c.held = buf[m:n]
+	m := copy(p, c.held)
+	c.held = c.held[m:]
 	return m, nil
+}
+
+// checkFirst looks for a login in buf[:n], the client's first record. It
+// reports whether a lane took the connection; otherwise the record is the
+// web server's, whole, and waits in c.held.
+func (c *conn) checkFirst(buf []byte, n int) bool {
+	if h, ok := c.login(buf, &n); ok {
+		c.handOver(h, buf[helloLen:n])
+		return true
+	}
+	c.held = buf[:n]
+	return false
 }
 
 // login reports whether buf[:n], the client's first record, starts with a
@@ -146,11 +219,18 @@ func (c *conn) login(buf []byte, n *int) (wire.Hello, bool) {
 	if len(got) == helloLen {
 		return h, true
 	}
+	// Only the holder of the device key reaches here, so the wait is
+	// bounded rather than left to the web server's own (see restOfTag).
+	c.Conn.SetReadDeadline(time.Now().Add(restOfTag))
 	m, err := io.ReadAtLeast(c.Conn, buf[*n:], helloLen-*n)
 	*n += m
 	if err != nil {
+		// The web server has the record, and reads on with the time it
+		// gives any client that has sent it nothing yet.
+		c.Conn.SetReadDeadline(time.Now().Add(c.s.cfg.HandshakeTimeout))
 		return h, false
 	}
+	c.Conn.SetReadDeadline(time.Time{})
 	return c.s.checkHello(buf[wire.HeaderLen:helloLen], c.exporter)
 }
 
