@@ -112,7 +112,7 @@ type Server struct {
 	profile *shape.Profile
 	// laneProfiles are profile with the records the cover web server opens
 	// with, one per rehearsed page load (see learnOpening), once known.
-	laneProfiles atomic.Pointer[[]*shape.Profile]
+	laneProfiles atomic.Pointer[[]*learned]
 	wgAddr       *net.UDPAddr
 
 	ctx    context.Context
