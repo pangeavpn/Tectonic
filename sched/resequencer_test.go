@@ -326,6 +326,85 @@ func TestResequencerBoundsWhatItHolds(t *testing.T) {
 	}
 }
 
+// held reports how many packets are waiting and what they come to.
+func (r *Resequencer) heldForTest() (int, int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.held, r.heldSz
+}
+
+// What waits at once is bounded by its size as well as its count: a DATA
+// frame carries up to 64 KiB, so the count alone would let a sender pin far
+// more memory than the cap was chosen for.
+func TestResequencerBoundsTheBytesItHolds(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	const size = 9000 // the largest a packet can be and still be held
+	b.Push(wgData(7, 0, big), time.Second)
+	for c := uint64(2); c < 2+2500; c++ {
+		a.Push(wgData(7, c, size), time.Second)
+	}
+	held, bytes := r.heldForTest()
+	if bytes > maxHeldBytes+size || held >= maxHeld {
+		t.Fatalf("holding %d packets, %d bytes; want at most %d bytes and fewer than %d packets",
+			held, bytes, maxHeldBytes, maxHeld)
+	}
+	if got := s.list(); !slices.IsSorted(got) {
+		t.Fatal("packets were delivered out of order")
+	}
+}
+
+// A packet too large to be WireGuard data at any sane MTU is not held for
+// the packets before it: it goes on as it arrives.
+func TestResequencerDoesNotHoldAnImplausiblyLargePacket(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	a.Push(wgData(7, 0, big), rtt)
+	b.Push(wgData(7, 2, maxHoldable+1), rtt) // 1 is still on its way
+	if got := s.list(); !slices.Equal(got, []uint64{0, 2}) {
+		t.Fatalf("delivered %v, want the large packet to go straight on", got)
+	}
+	if held, bytes := r.heldForTest(); bytes != 0 {
+		t.Fatalf("holding %d packets, %d bytes", held, bytes)
+	}
+	// One that just fits is held, as before.
+	b.Push(wgData(7, 3, maxHoldable), rtt)
+	if got := s.list(); !slices.Equal(got, []uint64{0, 2}) {
+		t.Fatalf("delivered %v; a packet that fits was not held", got)
+	}
+}
+
+// A LOST run that reaches past maxJump stops, but leaves the queue trimmed
+// and the timer set, like every other way out of the loop. It used to
+// return early, so what each flow held past the cap stayed there.
+func TestResequencerLostPastMaxJumpKeepsTheBound(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a := r.Source()
+	for idx := uint32(1); idx <= maxFlows; idx++ {
+		a.Push(wgData(idx, 0, big), rtt)
+		// Starts well inside maxJump and runs past it.
+		a.Lost(idx, maxJump-5536, maxHeld, rtt)
+	}
+	held, bytes := r.heldForTest()
+	if held > maxHeld || bytes > maxHeldBytes {
+		t.Fatalf("holding %d packets, %d bytes; want at most %d and %d", held, bytes, maxHeld, maxHeldBytes)
+	}
+	// The flows still work: the packet each is waiting for is delivered.
+	before := len(s.list())
+	for idx := uint32(1); idx <= maxFlows; idx++ {
+		a.Push(wgData(idx, maxJump, big), rtt)
+	}
+	if got := len(s.list()); got <= before {
+		t.Fatal("nothing was delivered after the bound was enforced")
+	}
+}
+
 func TestResequencerCloseStopsDelivery(t *testing.T) {
 	var s sink
 	r := NewResequencer(s.deliver)

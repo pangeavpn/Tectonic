@@ -69,6 +69,19 @@ const (
 	// maxHeld is the most packets waiting at once. Past it the oldest gap
 	// is given up on early.
 	maxHeld = 8192
+	// maxHeldBytes is the most the waiting packets may come to. The count
+	// alone doesn't bound the memory: a DATA frame carries up to 64 KiB,
+	// where a WireGuard packet at a 1500-byte MTU is 1536, so 8192 of them
+	// can be half a gigabyte rather than the 12 MiB the count was chosen
+	// for. A sender that fills this is holding up its own tunnel.
+	maxHeldBytes = 16 << 20
+	// maxHoldable is the largest packet that is held for the ones before
+	// it. A WireGuard data packet is 32 bytes around a payload padded to a
+	// multiple of 16, so this is one at a 9000-byte MTU: six times what the
+	// 1500 the apps allow gives, and far beyond any path that carries a
+	// tunnel. Anything larger goes on as it arrives, like a packet that
+	// isn't WireGuard data, instead of filling the queue.
+	maxHoldable = 32 + 9008
 	// maxFlows is how many WireGuard keys are tracked at once: during a
 	// rekey the old and new keys overlap.
 	maxFlows = 8
@@ -111,7 +124,8 @@ type Resequencer struct {
 	flows   [maxFlows]reflow
 	sources []*Source
 	clock   uint64 // orders flows by last use
-	held    int
+	held    int    // packets waiting, and what they come to
+	heldSz  int
 	timer   *time.Timer
 	timerAt time.Time
 	closed  bool
@@ -220,6 +234,8 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 	// Small packets go out of turn (the scheduler may also duplicate them
 	// onto a second lane), so they say nothing about how far a lane has got.
 	ordered := len(pkt) > DupMaxSize
+	// A packet too large to be WireGuard data is not waited for either.
+	holdable := len(pkt) <= maxHoldable
 	if ordered && !s.closed {
 		if h := &s.past[fi]; !h.ok || ctr >= h.next {
 			h.next, h.ok = ctr+1, true
@@ -245,24 +261,23 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 			break
 		}
 		h := heldPkt{ctr: ctr, at: now, soon: now.Add(IdleHoldFor(rtt)), due: now.Add(HoldFor(rtt))}
-		if ordered {
+		if ordered && holdable {
 			h.buf = append(r.bufs.Get().([]byte)[:0], pkt...)
 			r.stats.Held++
+			r.heldSz += len(h.buf)
 		} else {
 			r.deliver(pkt)
 		}
 		if dup {
 			// The sender said it had dropped this one, and sent it
 			// after all.
+			r.heldSz -= len(f.q[i].buf)
 			f.q[i] = h
 		} else {
 			f.insert(i, h)
 			r.held++
 		}
-		for r.held > maxHeld && f.len() > 0 {
-			r.skipTo(f, 0)
-			r.drain(f)
-		}
+		r.trim(f)
 		if f.len() > 0 {
 			r.schedule(h.due)
 		}
@@ -290,6 +305,7 @@ func (s *Source) Lost(idx uint32, ctr uint64, count uint32, rtt time.Duration) {
 	f := &r.flows[fi]
 	now := time.Now()
 	due := now.Add(HoldFor(rtt))
+loop:
 	for c, end := ctr, ctr+uint64(min(count, maxHeld)); c < end; c++ {
 		switch {
 		case c < f.next:
@@ -298,7 +314,9 @@ func (s *Source) Lost(idx uint32, ctr uint64, count uint32, rtt time.Duration) {
 			f.next++
 			r.drain(f)
 		case c-f.next > maxJump:
-			return
+			// Too far ahead to keep places for. Stop, but leave the queue
+			// trimmed and the timer set, as every other way out does.
+			break loop
 		default:
 			i, dup := f.find(c)
 			if dup {
@@ -309,14 +327,20 @@ func (s *Source) Lost(idx uint32, ctr uint64, count uint32, rtt time.Duration) {
 		}
 		r.stats.Lost++
 	}
-	for r.held > maxHeld && f.len() > 0 {
-		r.skipTo(f, 0)
-		r.drain(f)
-	}
+	r.trim(f)
 	if f.len() > 0 {
 		r.schedule(due)
 	}
 	r.regap(f, true)
+}
+
+// trim gives up on the flow's oldest gaps while the waiting packets are
+// more, or come to more, than may wait at once.
+func (r *Resequencer) trim(f *reflow) {
+	for (r.held > maxHeld || r.heldSz > maxHeldBytes) && f.len() > 0 {
+		r.skipTo(f, 0)
+		r.drain(f)
+	}
 }
 
 // Close tells the Resequencer the lane will deliver nothing more, so no
@@ -366,7 +390,7 @@ func (r *Resequencer) Close() {
 		s.closed = true
 	}
 	r.sources = nil
-	r.held = 0
+	r.held, r.heldSz = 0, 0
 }
 
 // transportHeader reads a WireGuard data packet's key index and counter.
@@ -501,6 +525,9 @@ func (r *Resequencer) flush(f *reflow) {
 func (r *Resequencer) dropFront(f *reflow, k int) {
 	if k == 0 {
 		return
+	}
+	for _, h := range f.q[f.head : f.head+k] {
+		r.heldSz -= len(h.buf)
 	}
 	clear(f.q[f.head : f.head+k])
 	f.head += k
