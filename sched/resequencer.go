@@ -277,7 +277,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 			f.insert(i, h)
 			r.held++
 		}
-		r.trim(f)
+		r.trim()
 		if f.len() > 0 {
 			r.schedule(h.due)
 		}
@@ -327,20 +327,46 @@ loop:
 		}
 		r.stats.Lost++
 	}
-	r.trim(f)
+	r.trim()
 	if f.len() > 0 {
 		r.schedule(due)
 	}
 	r.regap(f, true)
 }
 
-// trim gives up on the flow's oldest gaps while the waiting packets are
-// more, or come to more, than may wait at once.
-func (r *Resequencer) trim(f *reflow) {
-	for (r.held > maxHeld || r.heldSz > maxHeldBytes) && f.len() > 0 {
+// trim gives up on the oldest gaps while the waiting packets are more, or
+// come to more, than may wait at once.
+//
+// What it gives up on is the oldest gap of any flow, not of the flow a
+// packet has just arrived on. The bounds are over every flow together, so
+// a flow holding its share of them would otherwise cost every other flow
+// its reordering: the flow that just received would be emptied, over and
+// over, while the one holding the packets kept them.
+func (r *Resequencer) trim() {
+	for r.held > maxHeld || r.heldSz > maxHeldBytes {
+		f := r.oldestWaiting()
+		if f == nil {
+			return
+		}
 		r.skipTo(f, 0)
 		r.drain(f)
 	}
+}
+
+// oldestWaiting is the flow whose first waiting packet arrived first, or
+// nil if nothing is waiting.
+func (r *Resequencer) oldestWaiting() *reflow {
+	var out *reflow
+	for i := range r.flows {
+		f := &r.flows[i]
+		if f.len() == 0 {
+			continue
+		}
+		if out == nil || f.q[f.head].at.Before(out.q[out.head].at) {
+			out = f
+		}
+	}
+	return out
 }
 
 // Close tells the Resequencer the lane will deliver nothing more, so no

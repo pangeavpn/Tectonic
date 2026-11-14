@@ -356,6 +356,43 @@ func TestResequencerBoundsTheBytesItHolds(t *testing.T) {
 	}
 }
 
+// What may wait is bounded over every flow together, so the flow that
+// filled the bound is the one given up on. The flow a packet has just
+// arrived on used to be emptied instead, so during a rekey, when two flows
+// run at once, one flow's gap cost the other its reordering entirely.
+func TestResequencerTrimsTheFlowThatFilledIt(t *testing.T) {
+	var s sink
+	r := NewResequencer(s.deliver)
+	defer r.Close()
+	a, b := r.Source(), r.Source()
+	const size = 9000 // the largest a packet can be and still be held
+
+	// One flow loses every other packet, so each one it does get waits,
+	// and it fills the bound.
+	a.Push(wgData(7, 0, big), time.Second)
+	for c := uint64(2); c < 2+8000; c += 2 {
+		a.Push(wgData(7, c, size), time.Second)
+	}
+	if held, bytes := r.heldForTest(); held == 0 {
+		t.Fatalf("the first flow holds nothing (%d bytes): the test no longer fills the bound", bytes)
+	}
+
+	// The other flow, as a rekey's is, has a gap of its own.
+	b.Push(wgData(8, 50000, big), time.Second)
+	b.Push(wgData(8, 50002, size), time.Second) // 50001 is still on its way
+	got := s.list()
+	if !slices.Contains(got, uint64(50000)) {
+		t.Fatal("the second flow's first packet was not delivered")
+	}
+	if slices.Contains(got, uint64(50002)) {
+		t.Fatal("the second flow's out-of-order packet went straight on: the flow that filled the bound kept its own and this one lost its reordering")
+	}
+	if held, bytes := r.heldForTest(); bytes > maxHeldBytes+size || held >= maxHeld {
+		t.Fatalf("holding %d packets, %d bytes; want at most %d bytes and fewer than %d packets",
+			held, bytes, maxHeldBytes, maxHeld)
+	}
+}
+
 // A packet too large to be WireGuard data at any sane MTU is not held for
 // the packets before it: it goes on as it arrives.
 func TestResequencerDoesNotHoldAnImplausiblyLargePacket(t *testing.T) {
