@@ -117,6 +117,7 @@ type DialConfig struct {
 	SessionID wire.SessionID // zero for a new session
 	Join      bool
 	Cellular  bool
+	Redundant bool
 	// Now is the clock for HELLO's timestamp; nil means time.Now.
 	Now func() time.Time
 
@@ -199,6 +200,9 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 	}
 	if cfg.Cellular {
 		h.Flags |= wire.FlagCellular
+	}
+	if cfg.Redundant {
+		h.Flags |= wire.FlagRedundant
 	}
 	h.Sign(wire.LaneKey(cfg.DeviceKey, binding))
 	if cfg.FirstPacket == nil && cfg.TakeFirstPacket != nil {

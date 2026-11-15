@@ -16,8 +16,9 @@ const Version = 1
 // cellular asks for the server's cellular lane limit (design §7: "6 by
 // default, and 3 on cellular"). Receivers ignore bits they don't know.
 const (
-	FlagJoin     byte = 1 << 0 // join an existing session
-	FlagCellular byte = 1 << 1 // the client is on a cellular network
+	FlagJoin      byte = 1 << 0 // join an existing session
+	FlagCellular  byte = 1 << 1 // the client is on a cellular network
+	FlagRedundant byte = 1 << 2 // copy light traffic onto a second lane (gaming mode)
 )
 
 // SessionIDLen is the size of a session_id.
@@ -67,6 +68,9 @@ func (h *Hello) Join() bool { return h.Flags&FlagJoin != 0 }
 
 // Cellular reports whether the client says it is on a cellular network.
 func (h *Hello) Cellular() bool { return h.Flags&FlagCellular != 0 }
+
+// Redundant reports whether the client asks the server to copy light traffic onto a second lane.
+func (h *Hello) Redundant() bool { return h.Flags&FlagRedundant != 0 }
 
 // AppendBody appends the 78-byte HELLO body to dst.
 func (h *Hello) AppendBody(dst []byte) []byte {

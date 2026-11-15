@@ -182,6 +182,9 @@ type Config struct {
 	// Cellular tells the server the device is on cellular, where it allows
 	// fewer lanes.
 	Cellular bool
+	// Redundant is gaming mode: light traffic rides two lanes each way, so a lane that
+	// loses a segment doesn't stall it, at up to 2 Mbit/s more and a less browser-like pair of lanes.
+	Redundant bool
 	// Control runs on each lane's socket before it connects, for example
 	// to protect it from the VPN's own routing on mobile.
 	Control func(network, address string, c syscall.RawConn) error
@@ -272,6 +275,7 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		Profiles:  d.profiles,
 		Churn:     cfg.Churn,
 		BaseLanes: cfg.Lanes,
+		Redundant: cfg.Redundant,
 		Logger:    log,
 	})
 	return c, nil

@@ -538,6 +538,7 @@ func (d *dialer) laneConfig(req sched.DialRequest, cellular bool) lane.DialConfi
 		SessionID:       req.SessionID,
 		Join:            req.Join,
 		Cellular:        cellular,
+		Redundant:       d.cfg.Redundant,
 		TakeFirstPacket: req.TakeFirstPacket,
 		Lane: lane.Options{
 			Handler:    req.Handler,

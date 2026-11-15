@@ -145,6 +145,7 @@ lane_key = HKDF-SHA256(ikm = device_key, salt = exporter, info = "tectonic lane 
 HELLO
   version     1 byte    = 1
   flags       1 byte    bit 0: join an existing session
+                        bit 1: on cellular; bit 2: gaming mode (§7)
   key_id     20 bytes
   session_id 16 bytes   zeros for a new session
   timestamp   8 bytes   unix seconds
@@ -261,6 +262,8 @@ Lanes are separate TCP connections, so packets spread across them arrive out of 
 ### Duplicating small urgent packets
 
 While any lane is retransmitting, packets of 128 bytes or less are also copied onto the next-best lane. That covers WireGuard handshakes, keepalives, and most TCP ACKs from inside the tunnel. Duplication is capped at 5% of bandwidth and removes most of the latency spikes that loss would otherwise cause. The receiver doesn't need any logic for this, because WireGuard silently drops the second copy.
+
+**Gaming mode.** A client can ask for more by setting HELLO flag bit 2. Both ends then copy every packet of 1280 bytes or less onto the next preferred lane, whatever the lanes are doing, up to 2 Mbit/s of copies each way. A game's traffic is light enough to stay on one lane, so a single lost segment stalls it for a whole retransmission; with the copy, the other lane delivers it on time and the receiver drops whichever arrives second. On a 10 ms link losing 1% of packets this took a 60 Hz game stream's p99 from 222 ms to 24–42 ms. It is off by default: two lanes carrying the same records at the same moments is a pattern a browser doesn't make.
 
 ### Lane churn
 

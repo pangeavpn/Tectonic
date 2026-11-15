@@ -82,6 +82,8 @@ type PoolConfig struct {
 	// best cover and the slowest on a path that loses packets, where
 	// separate congestion windows are what lanes are for.
 	BaseLanes int
+	// Redundant copies light traffic onto a second lane (Scheduler.Redundant).
+	Redundant bool
 	Logger    *slog.Logger
 	// DialTimeout bounds one lane dial. Zero means 20 s.
 	DialTimeout time.Duration
@@ -243,6 +245,7 @@ func NewPool(cfg PoolConfig) *Pool {
 		rng:       rand.New(rand.NewChaCha8(seed)),
 	}
 	p.limit.Log = log.Debug
+	p.sched.Redundant = cfg.Redundant
 	p.reseq = NewResequencer(func(pkt []byte) {
 		if cfg.Receive != nil {
 			cfg.Receive(pkt)

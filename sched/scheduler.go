@@ -44,6 +44,13 @@ const (
 	dupBurst = 16 << 10
 	maxLanes = 16
 
+	// RedundantMaxSize is the largest packet a redundant scheduler copies onto
+	// a second lane: all a game or a call sends, none of a download's full-size packets.
+	RedundantMaxSize = 1280
+	// RedundantRate caps those copies at 2 Mbit/s.
+	RedundantRate  = 256 << 10
+	redundantBurst = 64 << 10
+
 	// SpillMin and SpillMax bound how much later than the best lane's a
 	// preferred lane's estimate may be before traffic spills past it.
 	// Within them the margin is a sixteenth of the preferred lane's srtt.
@@ -69,10 +76,15 @@ func SpillAfter(srtt time.Duration) time.Duration {
 // Scheduler picks a lane for every outgoing datagram. It is safe for
 // concurrent use; Send is lock-free apart from the duplication budget.
 type Scheduler struct {
+	// Redundant copies light traffic onto a second lane (see Send). Set it before the first Send.
+	Redundant bool
+
 	lanes atomic.Pointer[[]Lane]
 
-	mu     sync.Mutex
-	tokens float64
+	mu        sync.Mutex
+	tokens    float64
+	redTokens float64 // the redundant copy budget as of redAt
+	redAt     time.Time
 	// flows is how far each WireGuard key's counter has got, and lost the
 	// datagrams found missing or dropped that the peer has yet to be told
 	// about (see report).
@@ -195,7 +207,21 @@ func (s *Scheduler) Send(pkt []byte) bool {
 		s.report(lanes[used])
 	}
 
-	if len(pkt) <= DupMaxSize && k > 1 && anyRetransmitting(lanes) {
+	if k < 2 {
+		return true
+	}
+	// A lane that loses a segment stalls everything behind it until TCP resends it,
+	// so light traffic also rides the next preferred lane, and the first copy wins.
+	if s.Redundant && len(pkt) <= RedundantMaxSize && s.spendRedundant(n) {
+		for i := range k {
+			if i != used && lanes[i].Send(pkt) {
+				s.duplicated.Add(1)
+				break
+			}
+		}
+		return true
+	}
+	if len(pkt) <= DupMaxSize && anyRetransmitting(lanes) {
 		for _, i := range order[:k] {
 			if i == used {
 				continue
@@ -290,6 +316,23 @@ func (s *Scheduler) earn(n int) {
 	s.mu.Lock()
 	s.tokens = min(s.tokens+DupShare*float64(n), dupBurst)
 	s.mu.Unlock()
+}
+
+func (s *Scheduler) spendRedundant(n int) bool {
+	now := time.Now()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.redAt.IsZero() {
+		s.redTokens = redundantBurst
+	} else {
+		s.redTokens = min(s.redTokens+RedundantRate*now.Sub(s.redAt).Seconds(), redundantBurst)
+	}
+	s.redAt = now
+	if s.redTokens < float64(n) {
+		return false
+	}
+	s.redTokens -= float64(n)
+	return true
 }
 
 func (s *Scheduler) spend(n int) bool {

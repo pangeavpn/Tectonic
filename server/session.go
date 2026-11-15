@@ -155,6 +155,7 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 	}
 	ss := &session{s: s, keyID: h.KeyID, cellular: h.Cellular(), udp: udp, done: make(chan struct{})}
 	ss.joined.Store(time.Now().UnixNano())
+	ss.sched.Redundant = h.Redundant()
 	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
 	ss.limit.Log = s.log.Debug
 	s.mu.Lock()
