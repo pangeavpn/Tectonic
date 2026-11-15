@@ -360,6 +360,11 @@ func (d *dialer) choice(network string) (Choice, bool) {
 		if c.Mode == SNIBorrowed && d.cfg.SNI != "" {
 			c.Name = d.cfg.SNI // the user's own name wins
 		}
+		// The store is shared by every node: the mode is the network's, but Own's name
+		// is this node's cover domain, never the one the mode was learned on.
+		if c.Mode == SNIOwn {
+			c.Name = d.cfg.Profile.CoverDomain
+		}
 		return c, true
 	}
 	return Choice{}, false
