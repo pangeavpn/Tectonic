@@ -291,7 +291,8 @@ func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*
 		RootCAs: p.roots,
 		// BENCH_BASE_LANES compares lane counts: one lane is the best
 		// cover and the slowest where lanes earn their keep.
-		Lanes: baseLanes(),
+		Lanes:     baseLanes(),
+		Redundant: os.Getenv("BENCH_REDUNDANT") == "1",
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			ap, err := netip.ParseAddrPort(addr)
 			if err != nil {
