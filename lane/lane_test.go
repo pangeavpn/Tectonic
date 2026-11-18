@@ -66,7 +66,11 @@ func TestDialOwnModeCarriesDataBothWays(t *testing.T) {
 			t.Fatalf("packet %d out of place: %q %q", i, up[i+1], down[i])
 		}
 	}
+	// The writer counts a record once Write returns, which can be after the node has read it.
 	st := cl.Stats()
+	for deadline := time.Now().Add(5 * time.Second); st.PacketsSent < 51 && time.Now().Before(deadline); st = cl.Stats() {
+		time.Sleep(5 * time.Millisecond)
+	}
 	if st.PacketsSent != 51 || st.DataRecv == 0 || st.BytesSent < st.DataSent {
 		t.Fatalf("stats = %+v", st)
 	}
