@@ -7,7 +7,7 @@
 
 <h3>Design methodology</h3>
 
-![Status](https://img.shields.io/badge/status-draft-C3562B?style=flat-square)
+![Status](https://img.shields.io/badge/status-beta-C3562B?style=flat-square)
 [![License](https://img.shields.io/badge/license-GPL--3.0-434C59?style=flat-square)](../LICENSE)
 ![Language](https://img.shields.io/badge/language-Go-434C59?style=flat-square)
 ![Platforms](https://img.shields.io/badge/platforms-desktop%20%7C%20Android%20%7C%20iOS-434C59?style=flat-square)
@@ -19,7 +19,7 @@
 ---
 
 > [!NOTE]
-> **Status: draft.** This describes what we intend to build. Nothing here is implemented yet, and every number under [Measuring speed](#13-measuring-speed) is a target, not a result.
+> **Status: beta.** What this describes is built and covered by tests, including an in-process end-to-end run with real WireGuard. The PangeaVPN client carries it as a beta transport that automatic mode tries last, because it hasn't been field-tested at scale yet. The numbers under [Measuring speed](#13-measuring-speed) are targets; [`bench/RESULTS.md`](../bench/RESULTS.md) and [`bench/recent.md`](../bench/recent.md) show which of them it meets in the lab. Shaping profiles recorded from real Chrome sessions (milestone M5) are still to come.
 
 Tectonic carries WireGuard over a small pool of short-lived TLS 1.3 connections called **lanes**. Packets travel across the lanes independently and are put back in order as they arrive. Each lane has its own congestion window, so a loss slows one lane and the others keep their pace. To anyone watching the network, each lane is Chrome loading an ordinary website.
 
