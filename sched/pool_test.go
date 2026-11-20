@@ -690,6 +690,30 @@ func TestPoolBacksOffOnFailures(t *testing.T) {
 	}
 }
 
+func TestPoolRedialsQuicklyWhileTheNodeRestarts(t *testing.T) {
+	old := shutdownRedial
+	shutdownRedial = 50 * time.Millisecond
+	t.Cleanup(func() { shutdownRedial = old })
+	d := newFakeDialer()
+	d.welcome = 1
+	p := newTestPool(t, d, PoolConfig{})
+	l1, _ := d.next(t), d.next(t)
+	d.mu.Lock()
+	d.fail, d.welcome = 6, 2
+	d.mu.Unlock()
+	start := time.Now()
+	l1.req.Handler.Close(nil, wire.CloseShutdown)
+	p.Send(wgInit())
+	l := d.next(t)
+	// Backing off, six failures would have taken 0.5 + 1 + 2 + 4 + 8 + 16 s.
+	if el := time.Since(start); el > 2*time.Second {
+		t.Fatalf("back after %v; the restart did not shorten the redial", el)
+	}
+	if l.req.Join {
+		t.Fatalf("request = %+v, want a new session on the restarted node", l.req)
+	}
+}
+
 func TestPoolAdoptsReplacementSession(t *testing.T) {
 	d := newFakeDialer()
 	d.welcome = 1

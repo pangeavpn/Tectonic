@@ -124,6 +124,13 @@ const (
 // so tests can run the pool faster.
 var activeTick = 500 * time.Millisecond
 
+// After a node says it is restarting, the pool dials about every
+// shutdownRedial for shutdownRedialFor: a node update is back within seconds.
+var (
+	shutdownRedial    = time.Second
+	shutdownRedialFor = 2 * time.Minute
+)
+
 // Pool owns a client's lanes and the session they share.
 type Pool struct {
 	cfg   PoolConfig
@@ -167,6 +174,7 @@ type Pool struct {
 	lastLaneAt  time.Time
 	backoff     time.Duration
 	nextDial    time.Time
+	restarting  time.Time     // until when a failed dial retries every shutdownRedial
 	idleFor     time.Time     // the activity mark idleClose was drawn for
 	idleClose   time.Duration // how long after it the last lane closes
 	idleShrink  time.Duration // how long after the last real packet the pool shrinks to one lane
@@ -850,10 +858,9 @@ func (p *Pool) dialFailed(now time.Time, err error, reason string, taken []byte)
 	if p.ctx.Err() != nil {
 		return
 	}
-	p.backoff = min(max(p.backoff*2, backoffMin), backoffMax)
-	jitter := time.Duration(p.rng.Int64N(int64(p.backoff)/4 + 1))
-	p.nextDial = now.Add(p.backoff + jitter)
-	p.log.Debug("lane dial failed", "reason", reason, "err", err, "retry_in", p.backoff+jitter)
+	delay := p.redialDelay(now)
+	p.nextDial = now.Add(delay)
+	p.log.Debug("lane dial failed", "reason", reason, "err", err, "retry_in", delay)
 	if len(taken) > 0 {
 		// Put the packet back so the next lane carries it.
 		p.mu.Lock()
@@ -861,6 +868,14 @@ func (p *Pool) dialFailed(now time.Time, err error, reason string, taken []byte)
 		p.pendingSz += len(taken)
 		p.mu.Unlock()
 	}
+}
+
+func (p *Pool) redialDelay(now time.Time) time.Duration {
+	if now.Before(p.restarting) {
+		return shutdownRedial*3/4 + time.Duration(p.rng.Int64N(int64(shutdownRedial)/2+1))
+	}
+	p.backoff = min(max(p.backoff*2, backoffMin), backoffMax)
+	return p.backoff + time.Duration(p.rng.Int64N(int64(p.backoff)/4+1))
 }
 
 // clampWelcome holds what a WELCOME asks for to what the client will do.
@@ -886,6 +901,7 @@ func (p *Pool) welcomed(st *laneState) {
 	st.upAt = time.Now()
 	p.backoff = 0
 	p.nextDial = time.Time{}
+	p.restarting = time.Time{}
 	if !p.haveSession || w.SessionID != p.session {
 		if p.haveSession {
 			// The session expired on the server and this lane started a
@@ -926,6 +942,10 @@ func (p *Pool) sessionClosed(reason wire.CloseReason) {
 	if reason == wire.CloseCredential {
 		p.shutdown(ErrCredentialRejected)
 		return
+	}
+	if reason == wire.CloseShutdown {
+		p.restarting = time.Now().Add(shutdownRedialFor)
+		p.backoff, p.nextDial = 0, time.Time{}
 	}
 	// The session is over; the next lane starts a new one.
 	p.haveSession = false
