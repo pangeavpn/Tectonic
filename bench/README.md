@@ -67,6 +67,33 @@ the bottleneck queue, rather than queue then delay; fq hashes flows into
 the client's socket (`ss -K`), which sends the node a RST, rather than
 forging one to each end.
 
+## A Windows client (`cmd/winbench`)
+
+Neither path runs a lane on Windows' TCP, which is what Windows clients use
+in production. `cmd/winbench` runs the two ends apart: the node in WSL 2,
+the client on Windows, so the client's lanes cross the virtual switch
+between them as Windows TCP connections. `cmd/winbench/shape.sh` impairs
+that switch from the WSL side: what the client sends goes through an IFB
+device (netem delay and loss, then a tbf bottleneck and its queue), and what
+the node sends back is delayed by netem. The test traffic is a bulk TCP
+upload inside the tunnel, with 64-byte UDP echoes beside it every 20 ms.
+
+```sh
+# in WSL, from bench/ (the node's WireGuard listens on UDP 51999)
+go build -o /tmp/winbench ./cmd/winbench
+/tmp/winbench node -listen :8443 -dir /mnt/c/winbench   # writes ca.pem there
+sudo bash cmd/winbench/shape.sh 5000 20 150000 1         # 5 Mbit/s up, 20 ms each way, 150 KB queue, 1% loss
+sudo bash cmd/winbench/shape.sh off
+
+# on Windows, from bench\
+go build -o winbench.exe ./cmd/winbench
+.\winbench.exe client -node <WSL eth0 address>:8443 -dir C:\winbench -dur 15s [-redundant]
+```
+
+It prints the upload's goodput and the echoes' round trips, idle and under
+the upload, which vary by several milliseconds from run to run: compare
+builds by running them in turn, several times each.
+
 ## Scenarios
 
 | Name | Target (§13) | How it is measured |
