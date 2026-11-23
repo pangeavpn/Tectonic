@@ -51,6 +51,7 @@ var scenarios = []scenario{
 	{"reset", "recovery from a reset lane", scReset},
 	{"interactive", "bandwidth overhead during interactive use", scInteractive},
 	{"game", "a 60 Hz game stream on a lossy 10 ms link", scGame},
+	{"gameload", "the game stream beside a download in the same tunnel", scGameLoad},
 	{"paths", "throughput on realistic paths: nearby fibre, long-haul, mobile, lossy international", scPaths},
 }
 
