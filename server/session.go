@@ -81,12 +81,17 @@ func (s *Server) startLane(conn, raw net.Conn, r io.Reader, h wire.Hello) bool {
 		Profile:      s.profile.ID,
 	}
 	src := ss.reseq.Source()
+	urgent := 0
+	if h.Redundant() {
+		urgent = sched.RedundantMaxSize
+	}
 	l := lane.New(conn, r, lane.Options{
 		Role:       lane.Server,
 		Planner:    shape.NewPlanner(s.lanePlannerProfile()),
 		Raw:        raw,
 		InitialRTT: ss.baseRTT(),
 		Limiter:    &ss.limit,
+		Urgent:     urgent,
 		Logger:     s.log,
 		Handler: lane.Handler{
 			Data: func(l *lane.Lane, pkt []byte) { src.Push(pkt, l.BaseRTT()) },

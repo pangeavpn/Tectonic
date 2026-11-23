@@ -3,6 +3,7 @@ package lane
 import (
 	"math"
 	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -424,5 +425,48 @@ func TestSmallPacketsGoAheadOfQueuedBulk(t *testing.T) {
 	}
 	if sizes[32] != 32 {
 		t.Fatalf("last packet was %d bytes, want the keepalive", sizes[32])
+	}
+}
+
+func TestGamingModeSendsGamePacketsAheadOfBulk(t *testing.T) {
+	for _, tc := range []struct {
+		urgent, at int // where the 400-byte packet arrives among the 31
+	}{{0, 30}, {1280, 0}} {
+		a, b := tcpPair(t)
+		var mu sync.Mutex
+		var sizes []int
+		la := New(a, nil, Options{Role: Server, Urgent: tc.urgent})
+		lb := New(b, nil, Options{Role: Server, Handler: Handler{
+			Data: func(_ *Lane, pkt []byte) { mu.Lock(); sizes = append(sizes, len(pkt)); mu.Unlock() },
+		}})
+		for range 30 {
+			la.Send(make([]byte, 1400))
+		}
+		la.Send(make([]byte, 400))
+		if err := lb.Start(nil); err != nil {
+			t.Fatal(err)
+		}
+		if err := la.Start(nil); err != nil {
+			t.Fatal(err)
+		}
+		for deadline := time.Now().Add(2 * time.Second); ; time.Sleep(time.Millisecond) {
+			mu.Lock()
+			n := len(sizes)
+			mu.Unlock()
+			if n == 31 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("urgent %d: received %d of 31 packets", tc.urgent, n)
+			}
+		}
+		mu.Lock()
+		at := slices.Index(sizes, 400)
+		mu.Unlock()
+		if at != tc.at {
+			t.Fatalf("urgent %d: the 400-byte packet arrived %dth, want %dth", tc.urgent, at, tc.at)
+		}
+		la.Close()
+		lb.Close()
 	}
 }

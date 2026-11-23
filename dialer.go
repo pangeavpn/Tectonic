@@ -551,9 +551,18 @@ func (d *dialer) laneConfig(req sched.DialRequest, cellular bool) lane.DialConfi
 			Profiles:   d.profiles,
 			InitialRTT: req.InitialRTT,
 			Limiter:    req.Limiter,
+			Urgent:     urgent(d.cfg.Redundant),
 			Logger:     d.log,
 		},
 	}
+}
+
+// urgent is the size up to which a lane's packets go first: what gaming mode copies, or the default.
+func urgent(redundant bool) int {
+	if redundant {
+		return sched.RedundantMaxSize
+	}
+	return 0
 }
 
 // watch learns from a lane's outcome: whether it logged in decides the

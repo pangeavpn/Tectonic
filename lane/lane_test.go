@@ -470,6 +470,25 @@ func TestRecordWaitsAMomentToFill(t *testing.T) {
 	}
 }
 
+func TestGamingModeRecordsDoNotWaitToFill(t *testing.T) {
+	for _, tc := range []struct {
+		urgent int
+		wait   bool
+	}{{0, true}, {1280, false}} {
+		a, b := net.Pipe()
+		l := New(a, nil, Options{Role: Server, Urgent: tc.urgent})
+		l.Send(make([]byte, 100))
+		l.mu.Lock()
+		hold := l.holdFor(time.Now(), false)
+		l.mu.Unlock()
+		if (hold > 0) != tc.wait {
+			t.Fatalf("urgent %d: a record of one small packet waits %v", tc.urgent, hold)
+		}
+		l.Close()
+		b.Close()
+	}
+}
+
 func TestInteractiveRecordsAreDividedToFitBuckets(t *testing.T) {
 	prof := shape.Default()
 	prof.ServerFirstFlight = []shape.IntRange{{Min: 2000, Max: 2000}}

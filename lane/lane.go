@@ -271,6 +271,9 @@ type Options struct {
 	// Limiter, if set, is the send limit the lane shares with the other
 	// lanes of its session.
 	Limiter Limiter
+	// Urgent, above 128, is gaming mode: packets up to this size go ahead of the lane's queue,
+	// and a record carrying them leaves at once rather than wait to fill.
+	Urgent int
 	// PingInterval, PingTimeout and Linger override the defaults.
 	PingInterval time.Duration
 	PingTimeout  time.Duration
@@ -301,6 +304,7 @@ type Lane struct {
 	pingInterval time.Duration
 	pingTimeout  time.Duration
 	linger       time.Duration
+	urgent       int // packets this size or less go in small (see Options.Urgent)
 
 	mu         sync.Mutex
 	ctrl       []byte   // encoded control frames, sent before any DATA
@@ -466,6 +470,7 @@ func New(conn net.Conn, r io.Reader, opts Options) *Lane {
 		pingInterval: cmp.Or(opts.PingInterval, DefaultPingInterval),
 		pingTimeout:  cmp.Or(opts.PingTimeout, DefaultPingTimeout),
 		linger:       cmp.Or(opts.Linger, DefaultLinger),
+		urgent:       max(opts.Urgent, smallMax),
 	}
 	if _, ws := conn.(*wsConn); !ws && opts.Role == Client {
 		if _, ok := opts.Raw.(interface{ CloseWrite() error }); ok {
@@ -619,7 +624,7 @@ func (l *Lane) Send(pkt []byte) bool {
 		l.mu.Unlock()
 		return false
 	}
-	if l.queued >= minQueueBytes && len(l.data) > 0 && (len(pkt) > smallMax || ka || len(l.small) >= smallQueueMax) {
+	if l.queued >= minQueueBytes && len(l.data) > 0 && (len(pkt) > l.urgent || ka || len(l.small) >= smallQueueMax) {
 		// The queue is full once its oldest packet has waited about a
 		// round trip. Going by how long packets really wait, rather than
 		// by the bytes queued over the estimated rate, gives the tunnel's
@@ -631,7 +636,7 @@ func (l *Lane) Send(pkt []byte) bool {
 			return false
 		}
 	}
-	if len(pkt) <= smallMax && !ka && len(l.small) < smallQueueMax {
+	if len(pkt) <= l.urgent && !ka && len(l.small) < smallQueueMax {
 		l.small = append(l.small, append([]byte(nil), pkt...))
 	} else {
 		l.data = append(l.data, append([]byte(nil), pkt...))
@@ -994,6 +999,14 @@ func recordHold(rtt time.Duration, busy, small, receiving bool) time.Duration {
 	default:
 		return min(flushDelay, rtt/16)
 	}
+}
+
+// holdFor is how long the record being built waits for more (see recordHold). Called with mu held.
+func (l *Lane) holdFor(now time.Time, busy bool) time.Duration {
+	if l.urgent > smallMax && len(l.small) > 0 {
+		return 0 // a game's packet has no train to wait for, and waiting is its latency
+	}
+	return recordHold(l.RTT(), busy, len(l.small) > 0, len(l.data) == 0 && l.receiving(now))
 }
 
 func (l *Lane) String() string { return fmt.Sprintf("lane %d (%s)", l.id, l.role) }
@@ -1367,8 +1380,7 @@ func (l *Lane) writeLoop() error {
 		if !more && !gated && !held && !paced && !idle && !l.retiring && !l.closing &&
 			l.queued+len(l.ctrl) < shape.MaxRecord-wire.MaxFrameLen/32 {
 			if coalesceUntil.IsZero() {
-				coalesceUntil = now.Add(recordHold(l.RTT(), busy,
-					len(l.small) > 0, len(l.data) == 0 && l.receiving(now)))
+				coalesceUntil = now.Add(l.holdFor(now, busy))
 			}
 			if wait := coalesceUntil.Sub(now); wait > 0 {
 				l.mu.Unlock()
