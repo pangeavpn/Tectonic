@@ -351,6 +351,18 @@ func TestPoolRunsTheBaseLaneCountItIsGiven(t *testing.T) {
 	}
 }
 
+func TestPoolRunsTwoLanesInGamingModeWhateverTheBase(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 1
+	p := newTestPool(t, d, PoolConfig{BaseLanes: 1, Redundant: true})
+	d.next(t)
+	d.next(t) // the second lane gaming mode's copies ride
+	time.Sleep(100 * time.Millisecond)
+	if n := p.Stats().Lanes + p.Stats().Dialing; n != 2 {
+		t.Fatalf("%d lanes in gaming mode with a base of 1, want 2", n)
+	}
+}
+
 func TestPoolBaseLaneCountDefaults(t *testing.T) {
 	d := newFakeDialer()
 	d.welcome = 1

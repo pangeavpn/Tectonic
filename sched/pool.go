@@ -255,6 +255,9 @@ func NewPool(cfg PoolConfig) *Pool {
 	}
 	p.limit.Log = log.Debug
 	p.sched.Redundant = cfg.Redundant
+	if cfg.Redundant {
+		p.baseLanes = max(p.baseLanes, 2) // a copy needs a second lane to ride
+	}
 	p.reseq = NewResequencer(func(pkt []byte) {
 		if cfg.Receive != nil {
 			cfg.Receive(pkt)
