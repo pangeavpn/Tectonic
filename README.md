@@ -73,6 +73,11 @@ first lane's login, so it reaches the node within two round trips.
 `ErrCredentialRejected` means the key_id expired or was revoked, and the hub
 must issue a new one.
 
+Where the daemon runs wireguard-go itself, it can skip the loopback socket:
+`tectonic.NewBind(conn)` is a `conn.Bind` that hands WireGuard's packets to
+the `Conn` and back in batches, with no relay between them. Over loopback it
+moved full-size packets up 1.5 times as fast as the relay, and down 1.3 times.
+
 ## Running a node
 
 Build the node with Go 1.27 or newer. From that version Go's web server

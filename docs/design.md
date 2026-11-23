@@ -99,7 +99,7 @@ Most of these ideas exist somewhere in some form. What's new is combining them, 
 
 On the device, WireGuard sends to a loopback port, as it does with every other PangeaVPN transport. The Tectonic client spreads those packets across its lanes. The server merges what arrives on the lanes back into the order WireGuard sent it and passes it to the node's WireGuard. A packet waits only while an earlier one is still on its way on another lane.
 
-From the daemon's point of view, Tectonic is one more transport. It brings up a loopback UDP listener and points WireGuard's endpoint at it.
+From the daemon's point of view, Tectonic is one more transport. It brings up a loopback UDP listener and points WireGuard's endpoint at it, or, where it runs wireguard-go itself, gives the device a `Bind` over the connection and skips the loopback socket.
 
 ---
 

@@ -90,7 +90,7 @@ type node struct {
 }
 
 // startNode runs a Tectonic server in front of wgAddr.
-func startNode(t *testing.T, wgAddr string, mod func(*server.Config)) *node {
+func startNode(t testing.TB, wgAddr string, mod func(*server.Config)) *node {
 	t.Helper()
 	c := certs()
 	n := &node{secret: bytes.Repeat([]byte{7}, 32), sniSeen: make(chan string, 64)}
@@ -125,7 +125,7 @@ func startNode(t *testing.T, wgAddr string, mod func(*server.Config)) *node {
 
 // profile issues a credential the way the hub does and returns the profile
 // block for this node.
-func (n *node) profile(t *testing.T) tectonic.Profile {
+func (n *node) profile(t testing.TB) tectonic.Profile {
 	id, err := wire.NewKeyID(time.Now().Add(7 * 24 * time.Hour))
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +142,7 @@ func (n *node) profile(t *testing.T) tectonic.Profile {
 }
 
 // wgKey makes a WireGuard key pair, hex-encoded for IpcSet.
-func wgKey(t *testing.T) (priv, pub string) {
+func wgKey(t testing.TB) (priv, pub string) {
 	var k [32]byte
 	rand.Read(k[:])
 	k[0] &= 248
@@ -159,7 +159,7 @@ type wgPeer struct {
 	tun *tuntest.ChannelTUN
 }
 
-func newWG(t *testing.T, ipc string) *wgPeer {
+func newWG(t testing.TB, ipc string) *wgPeer {
 	t.Helper()
 	tun := tuntest.NewChannelTUN()
 	dev := device.NewDevice(tun.TUN(), conn.NewStdNetBind(), device.NewLogger(device.LogLevelSilent, ""))
@@ -173,7 +173,7 @@ func newWG(t *testing.T, ipc string) *wgPeer {
 	return &wgPeer{dev: dev, tun: tun}
 }
 
-func (p *wgPeer) port(t *testing.T) int {
+func (p *wgPeer) port(t testing.TB) int {
 	s, err := p.dev.IpcGet()
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func (p *wgPeer) handshakes(t *testing.T) bool {
 
 // bridge relays WireGuard's loopback UDP to the Tectonic Conn, as the
 // PangeaVPN daemon does with every transport.
-func bridge(t *testing.T, c *tectonic.Conn) *net.UDPAddr {
+func bridge(t testing.TB, c *tectonic.Conn) *net.UDPAddr {
 	t.Helper()
 	udp, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
