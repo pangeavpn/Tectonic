@@ -723,6 +723,82 @@ func (d *dialer) stallBound(connect time.Duration) time.Duration {
 	return min(max(modeStallRTTs*connect, d.stallMin), d.stallMax)
 }
 
+// usableAddrs are the node's addresses a search may race, its first address first: those not being
+// left alone, or all of them while every one is.
+func (d *dialer) usableAddrs() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	var out []string
+	for _, a := range d.nodes {
+		if !now.Before(d.addrBad[a]) {
+			out = append(out, a)
+		}
+	}
+	if len(out) == 0 {
+		return slices.Clone(d.nodes)
+	}
+	return out
+}
+
+// happyDelay is how long an address has to answer before the next is tried beside it (RFC 8305).
+const happyDelay = 250 * time.Millisecond
+
+// race connects to whichever of addrs answers first, starting the next whenever the last has failed
+// or gone happyDelay unanswered, as a browser does across a name's addresses.
+func (d *dialer) race(ctx context.Context, network string, addrs []string) (net.Conn, string, time.Duration, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel() // the attempts still connecting
+	type result struct {
+		c    net.Conn
+		addr string
+		took time.Duration
+		err  error
+	}
+	results := make(chan result, len(addrs))
+	next, pending := 0, 0
+	start := func() {
+		a := addrs[next]
+		next, pending = next+1, pending+1
+		go func() {
+			began := time.Now()
+			c, err := d.connect(ctx, network, a)
+			results <- result{c, a, time.Since(began), err}
+		}()
+	}
+	start()
+	timer := time.NewTimer(happyDelay)
+	defer timer.Stop()
+	var errs []error
+	for pending > 0 {
+		select {
+		case r := <-results:
+			pending--
+			if r.err == nil {
+				go func(n int) { // close any that connect after the winner
+					for range n {
+						if late := <-results; late.c != nil {
+							late.c.Close()
+						}
+					}
+				}(pending)
+				return r.c, r.addr, r.took, nil
+			}
+			errs = append(errs, fmt.Errorf("%s: %w", r.addr, r.err))
+			if next < len(addrs) {
+				start()
+				timer.Reset(happyDelay)
+			}
+		case <-timer.C:
+			if next < len(addrs) {
+				start()
+				timer.Reset(happyDelay)
+			}
+		}
+	}
+	return nil, "", 0, errors.Join(errs...)
+}
+
 // connect opens the TCP connection for tryModes, which needs to know when
 // it is up. It does what lane.Dial does when left to open the connection
 // itself, apart from setting TCP_NOTSENT_LOWAT before connecting; the lane
@@ -769,11 +845,10 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel() // stops the attempts that are still connecting
-	// Every attempt goes to the same address, and it counts as one lane on
-	// it while the search runs, so the next lane prefers another.
-	addr, release := d.takeThisAddr(d.node)
+	// Every attempt goes to the same address: the first races the node's addresses, and the one that
+	// answers counts as a lane on it while the search runs, so the next lane prefers another.
 	s := &modeSearch{
-		d: d, ctx: ctx, req: req, cellular: cellular, addr: addr,
+		d: d, ctx: ctx, req: req, cellular: cellular, addrs: d.usableAddrs(),
 		// Each attempt sends at most one event of each kind, so no send
 		// blocks, even after the search has returned.
 		events: make(chan attemptEvent, attemptEventKinds*len(cands)),
@@ -814,9 +889,14 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 			s.discard(loser)
 		}
 		d.blocked(network, attempts, won, hello, cut)
-		d.release(l, nil, release)
+		release := s.taken()
+		if release != nil {
+			d.release(l, nil, release)
+		}
 		if won == nil {
-			release(false) // nothing opened; release is spent once
+			if release != nil {
+				release(false) // nothing opened; release is spent once
+			}
 			d.outcome(false, lane.Direct, Choice{}, network)
 			return nil, fmt.Errorf("tectonic: no SNI mode logged in: %w", errors.Join(errs...))
 		}
@@ -886,7 +966,7 @@ type modeSearch struct {
 	ctx      context.Context
 	req      sched.DialRequest
 	cellular bool
-	addr     string // the one address every attempt goes to
+	addrs    []string // the node's addresses the first attempt races
 	events   chan attemptEvent
 	over     chan struct{} // closed when the search returns
 	// won is the attempt that was chosen. Only its lane's events reach the
@@ -894,8 +974,10 @@ type modeSearch struct {
 	won atomic.Pointer[attempt]
 
 	mu       sync.Mutex
+	addr     string     // the one address every attempt goes to, once one has answered
+	release  func(bool) // gives addr back (see takeThisAddr)
 	finished bool
-	live     int      // attempts started that have not failed
+	live     int // attempts started that have not failed
 	newest   *attempt // the last one started
 	first    []byte   // the first packet, once it has been taken from the pool
 	carrier  *attempt // the attempt whose login it went out with, while that attempt is open
@@ -936,18 +1018,15 @@ type attemptEvent struct {
 // run makes one attempt and reports how it goes.
 func (s *modeSearch) run(a *attempt) {
 	cfg := s.d.laneConfig(s.req, s.cellular)
-	cfg.Addr = s.addr
 	cfg.SNIMode = lane.SNIMode(a.c.Mode)
 	cfg.ServerName = a.c.Name
 	sent := false
-	cfg.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		start := time.Now()
-		conn, err := s.d.connect(ctx, network, addr)
-		if err == nil {
-			sent = true
-			s.events <- attemptEvent{a: a, kind: helloSent, rtt: time.Since(start)}
-		}
-		return conn, err
+	conn, addr, took, err := s.connect()
+	if err == nil {
+		sent = true
+		s.events <- attemptEvent{a: a, kind: helloSent, rtt: took}
+		cfg.Addr = addr
+		cfg.DialContext = func(context.Context, string, string) (net.Conn, error) { return conn, nil }
 	}
 	cfg.TakeFirstPacket = nil
 	if s.req.TakeFirstPacket != nil {
@@ -955,7 +1034,10 @@ func (s *modeSearch) run(a *attempt) {
 	}
 	cfg.Lane.Handler = s.handler(a)
 
-	l, err := lane.Dial(s.ctx, cfg)
+	var l *lane.Lane
+	if err == nil {
+		l, err = lane.Dial(s.ctx, cfg)
+	}
 	if err == nil {
 		s.mu.Lock()
 		a.l = l
@@ -981,6 +1063,37 @@ func (s *modeSearch) run(a *attempt) {
 	if s.fail(a) {
 		s.events <- attemptEvent{a: a, kind: failed, err: err, sent: sent}
 	}
+}
+
+// connect opens an attempt's TCP connection: the first races the node's addresses, and the rest go to
+// the one that answered. It returns the address and how long its TCP handshake took.
+func (s *modeSearch) connect() (net.Conn, string, time.Duration, error) {
+	s.mu.Lock()
+	addr := s.addr
+	s.mu.Unlock()
+	if addr != "" {
+		began := time.Now()
+		c, err := s.d.connect(s.ctx, "tcp", addr)
+		return c, addr, time.Since(began), err
+	}
+	c, addr, took, err := s.d.race(s.ctx, "tcp", s.addrs)
+	if err != nil {
+		return nil, "", 0, err
+	}
+	s.mu.Lock()
+	if s.addr == "" {
+		s.addr = addr
+		_, s.release = s.d.takeThisAddr(addr)
+	}
+	s.mu.Unlock()
+	return c, addr, took, nil
+}
+
+// taken gives back the search's address, or is nil if no attempt connected.
+func (s *modeSearch) taken() func(bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.release
 }
 
 // begin counts a in as the newest attempt. It refuses if an attempt has

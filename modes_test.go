@@ -180,6 +180,7 @@ type fakeNet struct {
 	delays       map[string]time.Duration // how long a name's ClientHello is held up
 	connectDelay time.Duration            // how long a TCP handshake takes
 	connectErr   error                    // if set, TCP never connects
+	dead         map[string]bool          // addresses whose SYNs vanish: a dial there never connects
 	// residual, if set, is how long the network resets every ClientHello
 	// to the node after resetting one by its name, as the GFW does; a
 	// name reset again starts the time over.
@@ -199,6 +200,10 @@ type dialRecord struct {
 
 func (n *fakeNet) dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	began := time.Now()
+	if n.dead[addr] {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if n.connectDelay > 0 {
 		select {
 		case <-time.After(n.connectDelay):
@@ -1086,6 +1091,31 @@ func TestLanesSpreadAcrossTheNodesAddresses(t *testing.T) {
 	}
 	if addrs[0] == addrs[1] {
 		t.Fatalf("both lanes dialled %s", addrs[0])
+	}
+}
+
+// On a network it hasn't seen, the first attempt races the node's addresses, as a browser does a
+// name's, so a first address that swallows its SYNs costs a quarter of a second, not the dial.
+func TestModeSearchRacesTheNodesAddresses(t *testing.T) {
+	const dead = "192.0.2.1:443"
+	r := newModeRig(t, nil)
+	live := r.node.addr
+	r.net.dead = map[string]bool{dead: true}
+	r.cfg.Profile.Node, r.cfg.Profile.Nodes = dead, []string{live}
+	d, err := newDialer(r.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.d = d
+	start := time.Now()
+	r.mustDial()
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("the first lane took %v behind an address that never answers", took)
+	}
+	r.wantSent(modeCover)
+	r.wantRemembered(SNIOwn)
+	if got := r.net.lastDialed(); got != live {
+		t.Fatalf("the lane went to %s, want %s", got, live)
 	}
 }
 
