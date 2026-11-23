@@ -109,6 +109,9 @@ type DialConfig struct {
 	Control func(network, address string, c syscall.RawConn) error
 	// Path is the WebSocket path on the CDN edge.
 	Path string
+	// ECHConfigList, for a CDN lane, encrypts ServerName inside a ClientHello that names the
+	// configuration's public name.
+	ECHConfigList []byte
 	// UserAgent overrides the CDN carrier's User-Agent.
 	UserAgent string
 
@@ -315,6 +318,7 @@ func handshake(ctx context.Context, raw net.Conn, cfg DialConfig) (*utls.UConn, 
 		// Chrome opens WebSockets on a connection that offers only
 		// HTTP/1.1.
 		tc.ServerName = cfg.ServerName
+		tc.EncryptedClientHelloConfigList = cfg.ECHConfigList
 		h2 = false
 	case cfg.SNIMode == SNIOwn:
 		tc.ServerName = cfg.ServerName

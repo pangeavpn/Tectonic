@@ -426,7 +426,14 @@ func (d *dialer) dial(ctx context.Context, req sched.DialRequest) (sched.PoolLan
 		}
 		cfg.ServerName = cdn.Host
 		cfg.Path = cdn.Path
+		cfg.ECHConfigList = cdn.ECH
 		l, err := lane.Dial(ctx, cfg)
+		var rejected *utls.ECHRejectionError
+		if errors.As(err, &rejected) && len(rejected.RetryConfigList) > 0 {
+			// The CDN has moved to another key, and says which: once, as a browser does.
+			cfg.ECHConfigList = rejected.RetryConfigList
+			l, err = lane.Dial(ctx, cfg)
+		}
 		d.watch(l, err, lane.CDN, Choice{}, network)
 		return poolLane(l, err)
 	}

@@ -86,6 +86,9 @@ type CDNRoute struct {
 	Path string `json:"path"`
 	// Edge is the address to dial, if not Host on port 443.
 	Edge string `json:"edge,omitempty"`
+	// ECH, if set, is the ECHConfigList the CDN publishes for Host, as Chrome finds in DNS: the
+	// ClientHello then names the CDN's public name, and Host goes encrypted.
+	ECH []byte `json:"ech,omitempty"`
 }
 
 // ParseProfile decodes a profile block from JSON.

@@ -365,7 +365,7 @@ The core (login, frames, scheduler and shaper) doesn't care how a lane reaches t
 | Carrier | What a lane is | When it's used |
 |---|---|---|
 | **Direct** | A TLS 1.3 connection to the node on port 443, using one of the [SNI modes](#9-sni-modes) | By default. This is the fastest route. |
-| **CDN** | A WebSocket over TLS to a CDN edge, which forwards it to the node. `HELLO` is sent in the first WebSocket message, which carries the lane's whole opening, and the node also checks a header signed by the CDN. | When direct lanes can't open, for example because the node's IP is null-routed |
+| **CDN** | A WebSocket over TLS to a CDN edge, which forwards it to the node. `HELLO` is sent in the first WebSocket message, which carries the lane's whole opening, and the node also checks a header signed by the CDN. Where the CDN publishes ECH and the profile carries its `ECHConfigList`, the lane uses it as Chrome does, so the ClientHello names only the CDN's public name and the host goes encrypted. | When direct lanes can't open, for example because the node's IP is null-routed |
 
 The client switches carriers within the same session, and direct and CDN lanes can briefly run side by side during the switch. The user sees one transport, Tectonic, that keeps working.
 

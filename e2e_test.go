@@ -357,9 +357,13 @@ func TestAutoModeFallsBackAndRemembers(t *testing.T) {
 
 // edge is a stand-in CDN: it terminates TLS, signs the upgrade and
 // forwards to the node.
-func edge(t *testing.T, nodeAddr string, secret []byte) string {
+func edge(t *testing.T, nodeAddr string, secret []byte, mods ...func(*tls.Config)) string {
 	t.Helper()
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{certs().own}, NextProtos: []string{"http/1.1"}})
+	cfg := &tls.Config{Certificates: []tls.Certificate{certs().own}, NextProtos: []string{"http/1.1"}}
+	for _, m := range mods {
+		m(cfg)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
