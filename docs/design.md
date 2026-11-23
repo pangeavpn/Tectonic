@@ -275,6 +275,7 @@ While any lane is retransmitting, packets of 128 bytes or less are also copied o
 - If the network kills a lane, for example with a forged reset or a middlebox timeout, traffic moves to the remaining lanes at once and a replacement opens.
 - A lane whose path dies without a word, as when a phone leaves Wi-Fi or a NAT forgets the connection, is noticed by its `PING`s: once the oldest has gone unanswered for four round trips, and at least a second, the lane is suspect. The scheduler gives it packets only when no other lane will take them, and the pool opens a lane in its place at once rather than when the lane times out, 15 s later. With every lane silenced mid-download, the download inside the tunnel had stalled for 25 s or more; it now stalls for 1.6 to 1.9 s.
 - The pool dials one lane at a time, but a dial that has gone six round trips without returning (at least 2 s, at most 5), as one whose SYN vanished does, no longer holds up the next: a second starts beside it. Where the first dial after a path change hung, the download had stalled for 25.5 s, and now for 6.4 s.
+- When the daemon says the device has changed network (`SetNetwork`), as the operating system tells it, the pool opens lanes on the new network at once, joining the session, and retires the old ones once the new ones carry it, much as a browser drops its connections when its address changes. A path change announced that way stalled the download for 0.5 to 0.7 s, where unannounced it costs 1.6 s.
 
 ### Lane count and throttle detection
 

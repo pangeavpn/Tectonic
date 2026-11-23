@@ -311,15 +311,18 @@ func (d *dialer) nameFor(m SNIMode) string {
 	return ""
 }
 
-func (d *dialer) setNetwork(network string, cellular bool) {
+// setNetwork moves the dialer to network, and reports whether that is a change.
+func (d *dialer) setNetwork(network string, cellular bool) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if network != d.network {
+	changed := network != d.network
+	if changed {
 		d.modeFails = 0
 		// A new network may not block what the old one did.
 		d.directFails, d.onCDN = 0, false
 	}
 	d.network, d.cellular = network, cellular
+	return changed
 }
 
 func (d *dialer) state() (string, Choice) {

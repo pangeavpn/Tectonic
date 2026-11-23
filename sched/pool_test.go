@@ -729,6 +729,44 @@ func TestPoolDialsAgainBesideADialThatHangs(t *testing.T) {
 	}
 }
 
+// When the device changes network the pool opens lanes there at once, joining the session, and lets
+// the old ones go once those are up, rather than waiting for the old ones to fail.
+func TestPoolMovesToANewNetworkAtOnce(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 9
+	p := newTestPool(t, d, PoolConfig{})
+	l1, l2 := d.next(t), d.next(t)
+	p.Send(make([]byte, 100))
+	p.NetworkChanged()
+	for range 2 {
+		if r := d.next(t); !r.req.Join || r.req.SessionID[0] != 9 {
+			t.Fatalf("request = %+v, want a lane joining the session", r.req)
+		}
+	}
+	for deadline := time.Now().Add(2 * time.Second); !(l1.wasRetired() && l2.wasRetired()); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the lanes of the network the device left were kept")
+		}
+	}
+}
+
+func TestPoolDialsAtOnceOnANewNetworkWhileBackingOff(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 9
+	p := newTestPool(t, d, PoolConfig{})
+	l1, l2 := d.next(t), d.next(t)
+	p.post(func() { p.backoff, p.nextDial = 30*time.Second, time.Now().Add(30*time.Second) })
+	l1.end(errors.New("reset"))
+	l2.end(errors.New("reset"))
+	p.Send(wgInit())
+	start := time.Now()
+	p.NetworkChanged()
+	d.next(t)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the first lane on the new network waited %v for a backoff the old one earned", took)
+	}
+}
+
 func TestPoolBacksOffOnFailures(t *testing.T) {
 	d := newFakeDialer()
 	d.fail = 3

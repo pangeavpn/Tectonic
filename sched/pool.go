@@ -221,6 +221,7 @@ type laneState struct {
 	carried     uint64     // payload bytes either way when last looked at, once a replacement is up
 	quietSince  time.Time  // since when that has not changed
 	replacement bool       // a replacement for this lane is being dialed or is up
+	moved       bool       // opened on a network the device has since left
 	upAt        time.Time
 	lastUp      uint64
 	lastDown    uint64
@@ -318,6 +319,17 @@ func (p *Pool) Send(pkt []byte) {
 	case p.kickCh <- struct{}{}:
 	default:
 	}
+}
+
+// NetworkChanged tells the pool the device has moved to another network, as a browser is told when
+// its address changes: it opens lanes there at once, and the lanes it has go once those are up.
+func (p *Pool) NetworkChanged() {
+	p.post(func() {
+		p.backoff, p.nextDial = 0, time.Time{}
+		for st := range p.lanes {
+			st.moved = true
+		}
+	})
 }
 
 // WaitSession blocks until the first lane has logged in, the pool fails, or
@@ -528,8 +540,8 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	active := now.Sub(lastActive) < pl.IdleAfter() || nPending > 0
 	live := 0
 	for st := range p.lanes {
-		// A suspect lane is not counted, so one opens in its place without waiting for it to time out.
-		if !st.retiring && st.replacing == nil && !st.l.Suspect() {
+		// A suspect lane, or one left behind on the last network, is not counted, so one opens in its place.
+		if !st.retiring && st.replacing == nil && !st.moved && !st.l.Suspect() {
 			live++
 		}
 	}
@@ -587,6 +599,15 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 			reason = "probe"
 		}
 		p.dial(now, reason, nil)
+	}
+
+	// Once lanes on the new network carry the session, those left on the old one go.
+	if live >= target {
+		for st := range p.lanes {
+			if st.moved {
+				p.retire(st, "moved")
+			}
+		}
 	}
 
 	// Retire lanes beyond the target, oldest first.

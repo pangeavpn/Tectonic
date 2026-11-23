@@ -396,9 +396,13 @@ func (c *Conn) WaitForSession(ctx context.Context, timeout time.Duration) error 
 	return c.pool.WaitSession(ctx)
 }
 
-// SetNetwork tells the client the device moved to another network, so new
-// lanes use the SNI mode remembered for it.
-func (c *Conn) SetNetwork(network string, cellular bool) { c.d.setNetwork(network, cellular) }
+// SetNetwork tells the client the device moved to another network. New lanes use the SNI mode
+// remembered for it, and the session moves there at once rather than waiting for its lanes to fail.
+func (c *Conn) SetNetwork(network string, cellular bool) {
+	if c.d.setNetwork(network, cellular) {
+		c.pool.NetworkChanged()
+	}
+}
 
 // Stats is a snapshot of the client.
 type Stats struct {
