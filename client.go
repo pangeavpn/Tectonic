@@ -25,6 +25,8 @@ import (
 	"syscall"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
+
 	"github.com/pangeavpn/tectonic/lane"
 	"github.com/pangeavpn/tectonic/sched"
 	"github.com/pangeavpn/tectonic/shape"
@@ -220,6 +222,9 @@ type Config struct {
 	// RootCAs verifies certificates checked by name (Own mode, the CDN).
 	// Nil means the system roots.
 	RootCAs *x509.CertPool
+	// SessionCache, shared by a daemon's Conns, lets the first lane of the next one resume TLS as a
+	// returning browser does, rather than fetch the certificate again. Nil means one per Conn.
+	SessionCache utls.ClientSessionCache
 	// Churn overrides lane lifetimes and byte budgets; zero means the
 	// design's.
 	Churn sched.Churn

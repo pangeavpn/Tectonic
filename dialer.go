@@ -227,6 +227,9 @@ func newDialer(cfg Config) (*dialer, error) {
 	if d.modes == nil {
 		d.modes = NewMemoryModeStore()
 	}
+	if cfg.SessionCache != nil {
+		d.sessions = cfg.SessionCache
+	}
 	if len(d.candidates()) == 0 {
 		return nil, errNoModes
 	}
