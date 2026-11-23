@@ -88,6 +88,9 @@ type PoolConfig struct {
 	// best cover and the slowest on a path that loses packets, where
 	// separate congestion windows are what lanes are for.
 	BaseLanes int
+	// LoadLanes runs the lanes beyond the first only while the tunnel carries a load: browsing, like a
+	// browser, holds one connection, and a download gets the lanes that carry it.
+	LoadLanes bool
 	// Redundant copies light traffic onto a second lane (Scheduler.Redundant).
 	Redundant bool
 	Logger    *slog.Logger
@@ -191,6 +194,7 @@ type Pool struct {
 	planner     *shape.Planner
 	maxLanes    int
 	baseLanes   int
+	loadedOnly  bool // the lanes beyond the first open only under a load (see busyBase)
 	lastLaneAt  time.Time
 	backoff     time.Duration
 	nextDial    time.Time
@@ -250,6 +254,7 @@ func NewPool(cfg PoolConfig) *Pool {
 	if cfg.DialTimeout <= 0 {
 		cfg.DialTimeout = 20 * time.Second
 	}
+	loadedOnly := cfg.LoadLanes && !cfg.Redundant
 	if cfg.BaseLanes <= 0 {
 		cfg.BaseLanes = DefaultBaseLanes
 	}
@@ -257,21 +262,22 @@ func NewPool(cfg PoolConfig) *Pool {
 	crand.Read(seed[:])
 	ctx, cancel := context.WithCancel(context.Background())
 	p := &Pool{
-		cfg:       cfg,
-		churn:     cfg.Churn.withDefaults(),
-		log:       log,
-		ctx:       ctx,
-		cancel:    cancel,
-		events:    make(chan func(), 256),
-		kickCh:    make(chan struct{}, 1),
-		done:      make(chan struct{}),
-		sessionUp: make(chan struct{}),
-		lanes:     map[*laneState]struct{}{},
-		planner:   shape.NewPlanner(cfg.Profiles.Get(shape.DefaultID)),
-		maxLanes:  defaultMaxLanes,
-		baseLanes: max(cfg.BaseLanes, 1),
-		thr:       newThrottle(),
-		rng:       rand.New(rand.NewChaCha8(seed)),
+		cfg:        cfg,
+		churn:      cfg.Churn.withDefaults(),
+		log:        log,
+		ctx:        ctx,
+		cancel:     cancel,
+		events:     make(chan func(), 256),
+		kickCh:     make(chan struct{}, 1),
+		done:       make(chan struct{}),
+		sessionUp:  make(chan struct{}),
+		lanes:      map[*laneState]struct{}{},
+		planner:    shape.NewPlanner(cfg.Profiles.Get(shape.DefaultID)),
+		maxLanes:   defaultMaxLanes,
+		baseLanes:  max(cfg.BaseLanes, 1),
+		loadedOnly: loadedOnly,
+		thr:        newThrottle(),
+		rng:        rand.New(rand.NewChaCha8(seed)),
 	}
 	p.limit.Log = log.Debug
 	p.limit.Latency = cfg.Redundant
@@ -563,7 +569,7 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		} else {
 			extra = p.thr.extra
 		}
-		target = min(p.baseLanes+extra, p.maxLanes)
+		target = min(p.busyBase(now)+extra, p.maxLanes)
 	case now.Sub(lastActive) < p.idleShrink:
 		// Idle, but not yet for as long as was drawn for this idle period:
 		// the pool keeps the lanes it has. It opens none, short of having
@@ -693,6 +699,15 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	default:
 		return time.Hour // nothing to do until a packet arrives
 	}
+}
+
+// busyBase is how many lanes an active tunnel runs before throttle detection adds any. With the
+// default count, a tunnel that carries no load runs one: a browser holds one connection to an origin.
+func (p *Pool) busyBase(now time.Time) int {
+	if p.loadedOnly && !p.thr.busy(now) {
+		return 1
+	}
+	return p.baseLanes
 }
 
 // mayDial reports whether a dial may start at now: none is under way, or the newest has stalled.

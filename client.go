@@ -228,10 +228,8 @@ type Config struct {
 	// Churn overrides lane lifetimes and byte budgets; zero means the
 	// design's.
 	Churn sched.Churn
-	// Lanes is how many lanes a busy tunnel runs before throttle detection
-	// adds any; zero means sched.DefaultBaseLanes. One lane is the best
-	// cover, since a browser holds one connection open to an origin, and
-	// the slowest on a path that loses packets.
+	// Lanes is how many lanes a busy tunnel runs before throttle detection adds any. Zero means
+	// sched.DefaultBaseLanes while it carries a load, and one, as a browser holds, while it doesn't.
 	Lanes  int
 	Logger *slog.Logger
 }
@@ -306,6 +304,7 @@ func Dial(ctx context.Context, cfg Config) (*Conn, error) {
 		Profiles:  d.profiles,
 		Churn:     cfg.Churn,
 		BaseLanes: cfg.Lanes,
+		LoadLanes: cfg.Lanes == 0,
 		Redundant: cfg.Redundant,
 		Logger:    log,
 	})

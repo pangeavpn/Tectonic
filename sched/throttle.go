@@ -136,6 +136,11 @@ func (t *throttle) update(now time.Time, lanes []laneRate, base, limit int, read
 	return t.clamp(base, limit)
 }
 
+// busy reports whether the tunnel carries a load, or did less than unloadReset ago.
+func (t *throttle) busy(now time.Time) bool {
+	return !t.loaded.IsZero() || !t.unloaded.IsZero() && now.Sub(t.unloaded) < t.unloadReset
+}
+
 func (t *throttle) average() float64 {
 	n := min(t.histN, len(t.hist))
 	var s float64

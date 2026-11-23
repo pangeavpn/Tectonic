@@ -282,7 +282,7 @@ While any lane is retransmitting, packets of 128 bytes or less are also copied o
 
 ### Lane count and throttle detection
 
-- The pool starts with 2 lanes and can grow to `max_lanes`. The server sets that limit: 6 by default, and 3 on cellular.
+- The pool runs 2 lanes while the tunnel carries a load (at least 1 Mbit/s in the last second's sample, or such a load less than 10 s ago) and one otherwise, and can grow to `max_lanes`. The server sets that limit: 6 by default, and 3 on cellular. A browser holds one connection to an origin, and browsing is light: in the bench's browsing exchange a session held a second connection 27% of the time where it had held one throughout, while a download still gets two lanes and was as fast as before. A client given a lane count of its own, or in gaming mode, runs that many all the time.
 - **Throttle check.** Under load, if every lane settles at about the same rate and adding a lane adds about that much more again, the network is limiting each connection separately. The client keeps adding lanes while each one pays off, and closes lanes once they stop helping.
 - When the tunnel is idle, the pool shrinks to a single lane. The moment is drawn for each idle period, anywhere between the tunnel going idle and its last lane closing (20 to 140 s after the last traffic with the default profile), so a connection doesn't close at the same offset in every session. Until then the pool keeps the lanes it has and opens none.
 
