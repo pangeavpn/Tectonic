@@ -353,7 +353,12 @@ new frame type. And a slow lane that paces now sends records smaller than
 - **The send limit reads Linux's `TCP_INFO`.** Where a lane has no such
   figures it stays off. That is every client platform but Linux and
   Android today, which matters only for uploads through a client whose own
-  TCP doesn't back off.
+  TCP doesn't back off. Windows lanes now read `SIO_TCP_INFO`, but only for
+  the round trip and retransmissions: fed from it in gaming mode
+  (`cmd/winbench`, 5 Mbit/s, 40 ms, 150 KB queue), the limit came on at
+  rates above what the path carried or stood down, and a ping beside an
+  upload was no faster: a median p50 of 103–109 ms over five runs with it,
+  99–104 ms without.
 
 ## Caveats
 

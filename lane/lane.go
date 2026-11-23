@@ -949,9 +949,9 @@ func (l *Lane) Retransmitting() bool {
 	if last := l.lastRetrans.Load(); last != 0 && now-last < win {
 		return true
 	}
-	if !l.hasTCPInfo.Load() {
-		// Without TCP_INFO, a PING that is long overdue is the best sign
-		// that the connection is stuck retransmitting.
+	if !l.lowat || !l.hasTCPInfo.Load() {
+		// A lane pacing on PONGs keeps PINGs out while it sends; one long overdue is the best sign that
+		// the connection is stuck retransmitting, which Windows' TCP_INFO does not say.
 		l.pingMu.Lock()
 		stuck := len(l.pings) > 0 && time.Since(l.pings[0].at) > 2*l.RTT()+100*time.Millisecond
 		l.pingMu.Unlock()
