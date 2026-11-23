@@ -67,6 +67,10 @@ const (
 	// DefaultLinger is how long a retiring lane waits for the peer's
 	// close_notify.
 	DefaultLinger = 10 * time.Second
+	// A lane whose oldest PING has waited suspectRTTs round trips, and at least suspectMin, is suspect:
+	// its path has most likely died, so the scheduler avoids it and the pool opens a lane in its place.
+	suspectMin  = time.Second
+	suspectRTTs = 4
 	// pongLen is the size of a PONG frame.
 	pongLen = wire.HeaderLen + wire.PingLen
 	// maxCtrl is how many bytes of control frames may wait to be written.
@@ -402,6 +406,8 @@ type Lane struct {
 	lastData atomic.Int64  // unix ns of the last DATA written
 	drain    atomic.Uint64 // float64 bits: bytes/s written while backlogged
 
+	pingOldest atomic.Int64 // unix ns the oldest outstanding PING went, or 0
+
 	pingMu        sync.Mutex
 	pings         []outPing // outstanding, oldest first
 	lastPingSent  time.Time
@@ -568,6 +574,7 @@ func (l *Lane) Start(first []byte) error {
 		buf = wire.AppendPing(buf, p.tok)
 		l.pingMu.Lock()
 		l.pings = append(l.pings, p)
+		l.notePings()
 		l.lastPingSent, l.lastPingBytes = now, uint64(total)
 		l.pingMu.Unlock()
 	}
@@ -796,11 +803,41 @@ func (l *Lane) Queued() int { return int(l.queuedA.Load()) }
 // until its first PONG is back, a round trip after it opens: only then is
 // its first flight known to have arrived.
 func (l *Lane) ETA(n int) time.Duration {
+	now := time.Now()
+	// A suspect lane waits out its silence first, so it takes packets only when no other lane would.
+	return l.eta(n, now) + l.overdue(now)
+}
+
+// Suspect reports whether the lane's oldest PING has gone unanswered so long that its path has most
+// likely died. A PONG clears it.
+func (l *Lane) Suspect() bool { return l.overdue(time.Now()) > 0 }
+
+// overdue is how long the oldest PING has waited, once that is long enough to suspect the lane.
+func (l *Lane) overdue(now time.Time) time.Duration {
+	at := l.pingOldest.Load()
+	if at == 0 {
+		return 0
+	}
+	if age := time.Duration(now.UnixNano() - at); age > max(suspectMin, suspectRTTs*l.RTT()) {
+		return age
+	}
+	return 0
+}
+
+// notePings keeps pingOldest in step with pings. Called with pingMu held.
+func (l *Lane) notePings() {
+	var at int64
+	if len(l.pings) > 0 {
+		at = l.pings[0].at.UnixNano()
+	}
+	l.pingOldest.Store(at)
+}
+
+func (l *Lane) eta(n int, now time.Time) time.Duration {
 	q := int(l.queuedA.Load()) + n
 	if l.lowat {
 		// The kernel holds part of the queue too, and says how much the
 		// connection can send (see sockState).
-		now := time.Now()
 		if s := l.kernel(now); s != nil {
 			idle := time.Duration(now.UnixNano() - l.lastSend.Load())
 			wait := s.wait(float64(q), idle)
@@ -1747,6 +1784,7 @@ func (l *Lane) ping(buf []byte, now time.Time, backlogged bool) []byte {
 	defer l.pingMu.Unlock()
 	p := outPing{tok: wire.NewPingToken(), at: now, limited: l.appLimited || !backlogged}
 	l.pings = append(l.pings, p)
+	l.notePings()
 	l.lastPingSent = now
 	l.lastPingBytes = l.tracked.Load()
 	l.appLimited = false
@@ -1822,6 +1860,7 @@ func (l *Lane) onPong(tok uint64, now time.Time) {
 	if len(l.pings) == 0 {
 		l.pings = nil
 	}
+	l.notePings()
 	l.lastPong.Store(now.UnixNano())
 	l.ponged.Store(true)
 	confirmed := p.bytes

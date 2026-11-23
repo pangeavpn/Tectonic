@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,6 +26,7 @@ type fakeLane struct {
 	closeReason *wire.CloseReason
 	welcome     wire.Welcome
 	stats       lane.Stats
+	suspect     atomic.Bool
 
 	welcomed     chan struct{}
 	welcomedOnce sync.Once
@@ -48,6 +50,7 @@ func (l *fakeLane) Send(pkt []byte) bool {
 	return true
 }
 func (l *fakeLane) ETA(int) time.Duration     { return time.Millisecond }
+func (l *fakeLane) Suspect() bool             { return l.suspect.Load() }
 func (l *fakeLane) Retransmitting() bool      { return false }
 func (l *fakeLane) Lost(wire.Lost) bool       { return true }
 func (l *fakeLane) Welcomed() <-chan struct{} { return l.welcomed }
@@ -682,6 +685,24 @@ func TestPoolReconnectsAfterNetworkChange(t *testing.T) {
 	r := d.next(t)
 	if !r.req.Join || r.req.SessionID[0] != 9 {
 		t.Fatalf("rejoin request = %+v", r.req)
+	}
+}
+
+// A lane whose path has died silently says nothing for 15 s; once it is suspect, which takes
+// a second or so, a lane opens in its place while it is still open.
+func TestPoolReplacesASuspectLaneAtOnce(t *testing.T) {
+	d := newFakeDialer()
+	d.welcome = 9
+	p := newTestPool(t, d, PoolConfig{})
+	l1, _ := d.next(t), d.next(t)
+	p.Send(make([]byte, 100))
+	l1.suspect.Store(true)
+	r := d.next(t)
+	if !r.req.Join || r.req.SessionID[0] != 9 {
+		t.Fatalf("request = %+v, want a lane joining the session", r.req)
+	}
+	if l1.isDone() {
+		t.Fatal("the suspect lane was closed rather than left to recover or time out")
 	}
 }
 

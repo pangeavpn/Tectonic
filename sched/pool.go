@@ -31,6 +31,9 @@ type PoolLane interface {
 	RTT() time.Duration
 	// BaseRTT is the lane's round trip without any queueing.
 	BaseRTT() time.Duration
+	// Suspect reports whether the lane's path seems to have died: it has heard nothing for far
+	// longer than its round trip.
+	Suspect() bool
 	SetPlanner(*shape.Planner)
 }
 
@@ -512,7 +515,8 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	active := now.Sub(lastActive) < pl.IdleAfter() || nPending > 0
 	live := 0
 	for st := range p.lanes {
-		if !st.retiring && st.replacing == nil {
+		// A suspect lane is not counted, so one opens in its place without waiting for it to time out.
+		if !st.retiring && st.replacing == nil && !st.l.Suspect() {
 			live++
 		}
 	}
