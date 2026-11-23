@@ -244,6 +244,8 @@ So a session has a send limit of its own, shared by its lanes.
 - **It goes when it isn't needed,** once the session has used less than half of it for a while.
 - **It stands down on a path it doesn't fit.** On a path that limits each connection separately, a lane given more than its connection may carry loses the excess while another lane has room, so holding the session to what it delivers makes it deliver less again. If the rate falls under 70% of the highest it has been, the limit stands down, for 30 s the first time and twice as long each time after.
 
+- **In gaming mode it holds the queue down as well.** A queue on the path alone brings the limit on, with or without loss, and while the path queues the session writes at 90% of what it delivers, so the queue drains within a few stretches rather than sitting at the bottleneck. What a game sends skips the lanes' queues, where the rest now waits. In gaming mode, a ping inside the tunnel under a saturating download (20 Mbit/s, 50 ms) went from a p95 of 110–133 ms, 2.4× idle, to 80–98 ms, 1.9×, and the download was as fast.
+
 The figures come from `TCP_INFO`, so the limit works where a lane has it and stays off elsewhere.
 
 ### Putting packets back in order

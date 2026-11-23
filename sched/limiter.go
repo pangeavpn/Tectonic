@@ -123,6 +123,9 @@ const (
 	// limitBurst is how far ahead of the rate the session may write: this
 	// long at the rate, and at least one full record.
 	limitBurst = 5 * time.Millisecond
+	// limitDrain is the share of what the path delivers a Latency limiter holds the session to while
+	// the path queues: low enough that the queue drains within a few stretches.
+	limitDrain = 0.9
 )
 
 // Limiter limits what a session sends across its lanes to what its path
@@ -132,6 +135,9 @@ type Limiter struct {
 	// Log, if set, is told when the limit comes on, eases, stands down
 	// and goes off.
 	Log func(msg string, args ...any)
+	// Latency holds down the path's queue, not only its losses: a queue alone brings the limit on and
+	// down, at a few percent of throughput. Gaming mode sets it. Set it before the first Report.
+	Latency bool
 
 	on    atomic.Bool // a rate is in force
 	mu    sync.Mutex
@@ -232,7 +238,11 @@ func (g *Limiter) roll(now time.Time) {
 	}
 	secs := elapsed.Seconds()
 	queued := g.queued*2 >= g.sent
-	overloaded := g.sent >= limitMinSent && g.resent > limitLoss*g.sent && queued
+	overloaded := g.sent >= limitMinSent && (g.Latency || g.resent > limitLoss*g.sent) && queued
+	ease := limitEase
+	if g.Latency {
+		ease = limitDrain
+	}
 	delivered := g.delivered / secs
 	if g.sent >= limitMinSent {
 		g.peaks[g.nextPeak%limitPeak] = delivered
@@ -250,7 +260,7 @@ func (g *Limiter) roll(now time.Time) {
 		g.strikes = 0
 	case g.rate == 0:
 		if g.strikes++; g.strikes >= limitStrikes {
-			g.set(max(carried*limitEase, limitFloor), now)
+			g.set(max(carried*ease, limitFloor), now)
 			g.best = g.rate
 			g.stats.On++
 			g.log("send limit on", delivered)
@@ -264,7 +274,7 @@ func (g *Limiter) roll(now time.Time) {
 		g.slack = 0
 		switch {
 		case overloaded:
-			g.set(max(carried*limitEase, limitFloor), now)
+			g.set(max(carried*ease, limitFloor), now)
 			g.stats.Eased++
 			g.log("send limit eased", delivered)
 			if g.rate < limitFall*g.best {

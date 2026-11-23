@@ -271,6 +271,7 @@ func NewPool(cfg PoolConfig) *Pool {
 		rng:       rand.New(rand.NewChaCha8(seed)),
 	}
 	p.limit.Log = log.Debug
+	p.limit.Latency = cfg.Redundant
 	p.sched.Redundant = cfg.Redundant
 	if cfg.Redundant {
 		p.baseLanes = max(p.baseLanes, 2) // a copy needs a second lane to ride

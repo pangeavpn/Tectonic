@@ -50,6 +50,24 @@ func overload(t *testing.T, g *Limiter, now time.Time) time.Time {
 	return now
 }
 
+// For gaming mode a queue on the path is enough: no loss, only round trips that have risen.
+func TestLatencyLimiterHoldsTheQueueDownWithoutLoss(t *testing.T) {
+	for _, latency := range []bool{false, true} {
+		g := Limiter{Latency: latency}
+		now := feed(&g, time.Now(), 0, 0, false)
+		for range 10 {
+			now = feed(&g, now, pathRate, 0, true)
+		}
+		rate := g.Stats().Rate
+		switch {
+		case !latency && rate != 0:
+			t.Fatalf("a queue without loss brought the limit on at %.0f", rate)
+		case latency && (rate == 0 || rate > limitDrain*pathRate*1.01):
+			t.Fatalf("with a queue on the path the latency limit is %.0f, want about %.0f", rate, limitDrain*pathRate)
+		}
+	}
+}
+
 func TestLimiterIsOffUntilThePathIsOverloaded(t *testing.T) {
 	var g Limiter
 	now := time.Now()
