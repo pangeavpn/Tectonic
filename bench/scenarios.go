@@ -54,6 +54,7 @@ var scenarios = []scenario{
 	{"gameload", "the game stream beside a download in the same tunnel", scGameLoad},
 	{"pathchange", "every lane's path goes silent mid-download, as when a phone leaves Wi-Fi", scPathChange},
 	{"deadaddr", "a session on an unseen network whose first node address is unreachable", scDeadAddr},
+	{"fingerprint", "what a passive observer counts: connections per address, records per MB", scFingerprint},
 	{"paths", "throughput on realistic paths: nearby fibre, long-haul, mobile, lossy international", scPaths},
 }
 
