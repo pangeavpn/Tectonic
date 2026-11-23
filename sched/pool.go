@@ -134,6 +134,18 @@ var (
 	shutdownRedialFor = 2 * time.Minute
 )
 
+// A dial that has gone dialStallRTTs round trips without returning, within dialStallMin and
+// dialStallMax, has most likely lost its SYN: another may start beside it, up to maxDialing in all.
+var (
+	dialStallMin = 2 * time.Second
+	dialStallMax = 5 * time.Second
+)
+
+const (
+	dialStallRTTs = 6
+	maxDialing    = 2
+)
+
 // Pool owns a client's lanes and the session they share.
 type Pool struct {
 	cfg   PoolConfig
@@ -168,6 +180,7 @@ type Pool struct {
 	// Owned by the loop goroutine.
 	lanes       map[*laneState]struct{}
 	dialing     int
+	dialAt      time.Time // when the newest dial under way began
 	haveSession bool
 	session     wire.SessionID
 	ended       wire.SessionID // the last session the node closed
@@ -561,7 +574,7 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		p.dormantAt = time.Time{}
 	}
 	// Open lanes up to the target, one dial at a time.
-	if live+p.dialing < target && p.dialing == 0 && !now.Before(p.nextDial) {
+	if live+p.dialsAhead(now) < target && p.mayDial(now) {
 		reason := "pool"
 		switch {
 		case live == 0 && !p.haveSession:
@@ -626,7 +639,7 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	// Lane churn: replace lanes nearing the end of their lifetime, or of
 	// their byte budget if they are old enough (see Churn), but not while
 	// idle; an idle lane closes soon anyway.
-	if active && p.dialing == 0 && !now.Before(p.nextDial) {
+	if active && p.mayDial(now) {
 		for st := range p.lanes {
 			if !st.welcomed || st.retiring || st.replacement || st.replacing != nil {
 				continue
@@ -654,6 +667,36 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 	default:
 		return time.Hour // nothing to do until a packet arrives
 	}
+}
+
+// mayDial reports whether a dial may start at now: none is under way, or the newest has stalled.
+func (p *Pool) mayDial(now time.Time) bool {
+	switch {
+	case now.Before(p.nextDial) || p.dialing >= maxDialing:
+		return false
+	case p.dialing == 0:
+		return true
+	}
+	return p.stalled(now)
+}
+
+// dialsAhead is how many of the dials under way count toward the target: a stalled one does not.
+func (p *Pool) dialsAhead(now time.Time) int {
+	if p.dialing > 0 && p.stalled(now) {
+		return p.dialing - 1
+	}
+	return p.dialing
+}
+
+// stalled reports whether the newest dial under way has gone longer than a dial takes.
+func (p *Pool) stalled(now time.Time) bool {
+	var rtt time.Duration
+	for st := range p.lanes {
+		if r := st.l.BaseRTT(); r > 0 && (rtt == 0 || r < rtt) {
+			rtt = r
+		}
+	}
+	return now.Sub(p.dialAt) >= min(max(dialStallRTTs*rtt, dialStallMin), dialStallMax)
 }
 
 // sampleThrottle measures each lane's throughput in the busier direction and
@@ -763,6 +806,7 @@ func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
 		},
 	}
 	p.dialing++
+	p.dialAt = now
 	p.log.Debug("dialing lane", "reason", reason, "join", req.Join)
 	go func() {
 		ctx, cancel := context.WithTimeout(p.ctx, p.cfg.DialTimeout)

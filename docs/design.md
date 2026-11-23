@@ -274,6 +274,7 @@ While any lane is retransmitting, packets of 128 bytes or less are also copied o
 - A new TCP connection next to a busy one grows slowly, so on a saturated link the old lane can stay for many seconds. It is retired regardless after 30 s, or once it has carried the most any lane's byte budget can be (8 GiB).
 - If the network kills a lane, for example with a forged reset or a middlebox timeout, traffic moves to the remaining lanes at once and a replacement opens.
 - A lane whose path dies without a word, as when a phone leaves Wi-Fi or a NAT forgets the connection, is noticed by its `PING`s: once the oldest has gone unanswered for four round trips, and at least a second, the lane is suspect. The scheduler gives it packets only when no other lane will take them, and the pool opens a lane in its place at once rather than when the lane times out, 15 s later. With every lane silenced mid-download, the download inside the tunnel had stalled for 25 s or more; it now stalls for 1.6 to 1.9 s.
+- The pool dials one lane at a time, but a dial that has gone six round trips without returning (at least 2 s, at most 5), as one whose SYN vanished does, no longer holds up the next: a second starts beside it. Where the first dial after a path change hung, the download had stalled for 25.5 s, and now for 6.4 s.
 
 ### Lane count and throttle detection
 

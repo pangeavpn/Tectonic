@@ -133,6 +133,7 @@ type fakeDialer struct {
 	mu      sync.Mutex
 	welcome byte // if non-zero, lanes are welcomed into this session at once
 	fail    int
+	hang    int // the next dials that never return until given up on
 }
 
 func (d *fakeDialer) setWelcome(sid byte) {
@@ -152,6 +153,12 @@ func (d *fakeDialer) dial(ctx context.Context, req DialRequest) (PoolLane, error
 		}
 	}
 	d.mu.Lock()
+	if d.hang > 0 {
+		d.hang--
+		d.mu.Unlock()
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	if d.fail > 0 {
 		d.fail--
 		d.mu.Unlock()
@@ -703,6 +710,22 @@ func TestPoolReplacesASuspectLaneAtOnce(t *testing.T) {
 	}
 	if l1.isDone() {
 		t.Fatal("the suspect lane was closed rather than left to recover or time out")
+	}
+}
+
+// A dial whose SYN vanished takes its whole timeout to fail; the pool doesn't wait that out.
+func TestPoolDialsAgainBesideADialThatHangs(t *testing.T) {
+	old := dialStallMin
+	dialStallMin = 100 * time.Millisecond
+	t.Cleanup(func() { dialStallMin = old })
+	d := newFakeDialer()
+	d.welcome = 1
+	d.hang = 1
+	start := time.Now()
+	newTestPool(t, d, PoolConfig{})
+	d.next(t)
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the first lane came %v after a dial that hung", took)
 	}
 }
 
