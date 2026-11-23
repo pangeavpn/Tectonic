@@ -129,8 +129,26 @@ func freeUDPPort() (uint16, error) {
 	return uint16(c.LocalAddr().(*net.UDPAddr).Port), nil
 }
 
+// clientOpt adjusts a Tectonic client's configuration before it dials.
+type clientOpt func(*tectonic.Config)
+
+// deadNode is a node address no dial reaches, and dialHang how many of the client's next dials hang
+// too: each blocks until it is given up on, as a dial whose SYN is blackholed does.
+const deadNode = "10.0.0.9:443"
+
+var dialHang atomic.Int32
+
+func takeHang() bool {
+	for n := dialHang.Load(); n > 0; n = dialHang.Load() {
+		if dialHang.CompareAndSwap(n, n-1) {
+			return true
+		}
+	}
+	return false
+}
+
 // newEnv builds a path and brings WireGuard up across it over tr.
-func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
+func newEnv(ctx context.Context, tr transport, lc link.Config, opts ...clientOpt) (*env, error) {
 	L, err := newPath(lc)
 	if err != nil {
 		return nil, err
@@ -168,7 +186,7 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 		if err != nil {
 			return nil, err
 		}
-		c, srv, err := startTectonic(ctx, L, tectonicPort, fmt.Sprintf("127.0.0.1:%d", port))
+		c, srv, err := startTectonic(ctx, L, tectonicPort, fmt.Sprintf("127.0.0.1:%d", port), opts...)
 		if err != nil {
 			return nil, err
 		}
@@ -256,7 +274,7 @@ func newEnv(ctx context.Context, tr transport, lc link.Config) (*env, error) {
 // startTectonic runs a Tectonic node on the path's server host, port
 // listen, in front of WireGuard at wgAddr, and dials it from the client
 // host.
-func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*tectonic.Conn, *server.Server, error) {
+func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string, opts ...clientOpt) (*tectonic.Conn, *server.Server, error) {
 	p := benchPKI()
 	secret := bytes.Repeat([]byte{0x5a}, 32)
 	srv, err := server.New(server.Config{
@@ -280,7 +298,7 @@ func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*
 
 	id, _ := wire.NewKeyID(time.Now().Add(24 * time.Hour))
 	dk := wire.DeviceKey(secret, id)
-	c, err := tectonic.Dial(ctx, tectonic.Config{
+	cfg := tectonic.Config{
 		Profile: tectonic.Profile{
 			Node:        netip.AddrPortFrom(L.serverAddr(), listen).String(),
 			CoverDomain: coverDomain,
@@ -294,6 +312,10 @@ func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*
 		Lanes:     baseLanes(),
 		Redundant: os.Getenv("BENCH_REDUNDANT") == "1",
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			if addr == deadNode || takeHang() {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
 			ap, err := netip.ParseAddrPort(addr)
 			if err != nil {
 				return nil, err
@@ -301,7 +323,11 @@ func startTectonic(ctx context.Context, L path, listen uint16, wgAddr string) (*
 			return L.client().DialTCP(ctx, ap)
 		},
 		Logger: benchLogger(),
-	})
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	c, err := tectonic.Dial(ctx, cfg)
 	if err != nil {
 		srv.Close()
 		return nil, nil, err
@@ -423,6 +449,13 @@ func (t *transfer) rate(ctx context.Context, d time.Duration) float64 {
 	case <-t.done:
 	}
 	return float64(t.bytes.Load()-b0) * 8 / time.Since(t0).Seconds()
+}
+
+// lastRead is when the transfer last read anything.
+func (t *transfer) lastRead() time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.lastAt
 }
 
 // maxGap is the longest pause between reads in [from, to).

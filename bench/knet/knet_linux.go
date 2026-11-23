@@ -290,6 +290,7 @@ func (t *Topology) Configure(cfg link.Config) error {
 			return err
 		}
 	}
+	t.rtr.run(nil, "nft", "delete", "table", "inet", "bench") // the last environment's blackholes; none is fine
 	for _, dev := range []string{devRouterClient, devRouterServer} {
 		t.rtr.run(nil, "tc", "qdisc", "del", "dev", dev, "root") // none yet is fine
 		for _, args := range qdiscs(dev, cfg) {
@@ -475,6 +476,25 @@ func (t *Topology) ResetFlow(f link.Flow) error {
 	}
 	if strings.TrimSpace(out) == "" {
 		return fmt.Errorf("knet: no connection %v to reset", f)
+	}
+	return nil
+}
+
+// BlackholeFlow silently drops every further packet of f in both directions at the router.
+func (t *Topology) BlackholeFlow(f link.Flow) error {
+	if _, err := t.rtr.run(nil, strings.Fields("nft add table inet bench")...); err != nil {
+		return err
+	}
+	chain := "nft add chain inet bench fwd { type filter hook forward priority 0 ; }"
+	if _, err := t.rtr.run(nil, strings.Fields(chain)...); err != nil {
+		return err
+	}
+	for _, d := range [][2]netip.AddrPort{{f.Src, f.Dst}, {f.Dst, f.Src}} {
+		rule := fmt.Sprintf("nft add rule inet bench fwd ip saddr %v tcp sport %d ip daddr %v tcp dport %d drop",
+			d[0].Addr(), d[0].Port(), d[1].Addr(), d[1].Port())
+		if _, err := t.rtr.run(nil, strings.Fields(rule)...); err != nil {
+			return err
+		}
 	}
 	return nil
 }

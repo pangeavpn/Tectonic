@@ -52,6 +52,8 @@ var scenarios = []scenario{
 	{"interactive", "bandwidth overhead during interactive use", scInteractive},
 	{"game", "a 60 Hz game stream on a lossy 10 ms link", scGame},
 	{"gameload", "the game stream beside a download in the same tunnel", scGameLoad},
+	{"pathchange", "every lane's path goes silent mid-download, as when a phone leaves Wi-Fi", scPathChange},
+	{"deadaddr", "a session on an unseen network whose first node address is unreachable", scDeadAddr},
 	{"paths", "throughput on realistic paths: nearby fibre, long-haul, mobile, lossy international", scPaths},
 }
 

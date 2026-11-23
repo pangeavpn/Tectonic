@@ -36,6 +36,7 @@ type path interface {
 	// tcpFlows lists TCP connections to port on the server.
 	tcpFlows(port uint16) []link.Flow
 	resetFlow(f link.Flow) error
+	blackholeFlow(f link.Flow) error
 	close()
 }
 
@@ -79,6 +80,7 @@ func (p simPath) server() pathHost                { return p.L.Server }
 func (p simPath) serverAddr() netip.Addr          { return link.ServerAddr }
 func (p simPath) stats() (up, down link.DirStats) { return p.L.Stats() }
 func (p simPath) resetFlow(f link.Flow) error     { return p.L.ResetFlow(f) }
+func (p simPath) blackholeFlow(f link.Flow) error { p.L.BlackholeFlow(f); return nil }
 func (p simPath) close()                          { p.L.Close() }
 
 func (p simPath) tcpFlows(port uint16) []link.Flow {
@@ -98,6 +100,7 @@ func (p kernelPath) server() pathHost                { return p.t.Server() }
 func (p kernelPath) serverAddr() netip.Addr          { return knet.ServerAddr }
 func (p kernelPath) stats() (up, down link.DirStats) { return p.t.Stats() }
 func (p kernelPath) resetFlow(f link.Flow) error     { return p.t.ResetFlow(f) }
+func (p kernelPath) blackholeFlow(f link.Flow) error { return p.t.BlackholeFlow(f) }
 func (p kernelPath) close()                          {} // the topology outlives each environment
 
 func (p kernelPath) tcpFlows(port uint16) []link.Flow {

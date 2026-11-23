@@ -29,6 +29,7 @@ func (t *Topology) Configure(link.Config) error                   { return errUn
 func (t *Topology) Stats() (up, down link.DirStats)               { return }
 func (t *Topology) TCPFlows(uint16) ([]link.Flow, error)          { return nil, errUnsupported }
 func (t *Topology) ResetFlow(link.Flow) error                     { return errUnsupported }
+func (t *Topology) BlackholeFlow(link.Flow) error                 { return errUnsupported }
 func (t *Topology) SS(bool, uint16) string                        { return "" }
 func (t *Topology) Client() *Host                                 { return &Host{} }
 func (t *Topology) Server() *Host                                 { return &Host{} }
