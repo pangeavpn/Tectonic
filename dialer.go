@@ -977,7 +977,7 @@ type modeSearch struct {
 	addr     string     // the one address every attempt goes to, once one has answered
 	release  func(bool) // gives addr back (see takeThisAddr)
 	finished bool
-	live     int // attempts started that have not failed
+	live     int      // attempts started that have not failed
 	newest   *attempt // the last one started
 	first    []byte   // the first packet, once it has been taken from the pool
 	carrier  *attempt // the attempt whose login it went out with, while that attempt is open
