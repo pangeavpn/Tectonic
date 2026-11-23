@@ -167,6 +167,7 @@ type Pool struct {
 	dialing     int
 	haveSession bool
 	session     wire.SessionID
+	ended       wire.SessionID // the last session the node closed
 	welcome     wire.Welcome
 	planner     *shape.Planner
 	maxLanes    int
@@ -896,6 +897,11 @@ func (p *Pool) welcomed(st *laneState) {
 	}
 	w, _ := st.l.Welcome()
 	w = clampWelcome(w)
+	if w.SessionID == p.ended {
+		// It logged in before the node's CLOSE: adopting it would revive the session and its backoff.
+		st.l.Close()
+		return
+	}
 	st.welcomed = true
 	st.session = w.SessionID
 	st.upAt = time.Now()
@@ -948,6 +954,9 @@ func (p *Pool) sessionClosed(reason wire.CloseReason) {
 		p.backoff, p.nextDial = 0, time.Time{}
 	}
 	// The session is over; the next lane starts a new one.
+	if p.haveSession {
+		p.ended = p.session
+	}
 	p.haveSession = false
 	for st := range p.lanes {
 		st.l.Close()
