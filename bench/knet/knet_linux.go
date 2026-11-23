@@ -293,7 +293,12 @@ func (t *Topology) Configure(cfg link.Config) error {
 	for _, dev := range []string{devRouterClient, devRouterServer} {
 		t.rtr.run(nil, "tc", "qdisc", "del", "dev", dev, "root") // none yet is fine
 		for _, args := range qdiscs(dev, cfg) {
-			if _, err := t.rtr.run(nil, args...); err != nil {
+			out, err := t.rtr.run(nil, args...)
+			if err != nil && cfg.Seed != 0 && strings.Contains(out+err.Error(), `"seed"`) {
+				// Older iproute2 (5.15 on Ubuntu 22.04) has no netem seed: loss then differs run to run.
+				_, err = t.rtr.run(nil, args[:len(args)-2]...)
+			}
+			if err != nil {
 				return err
 			}
 		}
