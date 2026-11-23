@@ -110,6 +110,7 @@ func serve(args []string) error {
 	cdnHeader := fs.String("cdn-header", "Edge-Signature", "header the CDN signs requests with")
 	cdnSecretFile := fs.String("cdn-secret-file", "", "file holding the secret the CDN signs with")
 	logLevel := fs.String("log-level", "info", "debug, info, warn or error")
+	congestion := fs.String("congestion", "bbr", "congestion control for the node's connections, where the kernel has it: BBR carries several times what cubic does over a lossy path (empty keeps the kernel's)")
 	fs.Parse(args)
 
 	var level slog.Level
@@ -251,11 +252,29 @@ func serve(args []string) error {
 		}
 	}()
 
+	ln, err := listenTCP(*listen, *congestion, log)
+	if err != nil {
+		return err
+	}
 	log.Info("listening", "addr", *listen, "cover_domain", *coverDomain, "default_pin", def.pin(), "cdn", *cdnPath != "")
-	if err := srv.ListenAndServe(*listen); !errors.Is(err, server.ErrServerClosed) {
+	if err := srv.Serve(ln); !errors.Is(err, server.ErrServerClosed) {
 		return err
 	}
 	return nil
+}
+
+// listenTCP listens on addr with the congestion control cc, which its connections inherit; where the
+// kernel lacks it (modprobe tcp_bbr), it says so and listens with the kernel's default.
+func listenTCP(addr, cc string, log *slog.Logger) (net.Listener, error) {
+	if cc != "" {
+		lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error { return setCongestion(c, cc) }}
+		ln, err := lc.Listen(context.Background(), "tcp", addr)
+		if err == nil {
+			return ln, nil
+		}
+		log.Warn("congestion control unavailable; using the kernel's default", "congestion", cc, "err", err)
+	}
+	return net.Listen("tcp", addr)
 }
 
 // readSecret reads a secret file: hex if it decodes as hex, the raw bytes

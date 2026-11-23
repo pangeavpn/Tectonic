@@ -107,6 +107,15 @@ is the case. Raise the limit on the node:
 sysctl -w net.core.rmem_max=7500000
 ```
 
+The node runs its connections on BBR (`-congestion bbr`, the default), which
+carries several times what cubic does over a path that loses packets. The
+kernel needs its module; without it the node says so at start and keeps the
+kernel's default:
+
+```sh
+modprobe tcp_bbr && echo tcp_bbr > /etc/modules-load.d/tcp_bbr.conf
+```
+
 On first run the node creates its default certificate (`default.crt`) and
 logs its pin. The certificate is self-signed for `localhost`;
 `-default-cert-name` sets another name. An existing certificate is never
