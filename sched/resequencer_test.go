@@ -216,6 +216,29 @@ func TestResequencerPassesSmallPacketsStraightThrough(t *testing.T) {
 	}
 }
 
+func TestResequencerPassesGamingCopiesStraightThrough(t *testing.T) {
+	for _, tc := range []struct {
+		small      int
+		want, then []uint64
+	}{{0, []uint64{0}, []uint64{0, 1, 2, 3}}, {RedundantMaxSize, []uint64{0, 2}, []uint64{0, 2, 1, 3}}} {
+		var s sink
+		r := NewResequencer(s.deliver)
+		r.Small = tc.small
+		a, b := r.Source(), r.Source()
+		a.Push(wgData(7, 0, big), rtt)
+		b.Push(wgData(7, 2, 400), rtt) // a game packet's copy, while 1 is stuck on lane a
+		b.Push(wgData(7, 3, big), rtt)
+		if got := s.list(); !slices.Equal(got, tc.want) {
+			t.Fatalf("small %d: delivered %v, want %v", tc.small, got, tc.want)
+		}
+		a.Push(wgData(7, 1, big), rtt)
+		if got := s.list(); !slices.Equal(got, tc.then) {
+			t.Fatalf("small %d: delivered %v once the gap filled, want %v", tc.small, got, tc.then)
+		}
+		r.Close()
+	}
+}
+
 func TestResequencerSmallPacketsDoNotMoveALaneOn(t *testing.T) {
 	// A small packet may be sent out of turn, or copied onto a second lane,
 	// so it is no proof the lane has nothing earlier to deliver.

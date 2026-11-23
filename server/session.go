@@ -157,6 +157,9 @@ func (s *Server) attach(h wire.Hello) (*session, error) {
 	ss.joined.Store(time.Now().UnixNano())
 	ss.sched.Redundant = h.Redundant()
 	ss.reseq = sched.NewResequencer(func(pkt []byte) { udp.Write(pkt) })
+	if h.Redundant() {
+		ss.reseq.Small = sched.RedundantMaxSize
+	}
 	ss.limit.Log = s.log.Debug
 	s.mu.Lock()
 	if s.closed {

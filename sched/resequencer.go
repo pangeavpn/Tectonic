@@ -118,6 +118,10 @@ func IdleHoldFor(rtt time.Duration) time.Duration {
 // It is safe for concurrent use. deliver is called with the Resequencer's
 // lock held, one packet at a time, and must not call back into it.
 type Resequencer struct {
+	// Small, if above DupMaxSize, is the size up to which packets go on as they arrive: gaming
+	// mode copies them onto two lanes, so one waiting for a stalled lane's packets wastes its copy.
+	Small int
+
 	deliver func(pkt []byte)
 
 	mu      sync.Mutex
@@ -233,7 +237,7 @@ func (s *Source) Push(pkt []byte, rtt time.Duration) {
 	now := time.Now()
 	// Small packets go out of turn (the scheduler may also duplicate them
 	// onto a second lane), so they say nothing about how far a lane has got.
-	ordered := len(pkt) > DupMaxSize
+	ordered := len(pkt) > max(r.Small, DupMaxSize)
 	// A packet too large to be WireGuard data is not waited for either.
 	holdable := len(pkt) <= maxHoldable
 	if ordered && !s.closed {

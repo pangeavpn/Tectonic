@@ -260,6 +260,9 @@ func NewPool(cfg PoolConfig) *Pool {
 			cfg.Receive(pkt)
 		}
 	})
+	if cfg.Redundant {
+		p.reseq.Small = RedundantMaxSize
+	}
 	p.lastActive.Store(time.Now().UnixNano())
 	go p.loop()
 	return p
