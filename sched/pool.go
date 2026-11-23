@@ -57,6 +57,9 @@ type DialRequest struct {
 	Planner *shape.Planner
 	// Limiter is the session's send limit, to be installed on the lane.
 	Limiter lane.Limiter
+	// Capped says the pool finds each connection capped separately, which the lane's HELLO tells the
+	// node, whose send limit then stands down too.
+	Capped bool
 	// Reason says why the lane is wanted, for logs: "first", "pool",
 	// "churn", "probe", "reopen" or "reconnect".
 	Reason string
@@ -556,6 +559,7 @@ func (p *Pool) maintain(now time.Time) time.Duration {
 		extra := 0
 		if now.Sub(p.lastSample) >= sampleEvery {
 			extra = p.sampleThrottle(now, live)
+			p.limit.SetCapped(p.thr.throttled)
 		} else {
 			extra = p.thr.extra
 		}
@@ -761,7 +765,7 @@ func (p *Pool) sampleThrottle(now time.Time, live int) int {
 // dial opens a lane in the background. replaces is the lane it will take
 // over from, for churn.
 func (p *Pool) dial(now time.Time, reason string, replaces *laneState) {
-	req := DialRequest{Reason: reason, Planner: p.planner, Limiter: &p.limit}
+	req := DialRequest{Reason: reason, Planner: p.planner, Limiter: &p.limit, Capped: p.thr.throttled}
 	if p.haveSession && (p.liveCount() > 0 || now.Sub(p.lastLaneAt) < p.welcome.ResumeWindow) {
 		req.Join = true
 		req.SessionID = p.session

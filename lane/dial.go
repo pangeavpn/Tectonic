@@ -118,6 +118,7 @@ type DialConfig struct {
 	Join      bool
 	Cellular  bool
 	Redundant bool
+	Capped    bool // the client has found each connection capped separately
 	// Now is the clock for HELLO's timestamp; nil means time.Now.
 	Now func() time.Time
 
@@ -203,6 +204,9 @@ func Dial(ctx context.Context, cfg DialConfig) (*Lane, error) {
 	}
 	if cfg.Redundant {
 		h.Flags |= wire.FlagRedundant
+	}
+	if cfg.Capped {
+		h.Flags |= wire.FlagCapped
 	}
 	h.Sign(wire.LaneKey(cfg.DeviceKey, binding))
 	if cfg.FirstPacket == nil && cfg.TakeFirstPacket != nil {

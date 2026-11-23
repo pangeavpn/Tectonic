@@ -74,6 +74,7 @@ func (s *Server) startLane(conn, raw net.Conn, r io.Reader, h wire.Hello) bool {
 	if h.Cellular() {
 		maxLanes = s.cfg.MaxLanesCellular
 	}
+	ss.limit.SetCapped(h.Capped()) // the client's newest finding about the path
 	w := wire.Welcome{
 		SessionID:    ss.id,
 		MaxLanes:     uint8(maxLanes),

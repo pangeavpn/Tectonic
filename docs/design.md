@@ -146,6 +146,7 @@ HELLO
   version     1 byte    = 1
   flags       1 byte    bit 0: join an existing session
                         bit 1: on cellular; bit 2: gaming mode (§7)
+                        bit 3: each connection is capped (§7)
   key_id     20 bytes
   session_id 16 bytes   zeros for a new session
   timestamp   8 bytes   unix seconds
@@ -242,7 +243,7 @@ So a session has a send limit of its own, shared by its lanes.
 - **Then the session writes no faster than the path has been delivering.** What the tunnel offers beyond that waits in the lanes' queues, where a full queue drops. Small packets and control frames don't wait.
 - **The rate follows the path smoothly.** Every time it falls, the lanes' queues fill and drop, and a TCP connection made to back off every second never gets back to what the path carries. So the rate moves a percent or two a stretch: up while there is no queue on the path, and with a queue it settles where the path drops about 2% of what it is sent. Only when the path is found overloaded again does it jump back to what is being delivered.
 - **It goes when it isn't needed,** once the session has used less than half of it for a while.
-- **It stands down on a path it doesn't fit.** On a path that limits each connection separately, a lane given more than its connection may carry loses the excess while another lane has room, so holding the session to what it delivers makes it deliver less again. If the rate falls under 70% of the highest it has been, the limit stands down, for 30 s the first time and twice as long each time after.
+- **It stands down on a path it doesn't fit.** On a path that limits each connection separately, a lane given more than its connection may carry loses the excess while another lane has room, so holding the session to what it delivers makes it deliver less again. If the rate falls under 70% of the highest it has been, the limit stands down, for 30 s the first time and twice as long each time after. It also stands down, at both ends, for as long as the client's throttle check finds each connection capped: the client's lanes say so in their `HELLO` (flag bit 3). Under a 4 Mbit/s cap with a BBR node that took the median of six runs from 13.6 to 20.1 Mbit/s; in a third of runs the check never confirms the cap and the session stays on three lanes, as it did before.
 
 - **In gaming mode it holds the queue down as well.** A queue on the path alone brings the limit on, with or without loss, and while the path queues the session writes at 90% of what it delivers, so the queue drains within a few stretches rather than sitting at the bottleneck. What a game sends skips the lanes' queues, where the rest now waits. In gaming mode, a ping inside the tunnel under a saturating download (20 Mbit/s, 50 ms) went from a p95 of 110–133 ms, 2.4× idle, to 80–98 ms, 1.9×, and the download was as fast.
 

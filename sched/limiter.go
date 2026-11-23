@@ -139,10 +139,11 @@ type Limiter struct {
 	// down, at a few percent of throughput. Gaming mode sets it. Set it before the first Report.
 	Latency bool
 
-	on    atomic.Bool // a rate is in force
-	mu    sync.Mutex
-	start time.Time     // when the stretch being measured began
-	span  time.Duration // how long it runs
+	on     atomic.Bool // a rate is in force
+	capped atomic.Bool // the path caps each connection: see SetCapped
+	mu     sync.Mutex
+	start  time.Time     // when the stretch being measured began
+	span   time.Duration // how long it runs
 	// What the lanes reported in the stretch, in bytes: sent, sent again,
 	// delivered, and the part of sent that came from lanes with a queue on
 	// their path. wrote is what the lanes wrote under the limit.
@@ -184,6 +185,10 @@ func (g *Limiter) Report(now time.Time, p lane.Progress) {
 	g.roll(now)
 	g.mu.Unlock()
 }
+
+// SetCapped says whether the path caps each connection separately. The limit takes the lanes to share
+// one path, so on such a path it holds the session to what its capped lanes deliver: it stands down.
+func (g *Limiter) SetCapped(capped bool) { g.capped.Store(capped) }
 
 // Wait returns how long a lane must hold its next DATA.
 func (g *Limiter) Wait(now time.Time) time.Duration {
@@ -256,6 +261,12 @@ func (g *Limiter) roll(now time.Time) {
 		carried = max(carried, p)
 	}
 	switch {
+	case g.capped.Load():
+		if g.rate > 0 {
+			g.log("send limit stands down: each connection is capped", delivered)
+			g.set(0, now)
+		}
+		g.strikes = 0
 	case g.rate == 0 && (!overloaded || now.Before(g.rest)):
 		g.strikes = 0
 	case g.rate == 0:

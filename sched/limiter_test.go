@@ -50,6 +50,24 @@ func overload(t *testing.T, g *Limiter, now time.Time) time.Time {
 	return now
 }
 
+func TestLimiterStandsDownWhereEachConnectionIsCapped(t *testing.T) {
+	var g Limiter
+	now := overload(t, &g, time.Now())
+	g.SetCapped(true)
+	for range 2 * limitStrikes {
+		if now = feed(&g, now, 1.33*pathRate, 0.25, true); g.Stats().Rate != 0 {
+			t.Fatal("the limit held a session whose path caps each connection")
+		}
+	}
+	g.SetCapped(false)
+	for range limitStrikes {
+		now = feed(&g, now, 1.33*pathRate, 0.25, true)
+	}
+	if g.Stats().Rate == 0 {
+		t.Fatal("the limit did not come back once the path no longer capped each connection")
+	}
+}
+
 // For gaming mode a queue on the path is enough: no loss, only round trips that have risen.
 func TestLatencyLimiterHoldsTheQueueDownWithoutLoss(t *testing.T) {
 	for _, latency := range []bool{false, true} {
