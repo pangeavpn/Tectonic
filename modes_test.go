@@ -976,6 +976,33 @@ func TestModeWaitsOutResidualCensorship(t *testing.T) {
 	r.wantRemembered(SNIBorrowed)
 }
 
+// A new Conn on that network, as a daemon makes after giving up on the last, shares its store: it
+// neither sends the blocked name again, which would start the block over, nor dials while it lasts.
+func TestModeANewConnKeepsWhatTheLastLearned(t *testing.T) {
+	r := newModeRig(t, nil)
+	r.net.rules[modeCover] = sniReset
+	r.net.residual = 300 * time.Millisecond
+	if _, err := r.dial(); err == nil {
+		t.Fatal("logged in through a block on the address")
+	}
+	r.wantSent(modeCover, modeBorrowed, "")
+	d, err := newDialer(r.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.d = d
+	if _, err := r.dial(); !errors.Is(err, errResidualWait) {
+		t.Fatalf("a new Conn dialed during the block: %v, want errResidualWait", err)
+	}
+	r.wantSent(modeCover, modeBorrowed, "")
+	r.d.mu.Lock()
+	r.d.quiet[modeNetwork] = time.Now()
+	r.d.mu.Unlock()
+	time.Sleep(r.net.residual)
+	r.mustDial()
+	r.wantSent(modeCover, modeBorrowed, "", modeBorrowed)
+}
+
 // A cover domain that was reset is not sent again on that network, even
 // once the mode is worked out again from the start.
 func TestModeDoesNotRetryABlockedCoverDomain(t *testing.T) {

@@ -152,6 +152,7 @@ type dialer struct {
 	ownBlocked  map[string]time.Time
 	quiet       map[string]time.Time
 	intercepted map[string]time.Time
+	learned     map[string]bool // networks whose verdicts have been read from the store
 	// laneAddrs counts the live direct lanes on each of the node's
 	// addresses, so the next lane goes to the one carrying the fewest.
 	laneAddrs map[string]int
@@ -196,6 +197,7 @@ func newDialer(cfg Config) (*dialer, error) {
 		ownBlocked:  map[string]time.Time{},
 		quiet:       map[string]time.Time{},
 		intercepted: map[string]time.Time{},
+		learned:     map[string]bool{},
 		network:     cfg.Network,
 		cellular:    cfg.Cellular,
 	}
@@ -283,6 +285,7 @@ func (d *dialer) candidates() []Choice {
 func (d *dialer) candidatesOn(network string) []Choice {
 	cands := d.candidates()
 	d.mu.Lock()
+	d.learnLocked(network)
 	blocked := time.Now().Before(d.ownBlocked[network])
 	d.mu.Unlock()
 	if blocked && len(cands) > 1 && cands[0].Mode == SNIOwn {
@@ -343,6 +346,7 @@ func (d *dialer) state() (string, Choice) {
 // wait lanes go by the CDN without the dialer having given up on direct
 // ones, and a report of "direct" then would be wrong. d.mu must be held.
 func (d *dialer) carrierLocked(network string) (useCDN, waiting bool) {
+	d.learnLocked(network)
 	now := time.Now()
 	cdnOK := d.cfg.Profile.CDN != nil && !now.Before(d.intercepted[network])
 	useCDN = cdnOK && d.onCDN && now.Sub(d.lastDirectTry) < directRetry
@@ -593,6 +597,7 @@ func (d *dialer) watch(l *lane.Lane, err error, carrier lane.Carrier, c Choice, 
 func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.learnLocked(network)
 	if carrier == lane.CDN {
 		if ok {
 			d.cdnFails = 0
@@ -616,7 +621,7 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 		// offer again rather than written off for the rest of the day
 		// (see refused).
 		if _, locked := d.intercepted[network]; locked {
-			delete(d.intercepted, network)
+			d.rememberLocked(d.intercepted, network, verdictIntercepted, time.Time{})
 			d.log.Info("a direct lane logged in, so TLS is not intercepted here after all; the CDN is on offer again", "network", network)
 		}
 		if d.cfg.SNIMode == SNIAuto && c.Mode != SNIAuto {
@@ -672,12 +677,13 @@ func (d *dialer) refused(network string, err error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.learnLocked(network)
 	now := time.Now()
 	if !now.Before(d.intercepted[network]) {
 		d.log.Warn("a lane was served a certificate the device trusts in the node's place; not using the CDN on this network",
 			"network", network, "for", interceptedFor, "err", err)
 	}
-	d.intercepted[network] = now.Add(interceptedFor)
+	d.rememberLocked(d.intercepted, network, verdictIntercepted, now.Add(interceptedFor))
 	if network == d.network && d.onCDN {
 		d.onCDN = false
 		d.directFails = 0
@@ -709,14 +715,51 @@ func (d *dialer) blocked(network string, attempts []*attempt, won *attempt, hell
 	now := time.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.learnLocked(network)
 	if own {
-		d.ownBlocked[network] = now.Add(ownBlockedFor)
+		d.rememberLocked(d.ownBlocked, network, d.ownVerdict(), now.Add(ownBlockedFor))
 		d.log.Info("the cover domain looks blocked here; not trying it for a while", "network", network, "for", ownBlockedFor)
 	}
 	if won == nil && n >= 2 {
 		wait := residualWait + time.Duration(d.rng.Int64N(int64(residualWait/5)))
-		d.quiet[network] = now.Add(wait)
+		d.rememberLocked(d.quiet, network, d.quietVerdict(), now.Add(wait))
 		d.log.Info("the node's address looks blocked here; waiting it out", "network", network, "for", wait.Round(time.Second))
+	}
+}
+
+// The keys a dialer's verdicts go by in a VerdictStore: a blocked cover domain is that name's, and a
+// block on an address is that address's, so another node, or another cover domain, starts afresh.
+const verdictIntercepted = "intercepted"
+
+func (d *dialer) ownVerdict() string   { return "own " + d.cfg.Profile.CoverDomain }
+func (d *dialer) quietVerdict() string { return "quiet " + d.node }
+
+// learnLocked reads what the store knows about network into the dialer's maps, once. d.mu held.
+func (d *dialer) learnLocked(network string) {
+	vs, ok := d.modes.(VerdictStore)
+	if !ok || d.learned[network] {
+		return
+	}
+	d.learned[network] = true
+	for _, v := range []struct {
+		m   map[string]time.Time
+		key string
+	}{{d.ownBlocked, d.ownVerdict()}, {d.quiet, d.quietVerdict()}, {d.intercepted, verdictIntercepted}} {
+		if until := vs.Verdict(network, v.key); until.After(v.m[network]) {
+			v.m[network] = until
+		}
+	}
+}
+
+// rememberLocked records a verdict in the dialer and in the store; a zero until forgets it. d.mu held.
+func (d *dialer) rememberLocked(m map[string]time.Time, network, key string, until time.Time) {
+	if until.IsZero() {
+		delete(m, network)
+	} else {
+		m[network] = until
+	}
+	if vs, ok := d.modes.(VerdictStore); ok {
+		vs.SetVerdict(network, key, until)
 	}
 }
 

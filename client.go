@@ -148,12 +148,22 @@ type ModeStore interface {
 	ForgetMode(network string)
 }
 
-// NewMemoryModeStore returns a ModeStore that lives only in memory.
-func NewMemoryModeStore() ModeStore { return &memoryModes{m: map[string]Choice{}} }
+// VerdictStore is what a ModeStore may also keep: until when a network blocks the cover domain or the
+// node's address, so a new Conn there neither sends that name again nor dials while the block lasts.
+type VerdictStore interface {
+	Verdict(network, key string) time.Time
+	SetVerdict(network, key string, until time.Time) // a zero until forgets the verdict
+}
+
+// NewMemoryModeStore returns a ModeStore, and VerdictStore, that lives only in memory.
+func NewMemoryModeStore() ModeStore {
+	return &memoryModes{m: map[string]Choice{}, v: map[[2]string]time.Time{}}
+}
 
 type memoryModes struct {
 	mu sync.Mutex
 	m  map[string]Choice
+	v  map[[2]string]time.Time
 }
 
 func (s *memoryModes) Mode(n string) (Choice, bool) {
@@ -164,6 +174,22 @@ func (s *memoryModes) Mode(n string) (Choice, bool) {
 }
 func (s *memoryModes) SetMode(n string, c Choice) { s.mu.Lock(); s.m[n] = c; s.mu.Unlock() }
 func (s *memoryModes) ForgetMode(n string)        { s.mu.Lock(); delete(s.m, n); s.mu.Unlock() }
+
+func (s *memoryModes) Verdict(n, k string) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.v[[2]string{n, k}]
+}
+
+func (s *memoryModes) SetVerdict(n, k string, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if until.IsZero() {
+		delete(s.v, [2]string{n, k})
+	} else {
+		s.v[[2]string{n, k}] = until
+	}
+}
 
 // Config configures a client.
 type Config struct {
