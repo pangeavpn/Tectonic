@@ -227,13 +227,12 @@ func newServer(cfg Config, direct bool) (*Server, error) {
 		listeners: map[net.Listener]struct{}{},
 		conns:     map[net.Conn]struct{}{},
 	}
-	// One tls.Config for every connection: its session ticket keys are
-	// what let a client's later lanes resume TLS.
+	// One tls.Config for every connection, whose ticket keys let later lanes resume. It keeps Go's
+	// record sizing, small at first, since a stranger who downloads anything sees it.
 	s.tls = &tls.Config{
-		MinVersion:                  tls.VersionTLS12, // the cover site serves older browsers too
-		NextProtos:                  []string{"h2", "http/1.1"},
-		GetCertificate:              s.certificate,
-		DynamicRecordSizingDisabled: true, // the shaper sizes records
+		MinVersion:     tls.VersionTLS12, // the cover site serves older browsers too
+		NextProtos:     []string{"h2", "http/1.1"},
+		GetCertificate: s.certificate,
 	}
 	s.cover, err = newCover(s, direct)
 	if err != nil {

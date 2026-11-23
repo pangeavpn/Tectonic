@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/rand"
 	"crypto/tls"
@@ -10,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -78,15 +80,71 @@ func newStockServer(t *testing.T, headerTimeout time.Duration) string {
 		IdleTimeout:       2 * time.Minute,
 		ErrorLog:          log.New(io.Discard, "", 0),
 		TLSConfig: &tls.Config{
-			MinVersion:                  tls.VersionTLS12,
-			NextProtos:                  []string{"h2", "http/1.1"},
-			Certificates:                []tls.Certificate{p.own},
-			DynamicRecordSizingDisabled: true,
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"h2", "http/1.1"},
+			Certificates: []tls.Certificate{p.own},
 		},
 	}
 	go srv.ServeTLS(ln, "", "")
 	t.Cleanup(func() { srv.Close() })
 	return ln.Addr().String()
+}
+
+// bigAsset serves 64 KB, as a script or an image on the cover site would.
+func bigAsset(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/big" {
+		coverPage(w, r)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Write(make([]byte, 64<<10))
+}
+
+// recordSizes fetches /big over HTTP/1.1 and returns the length of every TLS record the server sent.
+func recordSizes(t *testing.T, addr string) []int {
+	t.Helper()
+	c := probeDial(t, addr, tls.VersionTLS13, "http/1.1")
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := io.WriteString(c, "GET /big HTTP/1.1\r\nHost: "+coverDomain+"\r\n\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n, err := io.Copy(io.Discard, resp.Body); err != nil || n != 64<<10 {
+		t.Fatalf("read %d bytes of /big: %v", n, err)
+	}
+	c.tap.mu.Lock()
+	defer c.tap.mu.Unlock()
+	var sizes []int
+	for b := c.tap.in; len(b) >= 5; b = b[5+(int(b[3])<<8|int(b[4])):] {
+		sizes = append(sizes, int(b[3])<<8|int(b[4]))
+	}
+	// Past ServerHello, ChangeCipherSpec, EncryptedExtensions, Certificate, CertificateVerify (whose
+	// ECDSA signature varies by a byte or two) and Finished: the records that carry the response.
+	return sizes[min(6, len(sizes)):]
+}
+
+// A probe that downloads anything larger than a page sees how a server sizes its records. A Go web
+// server left as it comes starts small and grows them a segment at a time; the node must too.
+func TestCoverRecordsAreSizedAsAGoWebServerSizesThem(t *testing.T) {
+	p := certs(t)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	stock := &http.Server{Handler: http.HandlerFunc(bigAsset), ErrorLog: log.New(io.Discard, "", 0),
+		TLSConfig: &tls.Config{NextProtos: []string{"h2", "http/1.1"}, Certificates: []tls.Certificate{p.own}}}
+	go stock.ServeTLS(ln, "", "")
+	t.Cleanup(func() { stock.Close() })
+	want := recordSizes(t, ln.Addr().String())
+	for _, direct := range modes() {
+		ts := newServerAs(t, direct, func(cfg *Config) { cfg.Cover = http.HandlerFunc(bigAsset) })
+		if got := recordSizes(t, ts.addr); !slices.Equal(got, want) {
+			t.Errorf("direct=%v: the node sent records of %v bytes, a Go web server %v", direct, got, want)
+		}
+	}
 }
 
 // tapConn keeps what the server sent, so a test can see the TLS records.
