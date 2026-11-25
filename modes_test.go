@@ -1267,7 +1267,7 @@ func TestModeRefusedCertificateIsNotABlock(t *testing.T) {
 
 	// A certificate the device itself trusts is another matter: only that
 	// can sit in front of the CDN's edge too, so the CDN is written off.
-	r.d.refused(modeNetwork, fmt.Errorf("a lane: %w", lane.ErrIntercepted))
+	r.d.refused(modeNetwork, Choice{Mode: SNIOwn}, fmt.Errorf("a lane: %w", lane.ErrIntercepted))
 	r.d.mu.Lock()
 	locked = r.d.intercepted[modeNetwork]
 	r.d.mu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -271,14 +272,36 @@ func (d *dialer) allowed(m SNIMode) bool {
 	return false
 }
 
+// borrowedNames are the names the profile lets the client borrow, in the order
+// to try them: a name the interceptor refuses costs one attempt, not the mode.
+func (d *dialer) borrowedNames() []string {
+	if s := strings.TrimSpace(d.cfg.SNI); s != "" {
+		return []string{s}
+	}
+	out := make([]string, 0, len(d.cfg.Profile.BorrowedSNI))
+	for _, name := range d.cfg.Profile.BorrowedSNI {
+		if name = strings.TrimSpace(name); name != "" && !slices.Contains(out, name) {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
 // candidates are the modes to try on a new network, the best disguise
-// first.
+// first. Borrowed contributes one entry per name.
 func (d *dialer) candidates() []Choice {
 	var out []Choice
 	for _, m := range []SNIMode{SNIOwn, SNIBorrowed, SNINone} {
-		if d.allowed(m) {
-			out = append(out, Choice{Mode: m, Name: d.nameFor(m)})
+		if !d.allowed(m) {
+			continue
 		}
+		if m == SNIBorrowed {
+			for _, name := range d.borrowedNames() {
+				out = append(out, Choice{Mode: m, Name: name})
+			}
+			continue
+		}
+		out = append(out, Choice{Mode: m, Name: d.nameFor(m)})
 	}
 	return out
 }
@@ -370,6 +393,10 @@ func (d *dialer) choice(network string) (Choice, bool) {
 		if c.Mode == SNIBorrowed && d.cfg.SNI != "" {
 			c.Name = d.cfg.SNI // the user's own name wins
 		}
+		// A name the profile no longer offers is worked out again.
+		if c.Mode == SNIBorrowed && !slices.Contains(d.borrowedNames(), c.Name) {
+			return Choice{}, false
+		}
 		// The store is shared by every node: the mode is the network's, but Own's name
 		// is this node's cover domain, never the one the mode was learned on.
 		if c.Mode == SNIOwn {
@@ -397,6 +424,15 @@ func (d *dialer) stale(c Choice) bool {
 func (d *dialer) ownSinceChosen(c Choice) bool {
 	cover := d.cfg.Profile.CoverDomain
 	return c.Mode != SNIOwn && cover != "" && c.Cover != cover && d.allowed(SNIOwn)
+}
+
+// label names a candidate in logs and errors: the mode alone would not say
+// which borrowed name was refused.
+func (c Choice) label() string {
+	if c.Mode == SNIBorrowed && c.Name != "" {
+		return fmt.Sprintf("%v(%s)", c.Mode, c.Name)
+	}
+	return c.Mode.String()
 }
 
 // dial is the pool's DialFunc.
@@ -587,7 +623,7 @@ func urgent(redundant bool) int {
 // carrier and whether a remembered SNI mode still works.
 func (d *dialer) watch(l *lane.Lane, err error, carrier lane.Carrier, c Choice, network string) {
 	if err != nil {
-		d.refused(network, err)
+		d.refused(network, c, err)
 		d.outcome(false, carrier, c, network)
 		return
 	}
@@ -682,7 +718,7 @@ func (d *dialer) outcome(ok bool, carrier lane.Carrier, c Choice, network string
 // the route the client is left with where the node's address is blocked
 // (design §9), and a censor that could take it away by serving one
 // certificate could take the client off the network altogether.
-func (d *dialer) refused(network string, err error) {
+func (d *dialer) refused(network string, c Choice, err error) {
 	if !errors.Is(err, lane.ErrIntercepted) {
 		return
 	}
@@ -692,7 +728,7 @@ func (d *dialer) refused(network string, err error) {
 	now := time.Now()
 	if !now.Before(d.intercepted[network]) {
 		d.log.Warn("a lane was served a certificate the device trusts in the node's place; not using the CDN on this network",
-			"network", network, "for", interceptedFor, "err", err)
+			"network", network, "for", interceptedFor, "mode", c.label(), "err", err)
 	}
 	d.rememberLocked(d.intercepted, network, verdictIntercepted, now.Add(interceptedFor))
 	if network == d.network && d.onCDN {
@@ -957,7 +993,7 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 			d.outcome(false, lane.Direct, Choice{}, network)
 			return nil, fmt.Errorf("tectonic: no SNI mode logged in: %w", errors.Join(errs...))
 		}
-		d.log.Info("SNI mode chosen for network", "mode", won.c.Mode, "network", network)
+		d.log.Info("SNI mode chosen for network", "mode", won.c.Mode, "sni", won.c.Name, "network", network)
 		d.outcome(true, lane.Direct, won.c, network)
 		return l, nil
 	}
@@ -984,14 +1020,14 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 				}
 			case failed:
 				open--
-				errs = append(errs, fmt.Errorf("%v: %w", ev.a.c.Mode, ev.err))
+				errs = append(errs, fmt.Errorf("%v: %w", ev.a.c.label(), ev.err))
 				switch {
 				case !ev.sent:
 					halted = true
 				case errors.Is(ev.err, lane.ErrCertificate):
 					// Not a block: an interceptor, or the wrong server.
 					ev.a.refused = true
-					d.refused(network, ev.err)
+					d.refused(network, ev.a.c, ev.err)
 				case !errors.Is(ev.err, lane.ErrLoginFailed):
 					cut[ev.a] = true
 				}
@@ -1000,7 +1036,7 @@ func (d *dialer) tryModes(ctx context.Context, req sched.DialRequest, network st
 				}
 				switch {
 				case newest && len(attempts) < len(cands) && !halted:
-					start(nil, "SNI mode failed; trying the next", "mode", ev.a.c.Mode, "err", ev.err)
+					start(nil, "SNI mode failed; trying the next", "mode", ev.a.c.Mode, "sni", ev.a.c.Name, "err", ev.err)
 				case open == 0:
 					return finish()
 				}
